@@ -29,7 +29,6 @@ except ImportError as e:
 
 # Now import Nautilus
 from nautilus_trader.config import (
-    InstrumentProviderConfig,
     LiveDataEngineConfig,
     LiveExecEngineConfig,
     LiveRiskEngineConfig,
@@ -42,6 +41,7 @@ from nautilus_trader.adapters.polymarket import (
     PolymarketDataClientConfig,
     PolymarketExecClientConfig,
 )
+from nautilus_trader.adapters.polymarket.providers import PolymarketInstrumentProviderConfig
 from nautilus_trader.adapters.polymarket.factories import (
     PolymarketLiveDataClientFactory,
     PolymarketLiveExecClientFactory,
@@ -247,7 +247,7 @@ class IntegratedBTCStrategy(Strategy):
     def check_simulation_mode(self) -> bool:
         """
         Check Redis for current simulation mode.
-        
+
         Uses synchronous redis.Redis operations (fast single-key read).
         Safe to call from both sync and async contexts.
         """
@@ -1330,6 +1330,140 @@ class IntegratedBTCStrategy(Strategy):
 # ---------------------------------------------------------------------------
 # Backward-compatible entry point (prefer runner.py)
 # ---------------------------------------------------------------------------
+
+def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, test_mode: bool = False):
+    """Run the integrated BTC 15-min trading bot - LOADS ALL BTC MARKETS FOR THE DAY"""
+    
+    print("=" * 80)
+    print("INTEGRATED POLYMARKET BTC 15-MIN TRADING BOT")
+    print("Nautilus + 7-Phase System + Redis Control")
+    print("=" * 80)
+
+    redis_client = init_redis()
+
+    if redis_client:
+        try:
+            # ALWAYS overwrite Redis with the current session mode.
+            # This prevents a stale value from a previous --live run
+            # silently overriding --test-mode or --simulation runs.
+            mode_value = '1' if simulation else '0'
+            redis_client.set('btc_trading:simulation_mode', mode_value)
+            mode_label = 'SIMULATION' if simulation else 'LIVE'
+            logger.info(f"Redis simulation_mode forced to: {mode_label} ({mode_value})")
+        except Exception as e:
+            logger.warning(f"Could not set Redis simulation mode: {e}")
+
+    print(f"\nConfiguration:")
+    print(f"  Initial Mode: {'SIMULATION' if simulation else 'LIVE TRADING'}")
+    print(f"  Redis Control: {'Enabled' if redis_client else 'Disabled'}")
+    print(f"  Grafana: {'Enabled' if enable_grafana else 'Disabled'}")
+    print(f"  Max Trade Size: ${os.getenv('MARKET_BUY_USD', '1.00')}")
+    print(f"  Quote stability gate: {QUOTE_STABILITY_REQUIRED} valid ticks")
+    print()
+
+    # =========================================================================
+    # Use event_slug_builder to load ONLY BTC 15-min markets via slug_builders.
+    # This avoids load_all=True which would fetch all 151k+ instruments.
+    # =========================================================================
+    logger.info("=" * 80)
+    logger.info("LOADING BTC 15-MIN MARKETS VIA EVENT SLUG BUILDER")
+    logger.info("=" * 80)
+
+    instrument_cfg = PolymarketInstrumentProviderConfig(
+        event_slug_builder="slug_builders:build_btc_15min_slugs",
+    )
+
+    poly_data_cfg = PolymarketDataClientConfig(
+        private_key=os.getenv("POLYMARKET_PK"),
+        api_key=os.getenv("POLYMARKET_API_KEY"),
+        api_secret=os.getenv("POLYMARKET_API_SECRET"),
+        passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
+        signature_type=1,
+        instrument_config=instrument_cfg,
+    )
+
+    poly_exec_cfg = PolymarketExecClientConfig(
+        private_key=os.getenv("POLYMARKET_PK"),
+        api_key=os.getenv("POLYMARKET_API_KEY"),
+        api_secret=os.getenv("POLYMARKET_API_SECRET"),
+        passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
+        signature_type=1,
+        instrument_config=instrument_cfg,
+    )
+
+    config = TradingNodeConfig(
+        environment="live",
+        trader_id="BTC-15MIN-INTEGRATED-001",
+        logging=LoggingConfig(
+            log_level="INFO",
+            log_directory="./logs/nautilus",
+        ),
+        data_engine=LiveDataEngineConfig(qsize=6000),
+        exec_engine=LiveExecEngineConfig(qsize=6000),
+        risk_engine=LiveRiskEngineConfig(bypass=simulation),
+        data_clients={POLYMARKET: poly_data_cfg},
+        exec_clients={POLYMARKET: poly_exec_cfg},
+    )
+
+    strategy = IntegratedBTCStrategy(
+        redis_client=redis_client,
+        enable_grafana=enable_grafana,
+        test_mode=test_mode,
+    )
+
+    print("\nBuilding Nautilus node...")
+    node = TradingNode(config=config)
+    node.add_data_client_factory(POLYMARKET, PolymarketLiveDataClientFactory)
+    node.add_exec_client_factory(POLYMARKET, PolymarketLiveExecClientFactory)
+    node.trader.add_strategy(strategy)
+    node.build()
+    logger.info("Nautilus node built successfully")
+
+    print()
+    print("=" * 80)
+    print("BOT STARTING")
+    print("=" * 80)
+
+    try:
+        node.run()
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+    finally:
+        node.dispose()
+        logger.info("Bot stopped")
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Integrated BTC 15-Min Trading Bot")
+    parser.add_argument("--live", action="store_true",
+                        help="Run in LIVE mode (real money at risk!). Default is simulation.")
+    parser.add_argument("--no-grafana", action="store_true", help="Disable Grafana metrics")
+    parser.add_argument("--test-mode", action="store_true",
+                        help="Run in TEST MODE (trade every minute for faster testing)")
+
+    args = parser.parse_args()
+    enable_grafana = not args.no_grafana
+    test_mode = args.test_mode
+
+    # --test-mode ALWAYS forces simulation even if --live is also passed
+    if args.test_mode:
+        simulation = True
+    else:
+        simulation = not args.live
+
+    if not simulation:
+        logger.warning("=" * 80)
+        logger.warning("LIVE TRADING MODE — REAL MONEY AT RISK!")
+        logger.warning("=" * 80)
+    else:
+        logger.info("=" * 80)
+        logger.info(f"SIMULATION MODE — {'TEST MODE (fast clock)' if test_mode else 'paper trading only'}")
+        logger.info("No real orders will be placed.")
+        logger.info("=" * 80)
+
+    run_integrated_bot(simulation=simulation, enable_grafana=enable_grafana, test_mode=test_mode)
+
 
 if __name__ == "__main__":
     from runner import main
