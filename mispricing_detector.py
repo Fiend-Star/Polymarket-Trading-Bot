@@ -252,10 +252,6 @@ class MispricingDetector:
             f"kelly={'half' if use_half_kelly else 'full'}, "
             f"vol_method={vol_method}"
         )
-        logger.info(
-            f"  ██ FEE FIX: Taker fee is now NONLINEAR (~1.56% max at p=0.50), "
-            f"was 10% flat in V1 ██"
-        )
 
     # ------------------------------------------------------------------
     # Core detection

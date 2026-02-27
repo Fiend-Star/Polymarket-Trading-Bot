@@ -56,14 +56,13 @@ class SignalFusionEngine:
         self._fusions_performed = 0
         
         logger.info("Initialized Signal Fusion Engine")
-        logger.info(f"Weights: {self.weights}")
-    
+
     def set_weight(self, processor_name: str, weight: float) -> None:
         if not 0.0 <= weight <= 1.0:
             raise ValueError("Weight must be between 0.0 and 1.0")
         self.weights[processor_name] = weight
-        logger.info(f"Set weight for {processor_name}: {weight:.2f}")
-    
+        logger.debug(f"Set weight for {processor_name}: {weight:.2f}")
+
     def fuse_signals(
         self,
         signals: List[TradingSignal],

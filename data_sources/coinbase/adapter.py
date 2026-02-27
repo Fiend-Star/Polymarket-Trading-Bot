@@ -96,7 +96,7 @@ class CoinbaseDataSource:
             self._last_update = datetime.now()
             
             if price != self._last_logged_price:
-                logger.debug(f"Coinbase BTC price: ${price:,.2f}")
+                logger.trace(f"Coinbase BTC price: ${price:,.2f}")
                 self._last_logged_price = price
             return price
             

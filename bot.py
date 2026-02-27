@@ -379,26 +379,20 @@ class IntegratedBTCStrategy(Strategy):
         self.test_mode = test_mode
 
         if test_mode:
-            logger.info("=" * 80)
-            logger.info("  TEST MODE ACTIVE")
-            logger.info("=" * 80)
+            logger.info("TEST MODE ACTIVE")
 
-        logger.info("=" * 80)
-        logger.info("INTEGRATED BTC STRATEGY V3.1 — BINARY OPTION PRICING + RTDS ORACLE")
         logger.info(
-            f"  Trade window: {TRADE_WINDOW_START_SEC}s–{TRADE_WINDOW_END_SEC}s ({TRADE_WINDOW_START_SEC / 60:.0f}–{TRADE_WINDOW_END_SEC / 60:.0f} min)")
-        logger.info(f"  Order type: {'LIMIT @ BID (maker, 0% fee)' if USE_LIMIT_ORDERS else 'MARKET (taker, 10% fee)'}")
-        logger.info(f"  Position size: ${POSITION_SIZE_USD}")
-        logger.info(f"  Min edge: ${MIN_EDGE_CENTS:.2f}")
-        logger.info(f"  Take profit: {TAKE_PROFIT_PCT:.0%} | Cut loss: {CUT_LOSS_PCT:.0%}")
-        logger.info(f"  Vol method: {VOL_METHOD} | Default vol: {DEFAULT_VOL:.0%}")
-        logger.info(f"  Confirmation: fusion min {MIN_FUSION_SIGNALS} signals, score >= {MIN_FUSION_SCORE}")
-        logger.info(
-            f"  RTDS: {'Enabled (Chainlink + Binance sub-second)' if USE_RTDS else 'Disabled (Coinbase fallback)'}")
-        logger.info(
-            f"  Late-window: {'Enabled (T-{:.0f}s, min {:.0f}bps)'.format(RTDS_LATE_WINDOW_SEC, RTDS_LATE_WINDOW_MIN_BPS) if LATE_WINDOW_ENABLED else 'Disabled'}")
-        logger.info(f"  Funding filter: {'Enabled' if USE_FUNDING_FILTER else 'Disabled'}")
-        logger.info("=" * 80)
+            f"Strategy V3.1 | {TRADE_WINDOW_START_SEC}s–{TRADE_WINDOW_END_SEC}s window | "
+            f"{'LIMIT' if USE_LIMIT_ORDERS else 'MARKET'} orders | ${POSITION_SIZE_USD} size | "
+            f"edge≥${MIN_EDGE_CENTS:.2f} | TP {TAKE_PROFIT_PCT:.0%} / SL {CUT_LOSS_PCT:.0%} | "
+            f"vol={VOL_METHOD} {DEFAULT_VOL:.0%} | fusion≥{MIN_FUSION_SIGNALS}sig/{MIN_FUSION_SCORE}pts"
+        )
+        if USE_RTDS:
+            logger.info(
+                f"  RTDS: Chainlink + Binance | Late-window: "
+                f"{'T-{:.0f}s'.format(RTDS_LATE_WINDOW_SEC) if LATE_WINDOW_ENABLED else 'off'} | "
+                f"Funding: {'on' if USE_FUNDING_FILTER else 'off'}"
+            )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -457,6 +451,67 @@ class IntegratedBTCStrategy(Strategy):
             self._coinbase_source = None
 
         self._data_sources_initialized = True
+
+    async def _preseed_vol_estimator(self):
+        """
+        V3.1 FIX: Fetch recent Coinbase 1-min candles to warm up vol estimator
+        immediately on startup. Without this, the first 15-min window always
+        uses DEFAULT_VOL (65%) which makes the model see a coin flip and Kelly
+        says f*=0% → NO_TRADE on every first window.
+
+        Coinbase public API: no auth required.
+        GET /products/BTC-USD/candles?granularity=60
+        Returns: [[timestamp, low, high, open, close, volume], ...]
+        """
+        import aiohttp
+
+        url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+        params = {"granularity": 60}  # 1-min candles, returns last 300 by default
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"Coinbase candles API returned {resp.status}")
+                        return
+
+                    candles = await resp.json()
+
+            if not candles or not isinstance(candles, list):
+                logger.warning("No candle data returned from Coinbase")
+                return
+
+            # Candles come newest-first: [[ts, low, high, open, close, vol], ...]
+            # Sort oldest-first so vol estimator sees them in chronological order
+            candles.sort(key=lambda c: c[0])
+
+            fed = 0
+            for candle in candles:
+                try:
+                    ts, low, high, open_p, close, volume = candle
+                    price = float(close)
+                    self.vol_estimator.add_price(price, float(ts))
+                    fed += 1
+                except (ValueError, IndexError, TypeError):
+                    continue
+
+            vol = self.vol_estimator.get_vol(VOL_METHOD)
+            logger.info(
+                f"✓ Vol estimator pre-seeded: {fed} candles → "
+                f"RV={vol.annualized_vol:.1%} ({vol.method}), "
+                f"confidence={vol.confidence:.0%}"
+            )
+
+            # Also cache the latest price as initial spot
+            if candles:
+                latest_price = float(candles[-1][4])  # close of most recent candle
+                with self._cache_lock:
+                    if self._cached_spot_price is None:
+                        self._cached_spot_price = latest_price
+                        logger.info(f"✓ Initial BTC spot from candles: ${latest_price:,.2f}")
+
+        except Exception as e:
+            logger.warning(f"Vol estimator pre-seed failed: {e} — will use default vol until enough ticks")
 
     async def _teardown_data_sources(self):
         if self._news_source:
@@ -559,20 +614,16 @@ class IntegratedBTCStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def on_start(self):
-        logger.info("=" * 80)
-        logger.info("INTEGRATED BTC STRATEGY V3 STARTED")
-        logger.info("=" * 80)
+        logger.info("Strategy starting — loading instruments...")
 
         self._load_all_btc_instruments()
 
         if self.instrument_id:
             self.subscribe_quote_ticks(self.instrument_id)
-            logger.info(f"✓ SUBSCRIBED to YES token: {self.instrument_id}")
 
             no_id = getattr(self, '_no_instrument_id', None)
             if no_id:
                 self.subscribe_quote_ticks(no_id)
-                logger.info(f"✓ SUBSCRIBED to NO token: {no_id}")
 
             try:
                 quote = self.cache.quote_tick(self.instrument_id)
@@ -593,7 +644,7 @@ class IntegratedBTCStrategy(Strategy):
         # V3.1: Start RTDS Chainlink settlement oracle
         if self.rtds:
             self.rtds.start_background()
-            logger.info("✓ RTDS connector started — streaming Chainlink settlement oracle + Binance")
+            logger.info("✓ RTDS connector started")
 
         # V3.1: Initial funding rate fetch
         if self.funding_filter:
@@ -610,10 +661,7 @@ class IntegratedBTCStrategy(Strategy):
         if self.grafana_exporter:
             threading.Thread(target=self._start_grafana_sync, daemon=True).start()
 
-        logger.info("=" * 80)
-        logger.info("V3.1 active — binary option pricing + RTDS Chainlink oracle")
-        logger.info(f"Price history: {len(self.price_history)} points")
-        logger.info("=" * 80)
+        logger.info(f"V3.1 active — {len(self.price_history)} price points cached")
 
     # ------------------------------------------------------------------
     # Load all BTC instruments
@@ -677,14 +725,12 @@ class IntegratedBTCStrategy(Strategy):
         btc_instruments = deduped
         btc_instruments.sort(key=lambda x: x['market_timestamp'])
 
-        logger.info("=" * 80)
-        logger.info(f"FOUND {len(btc_instruments)} BTC 15-MIN MARKETS:")
-        for i, inst in enumerate(btc_instruments):
-            is_active = inst['time_diff_minutes'] <= 0 and inst['end_timestamp'] > current_timestamp
-            status = "ACTIVE" if is_active else "FUTURE" if inst['time_diff_minutes'] > 0 else "PAST"
-            logger.info(
-                f"  [{i}] {inst['slug']}: {status} (starts at {inst['start_time'].strftime('%H:%M:%S')}, ends at {inst['end_time'].strftime('%H:%M:%S')})")
-        logger.info("=" * 80)
+        if btc_instruments:
+            first_t = btc_instruments[0]['start_time'].strftime('%H:%M')
+            last_t = btc_instruments[-1]['end_time'].strftime('%H:%M')
+            logger.info(f"Found {len(btc_instruments)} BTC 15-min markets ({first_t}–{last_t})")
+        else:
+            logger.warning("No BTC 15-min markets found!")
 
         self.all_btc_instruments = btc_instruments
 
@@ -698,14 +744,11 @@ class IntegratedBTCStrategy(Strategy):
                 self._yes_token_id = inst.get('yes_token_id')
                 self._yes_instrument_id = inst.get('yes_instrument_id', inst['instrument'].id)
                 self._no_instrument_id = inst.get('no_instrument_id')
-                logger.info(f"✓ CURRENT MARKET: {inst['slug']} (index {i})")
-                logger.info(f"  Next switch at: {self.next_switch_time.strftime('%H:%M:%S')}")
+                logger.info(f"✓ Active: {inst['slug']} → switch at {self.next_switch_time.strftime('%H:%M:%S')}")
 
                 self.subscribe_quote_ticks(self.instrument_id)
-                logger.info(f"  ✓ SUBSCRIBED to current market (YES)")
                 if inst.get('no_instrument_id'):
                     self.subscribe_quote_ticks(inst['no_instrument_id'])
-                    logger.info(f"  ✓ SUBSCRIBED to current market (NO)")
                 break
 
         if self.current_instrument_index == -1 and btc_instruments:
@@ -889,6 +932,10 @@ class IntegratedBTCStrategy(Strategy):
         V3: Also refreshes Coinbase/sentiment cache and feeds vol estimator.
         """
         await self._init_data_sources()
+
+        # V3.1: Pre-seed vol estimator with recent Coinbase candles
+        # so the first trade window has real vol instead of 65% default
+        await self._preseed_vol_estimator()
 
         while True:
             # Auto-restart check
@@ -1808,7 +1855,6 @@ class IntegratedBTCStrategy(Strategy):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             loop.run_until_complete(self.grafana_exporter.start())
-            logger.info("Grafana metrics started on port 8000")
         except Exception as e:
             logger.error(f"Failed to start Grafana: {e}")
 
@@ -1873,26 +1919,9 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         except Exception as e:
             logger.warning(f"Could not set Redis simulation mode: {e}")
 
-    print(f"\nConfiguration:")
-    print(f"  Initial Mode: {'SIMULATION' if simulation else 'LIVE TRADING'}")
-    print(f"  Redis Control: {'Enabled' if redis_client else 'Disabled'}")
-    print(f"  Grafana: {'Enabled' if enable_grafana else 'Disabled'}")
-    print(f"  Trade Size: ${POSITION_SIZE_USD}")
-    print(f"  Order Type: {'LIMIT @ BID (maker, 0% fee)' if USE_LIMIT_ORDERS else 'MARKET (taker, 10% fee)'}")
-    print(f"  Trade Window: {TRADE_WINDOW_START_SEC}s–{TRADE_WINDOW_END_SEC}s")
-    print(f"  Min Edge: ${MIN_EDGE_CENTS:.2f}")
-    print(f"  Take Profit: {TAKE_PROFIT_PCT:.0%} | Cut Loss: {CUT_LOSS_PCT:.0%}")
-    print(f"  Vol: {VOL_METHOD} (default {DEFAULT_VOL:.0%})")
-    print(f"  Confirmation: fusion min {MIN_FUSION_SIGNALS} signals, score >= {MIN_FUSION_SCORE}")
-    print(f"  Stability gate: {QUOTE_STABILITY_REQUIRED} valid ticks")
-    print(f"  RTDS Oracle: {'Enabled (Chainlink + Binance sub-second)' if USE_RTDS else 'Disabled'}")
-    print(f"  Late-window: {'Enabled (T-{:.0f}s)'.format(RTDS_LATE_WINDOW_SEC) if LATE_WINDOW_ENABLED else 'Disabled'}")
-    print(f"  Funding filter: {'Enabled' if USE_FUNDING_FILTER else 'Disabled'}")
-    print()
+    print(f"\nMode: {'SIMULATION' if simulation else 'LIVE TRADING'} | Trade Size: ${POSITION_SIZE_USD} | Min Edge: ${MIN_EDGE_CENTS:.2f}")
 
-    logger.info("=" * 80)
-    logger.info("LOADING BTC 15-MIN MARKETS VIA EVENT SLUG BUILDER")
-    logger.info("=" * 80)
+    logger.info("Loading BTC 15-min markets via event slug builder...")
 
     instrument_cfg = PolymarketInstrumentProviderConfig(
         event_slug_builder="slug_builders:build_btc_15min_slugs",
@@ -1948,9 +1977,6 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
     logger.info("Nautilus node built successfully")
 
     print()
-    print("=" * 80)
-    print("BOT V3 STARTING")
-    print("=" * 80)
 
     try:
         node.run()
@@ -1981,14 +2007,9 @@ def main():
         simulation = not args.live
 
     if not simulation:
-        logger.warning("=" * 80)
-        logger.warning("LIVE TRADING MODE — REAL MONEY AT RISK!")
-        logger.warning(f"Order type: {'LIMIT @ BID (0% fee)' if USE_LIMIT_ORDERS else 'MARKET (10% fee)'}")
-        logger.warning("=" * 80)
+        logger.warning(f"⚠ LIVE TRADING MODE — REAL MONEY | {'LIMIT' if USE_LIMIT_ORDERS else 'MARKET'} orders")
     else:
-        logger.info("=" * 80)
         logger.info(f"SIMULATION MODE — {'TEST MODE' if test_mode else 'paper trading only'}")
-        logger.info("=" * 80)
 
     run_integrated_bot(simulation=simulation, enable_grafana=enable_grafana, test_mode=test_mode)
 

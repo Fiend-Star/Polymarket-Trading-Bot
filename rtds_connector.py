@@ -394,37 +394,39 @@ class RTDSConnector:
     async def _connect_and_stream(self):
         """Establish WS connection, subscribe, and process messages."""
         self._session = aiohttp.ClientSession()
+        try:
+            async with self._session.ws_connect(
+                RTDS_WS_URL,
+                heartbeat=PING_INTERVAL_SEC,
+                timeout=aiohttp.ClientWSTimeout(ws_close=10),
+            ) as ws:
+                self._ws = ws
+                self._connected = True
+                self._reconnect_count = 0
+                logger.info(f"✓ RTDS WebSocket connected: {RTDS_WS_URL}")
 
-        async with self._session.ws_connect(
-            RTDS_WS_URL,
-            heartbeat=PING_INTERVAL_SEC,
-            timeout=aiohttp.ClientWSTimeout(ws_close=10),
-        ) as ws:
-            self._ws = ws
-            self._connected = True
-            self._reconnect_count = 0
-            logger.info(f"✓ RTDS WebSocket connected: {RTDS_WS_URL}")
+                # Subscribe to both feeds
+                await self._subscribe(ws)
 
-            # Subscribe to both feeds
-            await self._subscribe(ws)
+                # Process messages
+                async for msg in ws:
+                    if self._should_stop:
+                        break
 
-            # Process messages
-            async for msg in ws:
-                if self._should_stop:
-                    break
-
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    self._handle_message(msg.data)
-                elif msg.type == aiohttp.WSMsgType.ERROR:
-                    logger.error(f"RTDS WS error: {ws.exception()}")
-                    break
-                elif msg.type == aiohttp.WSMsgType.CLOSED:
-                    logger.warning("RTDS WS closed by server")
-                    break
-
-        self._connected = False
-        if self._session and not self._session.closed:
-            await self._session.close()
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        self._handle_message(msg.data)
+                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                        logger.error(f"RTDS WS error: {ws.exception()}")
+                        break
+                    elif msg.type == aiohttp.WSMsgType.CLOSED:
+                        logger.warning("RTDS WS closed by server")
+                        break
+        finally:
+            # Always clean up the session — prevents "Unclosed client session" warnings
+            self._connected = False
+            if self._session and not self._session.closed:
+                await self._session.close()
+                self._session = None
 
     async def _subscribe(self, ws):
         """Subscribe to Binance + Chainlink BTC price feeds."""

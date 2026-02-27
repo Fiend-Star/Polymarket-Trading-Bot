@@ -22,12 +22,7 @@ def run_bot():
     
     print("=" * 80)
     print("BTC 15-MIN TRADING BOT - AUTO-RESTART WRAPPER")
-    print("=" * 80)
-    print(f"Platform: {sys.platform}")
-    print(f"Python: {python_cmd}")
-    print(f"Bot script: {BOT_SCRIPT}")
-    print(f"Bot arguments: {bot_args}")
-    print(f"Virtual env: {sys.prefix}")
+    print(f"Bot: {BOT_SCRIPT} {' '.join(bot_args)}")
     print("=" * 80)
     print()
     
@@ -50,13 +45,8 @@ def run_bot():
     while True:
         restart_count += 1
         
-        print("=" * 80)
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
-        print(f"Starting bot (restart #{restart_count})...")
-        print(f"Command: {python_cmd} {BOT_SCRIPT} {' '.join(bot_args)}")
-        print("=" * 80)
-        print()
-        
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting bot (restart #{restart_count})...")
+
         try:
             # Run the bot with arguments!
             cmd = [python_cmd, BOT_SCRIPT] + bot_args

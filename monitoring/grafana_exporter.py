@@ -304,9 +304,7 @@ class GrafanaMetricsExporter:
             'trading_orders_rejected',
             'Total orders rejected'
         )
-        
-        logger.info("Prometheus metrics initialized")
-    
+
     def update_metrics(self) -> None:
         """Update all metrics with current values."""
         try:
@@ -363,11 +361,8 @@ class GrafanaMetricsExporter:
             self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
             self._thread.start()
             
-            logger.info(f"✓ Metrics server started on port {self.port}")
-            logger.info(f"  Metrics available at: http://localhost:{self.port}/metrics")
-            logger.info(f"  Health check: http://localhost:{self.port}/health")
-            logger.info(f"  Supports: GET, POST, OPTIONS")
-            
+            logger.info(f"✓ Metrics server started on http://localhost:{self.port}/metrics")
+
             self._is_running = True
             
             # Start update loop
