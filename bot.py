@@ -884,9 +884,12 @@ class IntegratedBTCStrategy(Strategy):
                     logger.info(f"   Entry: ${pos.entry_price:.4f} → Exit: ${final_price:.4f}")
                     logger.info(f"   P&L: ${pnl:+.4f} ({outcome})")
 
+                    # V3.1 FIX: Always pass direction="long" to performance tracker.
+                    # In our system "short" = bought NO tokens = still a LONG position.
+                    # The tracker assumes "short" means SOLD, which inverts the PnL sign.
                     self.performance_tracker.record_trade(
                         trade_id=pos.order_id,
-                        direction=pos.direction,
+                        direction="long",  # Always LONG — we BUY tokens (YES or NO)
                         entry_price=Decimal(str(pos.entry_price)),
                         exit_price=Decimal(str(final_price)),
                         size=Decimal(str(pos.size_usd)),
@@ -894,7 +897,14 @@ class IntegratedBTCStrategy(Strategy):
                         exit_time=datetime.now(timezone.utc),
                         signal_score=0,
                         signal_confidence=0,
-                        metadata={"resolved": True, "market": slug, "paper": is_paper}
+                        metadata={
+                            "resolved": True,
+                            "market": slug,
+                            "paper": is_paper,
+                            "original_direction": pos.direction,  # Keep for reference
+                            "token": "YES" if pos.direction == "long" else "NO",
+                            "pnl_computed": round(pnl, 4),  # Our computed PnL for cross-check
+                        }
                     )
 
                     # V3.1: Update Grafana metrics on resolution

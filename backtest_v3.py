@@ -1355,7 +1355,7 @@ Examples:
     print(f"  Decision minute:   {args.decision_minute}")
     if rc.enabled:
         print(f"  ── REALISTIC MODE ──")
-        print(f"  Spread:            {rc.spread_cents:.0f}¢ ({rc.spread_cents + rc.spread_widen_late:.0f}¢ late window)")
+        print(f"  Spread:            {rc.spread_cents*100:.0f}¢ ({(rc.spread_cents + rc.spread_widen_late)*100:.0f}¢ late window)")
         print(f"  Fill rate:         {rc.fill_rate:.0%} base (+{rc.fill_rate_boost_edge:.0%}/10¢ edge)")
         print(f"  Market noise:      ±{rc.market_noise_std * 100:.1f}¢")
         print(f"  Market efficiency: {rc.market_efficiency:.0%} (MM partially reflects model)")
