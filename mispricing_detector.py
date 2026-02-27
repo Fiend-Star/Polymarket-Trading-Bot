@@ -77,43 +77,18 @@ def polymarket_taker_fee_usd(price: float, num_shares: float) -> float:
 # ---------------------------------------------------------------------------
 
 def kelly_fraction(
-    true_prob: float,
-    market_price: float,
-    use_half_kelly: bool = True,
-    max_fraction: float = 0.05,
+    true_prob: float, market_price: float,
+    use_half_kelly: bool = True, max_fraction: float = 0.05,
 ) -> float:
-    """
-    Kelly-optimal fraction of bankroll to bet on a binary option.
-
-    For binary: buy at price q, win (1-q) if correct, lose q if wrong.
-      Full Kelly: f* = (p(1-q) - (1-p)q) / (1-q)
-                     = (p - q) / (1 - q)
-
-    Half Kelly captures ~75% of optimal growth with ~50% less drawdown.
-    Full Kelly has 1/3 chance of halving bankroll before doubling.
-
-    Args:
-        true_prob: Model's estimated probability of winning (p)
-        market_price: Price paid for the token (q)
-        use_half_kelly: Use half Kelly (recommended)
-        max_fraction: Maximum bet as fraction of bankroll
-
-    Returns:
-        Optimal fraction of bankroll to bet (0 if no edge)
-    """
+    """Kelly-optimal fraction of bankroll to bet on a binary option.
+    f* = (p - q) / (1 - q).  Half Kelly captures ~75% of growth with ~50% less drawdown."""
     p = max(0.01, min(0.99, true_prob))
     q = max(0.01, min(0.99, market_price))
-
     if p <= q:
-        return 0.0  # No edge
-
-    # Kelly for binary: f* = (p - q) / (1 - q)
+        return 0.0
     f_star = (p - q) / (1 - q)
-
     if use_half_kelly:
         f_star *= 0.5
-
-    # Cap at max_fraction (never risk more than 5% of bankroll on one trade)
     return max(0.0, min(max_fraction, f_star))
 
 
@@ -212,26 +187,16 @@ class MispricingDetector:
     """
 
     def __init__(
-        self,
-        pricer: Optional[BinaryOptionPricer] = None,
-        vol_estimator: Optional[VolEstimator] = None,
-        # V2: maker_fee stays 0%, taker_fee is now computed dynamically
-        maker_fee: float = 0.00,
-        taker_fee: float = 0.02,    # V2: DEFAULT ~2% (was 10%!!) — overridden by nonlinear formula
-        min_edge_cents: float = 0.02,
-        min_edge_after_fees: float = 0.005,
-        take_profit_pct: float = 0.30,
-        cut_loss_pct: float = -0.50,
-        vol_method: str = "ewma",
-        # V2: Kelly parameters
-        bankroll: float = 50.0,     # Total bankroll in USD
-        use_half_kelly: bool = True,
-        max_kelly_fraction: float = 0.05,
+        self, pricer=None, vol_estimator=None,
+        maker_fee=0.00, taker_fee=0.02, min_edge_cents=0.02,
+        min_edge_after_fees=0.005, take_profit_pct=0.30, cut_loss_pct=-0.50,
+        vol_method="ewma", bankroll=50.0, use_half_kelly=True,
+        max_kelly_fraction=0.05,
     ):
         self.pricer = pricer or get_binary_pricer()
         self.vol_est = vol_estimator or get_vol_estimator()
         self.maker_fee = maker_fee
-        self.taker_fee_default = taker_fee  # Fallback only
+        self.taker_fee_default = taker_fee
         self.min_edge_cents = min_edge_cents
         self.min_edge_after_fees = min_edge_after_fees
         self.take_profit_pct = take_profit_pct
@@ -240,246 +205,221 @@ class MispricingDetector:
         self.bankroll = bankroll
         self.use_half_kelly = use_half_kelly
         self.max_kelly_fraction = max_kelly_fraction
-
         self._total_detections = 0
         self._tradeable_detections = 0
-
-        logger.info(
-            f"Initialized MispricingDetector V2: "
-            f"maker_fee={maker_fee:.0%}, "
-            f"min_edge=${min_edge_cents:.2f}, "
-            f"bankroll=${bankroll:.0f}, "
-            f"kelly={'half' if use_half_kelly else 'full'}, "
-            f"vol_method={vol_method}"
-        )
+        logger.info(f"MispricingDetector V2: fee={maker_fee:.0%}, min_edge=${min_edge_cents:.2f}, "
+                    f"bankroll=${bankroll:.0f}, kelly={'half' if use_half_kelly else 'full'}")
 
     # ------------------------------------------------------------------
     # Core detection
     # ------------------------------------------------------------------
 
-    def detect(
-        self,
-        yes_market_price: float,
-        no_market_price: float,
-        btc_spot: float,
-        btc_strike: float,
-        time_remaining_min: float,
-        position_size_usd: float = 1.0,
-        use_maker: bool = True,
-        # V3: Additional overlays
-        vol_skew: Optional[float] = None,
-        funding_bias: float = 0.0,
-    ) -> MispricingSignal:
-        """
-        Detect mispricing between model and market.
-        V2: Uses jump-diffusion pricer, correct fees, Kelly sizing.
-        """
-        self._total_detections += 1
+    def _compute_metrics(self, yes_mp, no_mp, btc_spot, btc_strike, trm, ps_usd, use_maker, vol_skew, fb):
+        """Compute all intermediate metrics for detection."""
+        ve, rv, vc, jp, rs = self._get_vol_and_jumps()
+        model = self._compute_model_price(btc_spot, btc_strike, rv, trm, jp, rs, vol_skew, fb)
+        iv, vs, vrp, vrp_sig = self._compute_iv_and_vrp(yes_mp, btc_spot, btc_strike, trm, rv)
+        d, pe, tp, mp = self._determine_direction(model, yes_mp, no_mp)
+        ae = abs(pe)
+        fr, fc, ev, nev = self._compute_fees_and_ev(use_maker, tp, ae, ps_usd)
+        kf, kb = self._compute_kelly(mp, tp)
+        tradeable = self._evaluate_tradeability(ae, fr, nev, trm, vc, kf, model, pe)
+        vrp_b = self._compute_vrp_boost(vrp_sig, d, yes_mp, no_mp)
+        conf = self._compute_confidence(vc, ae, trm, kf, vrp_b)
+        return (ve, rv, vc, jp, rs, model, iv, vs, vrp, vrp_sig,
+                d, pe, ae, tp, mp, fc, ev, nev, tradeable, kf, kb, conf)
 
-        # ---- Step 1: Get vol estimate + jump params + return stats ----
+    def detect(
+        self, yes_market_price: float, no_market_price: float,
+        btc_spot: float, btc_strike: float, time_remaining_min: float,
+        position_size_usd: float = 1.0, use_maker: bool = True,
+        vol_skew: Optional[float] = None, funding_bias: float = 0.0,
+    ) -> MispricingSignal:
+        """Detect mispricing between model and market."""
+        self._total_detections += 1
+        (ve, rv, vc, jp, rs, model, iv, vs, vrp, vrp_sig,
+         direction, pe, ae, tp, mp, fc, ev, nev, tradeable, kf, kb, conf
+        ) = self._compute_metrics(yes_market_price, no_market_price, btc_spot,
+                                   btc_strike, time_remaining_min, position_size_usd,
+                                   use_maker, vol_skew, funding_bias)
+        if not tradeable:
+            direction, kf, kb = "NO_TRADE", 0.0, 0.0
+        else:
+            self._tradeable_detections += 1
+        ep = ae / tp if tp > 0 else 0.0
+        signal = self._build_signal(pe, ep, direction, yes_market_price, no_market_price,
+                                    model, btc_spot, btc_strike, rv, time_remaining_min,
+                                    conf, vc, iv, vs, vrp, vrp_sig, ev, fc, nev, tradeable, kf, kb)
+        self._log_detection(signal, ve, jp, rs, model)
+        return signal
+
+    def _build_signal(self, edge, edge_pct, direction, yes_mkt, no_mkt,
+                      model, spot, strike, vol, trm, conf, vol_conf,
+                      iv, vs, vrp, vrp_sig, ev, fee, net_ev, tradeable, kf, kb):
+        """Construct MispricingSignal from computed values."""
+        return MispricingSignal(
+            edge=edge, edge_pct=edge_pct, direction=direction,
+            yes_market=yes_mkt, no_market=no_mkt,
+            yes_model=model.yes_fair_value, no_model=model.no_fair_value,
+            spot=spot, strike=strike, vol=vol, time_remaining_min=trm,
+            delta=model.delta, gamma=model.gamma, theta_per_min=model.theta,
+            confidence=conf, vol_confidence=vol_conf,
+            implied_vol=iv, realized_vol=vol, vol_spread=vs,
+            vrp=vrp, vrp_signal=vrp_sig,
+            expected_pnl=ev, fee_cost=fee,
+            net_expected_pnl=net_ev, is_tradeable=tradeable,
+            kelly_fraction=kf, kelly_bet_usd=kb,
+            pricing_method=model.method)
+
+    # ------------------------------------------------------------------
+    # Detection helpers
+    # ------------------------------------------------------------------
+
+    def _get_vol_and_jumps(self):
+        """Get volatility estimate and jump parameters from vol estimator."""
         vol_estimate = self.vol_est.get_vol(method=self.vol_method)
         realized_vol = vol_estimate.annualized_vol
         vol_confidence = vol_estimate.confidence
-
         jump_params = self.vol_est.get_jump_params()
-        return_stats = self.vol_est.get_return_stats(reference_price=btc_strike)
+        return_stats = self.vol_est.get_return_stats()
+        return vol_estimate, realized_vol, vol_confidence, jump_params, return_stats
 
-        # ---- Step 2: Price with jump-diffusion + overlays ----
-        model = self.pricer.price(
-            spot=btc_spot,
-            strike=btc_strike,
-            vol=realized_vol,
+    def _compute_model_price(self, btc_spot, btc_strike, realized_vol,
+                             time_remaining_min, jump_params, return_stats,
+                             vol_skew, funding_bias):
+        """Price with jump-diffusion + overlays."""
+        return self.pricer.price(
+            spot=btc_spot, strike=btc_strike, vol=realized_vol,
             time_remaining_min=time_remaining_min,
-            # V2: Jump parameters from estimator
             jump_intensity=jump_params.intensity,
-            jump_mean=jump_params.mean,
-            jump_vol=jump_params.vol,
-            # V2: Mean reversion inputs
+            jump_mean=jump_params.mean, jump_vol=jump_params.vol,
             recent_return=return_stats.recent_return,
             recent_return_sigma=return_stats.recent_return_sigma,
             apply_overlays=True,
-            # V3: Skew + funding overlays
-            vol_skew=vol_skew,
-            funding_bias=funding_bias,
+            vol_skew=vol_skew, funding_bias=funding_bias,
         )
 
-        # ---- Step 3: Implied vol (BSM-based, standard) ----
+    def _compute_iv_and_vrp(self, yes_market_price, btc_spot, btc_strike,
+                            time_remaining_min, realized_vol):
+        """Compute implied vol, vol spread, and VRP."""
         try:
             iv = self.pricer.implied_vol(
-                market_price=yes_market_price,
-                spot=btc_spot,
-                strike=btc_strike,
-                time_remaining_min=time_remaining_min,
+                market_price=yes_market_price, spot=btc_spot,
+                strike=btc_strike, time_remaining_min=time_remaining_min,
                 is_call=True,
             )
         except Exception:
             iv = realized_vol
 
         vol_spread = iv - realized_vol
-
-        # V2: Track VRP
         self.vol_est.record_iv(iv)
         self.vol_est.record_rv(realized_vol)
         vrp = self.vol_est.get_vrp()
 
-        # VRP signal interpretation
-        if vrp > 0.20:  # IV exceeds RV by 20%+
-            vrp_signal = "FADE_EXTREME"  # Market overpricing vol → fade extreme prices
+        if vrp > 0.20:
+            vrp_signal = "FADE_EXTREME"
         elif vrp < -0.05:
-            vrp_signal = "VOL_CHEAP"     # Rare: market underpricing vol
+            vrp_signal = "VOL_CHEAP"
         else:
             vrp_signal = "NEUTRAL"
 
-        # ---- Step 4: Compute edge on both sides ----
+        return iv, vol_spread, vrp, vrp_signal
+
+    def _determine_direction(self, model, yes_market_price, no_market_price):
+        """Pick the side with more edge and determine trade direction."""
         yes_edge = model.yes_fair_value - yes_market_price
         no_edge = model.no_fair_value - no_market_price
 
-        # Pick the side with more edge
         if abs(yes_edge) >= abs(no_edge):
-            primary_edge = yes_edge
             if yes_edge > 0:
-                direction = "BUY_YES"
-                trade_price = yes_market_price
-                model_prob = model.yes_fair_value
+                return "BUY_YES", yes_edge, yes_market_price, model.yes_fair_value
             else:
-                direction = "BUY_NO"
-                trade_price = no_market_price
-                primary_edge = no_edge
-                model_prob = model.no_fair_value
+                return "BUY_NO", no_edge, no_market_price, model.no_fair_value
         else:
-            primary_edge = no_edge
             if no_edge > 0:
-                direction = "BUY_NO"
-                trade_price = no_market_price
-                model_prob = model.no_fair_value
+                return "BUY_NO", no_edge, no_market_price, model.no_fair_value
             else:
-                direction = "BUY_YES"
-                trade_price = yes_market_price
-                primary_edge = yes_edge
-                model_prob = model.yes_fair_value
+                return "BUY_YES", yes_edge, yes_market_price, model.yes_fair_value
 
-        abs_edge = abs(primary_edge)
-        edge_pct = abs_edge / trade_price if trade_price > 0 else 0.0
-
-        # ---- Step 5: Fee calculation — V2 CRITICAL FIX ----
-        if use_maker:
-            fee_rate = self.maker_fee  # 0%
-        else:
-            # V2: Nonlinear Polymarket taker fee
-            fee_rate = polymarket_taker_fee(trade_price)
-
+    def _compute_fees_and_ev(self, use_maker, trade_price, abs_edge, position_size_usd):
+        """Compute fee rate, fee cost, and expected PnL."""
+        fee_rate = self.maker_fee if use_maker else polymarket_taker_fee(trade_price)
         num_tokens = position_size_usd / trade_price if trade_price > 0 else 0
         expected_pnl = abs_edge * num_tokens
-        fee_cost = fee_rate * num_tokens * trade_price  # Correct nonlinear fee
+        fee_cost = fee_rate * num_tokens * trade_price
         net_expected_pnl = expected_pnl - fee_cost
+        return fee_rate, fee_cost, expected_pnl, net_expected_pnl
 
-        # ---- Step 6: Kelly criterion sizing ----
+    def _compute_kelly(self, model_prob, trade_price):
+        """Compute Kelly fraction and bet size."""
         kf = kelly_fraction(
-            true_prob=model_prob,
-            market_price=trade_price,
+            true_prob=model_prob, market_price=trade_price,
             use_half_kelly=self.use_half_kelly,
             max_fraction=self.max_kelly_fraction,
         )
-        kelly_bet = kf * self.bankroll
+        return kf, kf * self.bankroll
 
-        # ---- Step 7: Tradeability decision ----
-        # V2: More nuanced than V1's simple threshold check
-        min_edge = max(
-            self.min_edge_cents,
-            fee_rate * 2.0,  # Edge must be at least 2× the fee
-        )
+    def _evaluate_tradeability(self, abs_edge, fee_rate, net_expected_pnl,
+                               time_remaining_min, vol_confidence, kf, model,
+                               primary_edge):
+        """Determine if the detected edge is tradeable."""
+        min_edge = max(self.min_edge_cents, fee_rate * 2.0)
 
         is_tradeable = (
             abs_edge >= min_edge
             and net_expected_pnl >= self.min_edge_after_fees
             and time_remaining_min >= 1.0
-            and vol_confidence >= 0.2    # V2: Lowered from 0.3 (JD more robust)
-            and kf > 0.001              # V2: Kelly says there's an edge
+            and vol_confidence >= 0.2
+            and kf > 0.001
         )
 
-        # V2: VRP confirmation — if VRP is wide and we're fading an extreme, boost confidence
-        vrp_boost = 0.0
+        # Theta check
+        if time_remaining_min < 3.0 and abs(model.theta) * time_remaining_min > abs_edge * 0.5:
+            is_tradeable = False
+
+        return is_tradeable
+
+    def _compute_vrp_boost(self, vrp_signal, direction, yes_market_price, no_market_price):
+        """Compute VRP-based confidence boost."""
         if vrp_signal == "FADE_EXTREME":
-            # We should be fading extreme market prices
             if (direction == "BUY_NO" and yes_market_price > 0.70) or \
                (direction == "BUY_YES" and no_market_price > 0.70):
-                vrp_boost = 0.10  # Extra confidence for VRP-confirmed trades
+                return 0.10
+        return 0.0
 
-        # V2: Theta check — don't trade if time decay exceeds edge
-        if time_remaining_min < 3.0 and abs(model.theta) * time_remaining_min > abs_edge * 0.5:
-            is_tradeable = False  # Theta bleed would eat most of our edge
-
-        if not is_tradeable:
-            direction = "NO_TRADE"
-            kf = 0.0
-            kelly_bet = 0.0
-
-        # Confidence score
+    def _compute_confidence(self, vol_confidence, abs_edge, time_remaining_min,
+                            kf, vrp_boost):
+        """Compute overall confidence score."""
         edge_conf = min(1.0, abs_edge / 0.10)
         time_conf = min(1.0, time_remaining_min / 5.0)
-        confidence = (
+        return (
             vol_confidence * 0.3
             + edge_conf * 0.3
             + time_conf * 0.2
-            + (0.1 if kf > 0.01 else 0.0)  # Kelly confirms edge
+            + (0.1 if kf > 0.01 else 0.0)
             + vrp_boost
         )
 
-        if is_tradeable:
-            self._tradeable_detections += 1
-
-        signal = MispricingSignal(
-            edge=primary_edge,
-            edge_pct=edge_pct,
-            direction=direction,
-            yes_market=yes_market_price,
-            no_market=no_market_price,
-            yes_model=model.yes_fair_value,
-            no_model=model.no_fair_value,
-            spot=btc_spot,
-            strike=btc_strike,
-            vol=realized_vol,
-            time_remaining_min=time_remaining_min,
-            delta=model.delta,
-            gamma=model.gamma,
-            theta_per_min=model.theta,
-            confidence=confidence,
-            vol_confidence=vol_confidence,
-            implied_vol=iv,
-            realized_vol=realized_vol,
-            vol_spread=vol_spread,
-            vrp=vrp,
-            vrp_signal=vrp_signal,
-            expected_pnl=expected_pnl,
-            fee_cost=fee_cost,
-            net_expected_pnl=net_expected_pnl,
-            is_tradeable=is_tradeable,
-            kelly_fraction=kf,
-            kelly_bet_usd=kelly_bet,
-            pricing_method=model.method,
-        )
-
-        # ---- Logging ----
+    def _log_detection(self, signal, vol_estimate, jump_params, return_stats, model):
+        """Log the detection analysis."""
         logger.info("=" * 70)
         logger.info("BINARY OPTION MISPRICING ANALYSIS — V2")
-        logger.info(f"  BTC: spot=${btc_spot:,.2f}, strike=${btc_strike:,.2f}, T={time_remaining_min:.1f}min")
-        logger.info(f"  Vol: RV={realized_vol:.1%} ({vol_estimate.method}), IV={iv:.1%}, spread={vol_spread:+.1%}")
-        logger.info(f"  VRP: {vrp:+.1%} → {vrp_signal}")
+        logger.info(f"  BTC: spot=${signal.spot:,.2f}, strike=${signal.strike:,.2f}, T={signal.time_remaining_min:.1f}min")
+        logger.info(f"  Vol: RV={signal.realized_vol:.1%} ({vol_estimate.method}), IV={signal.implied_vol:.1%}, spread={signal.vol_spread:+.1%}")
+        logger.info(f"  VRP: {signal.vrp:+.1%} → {signal.vrp_signal}")
         logger.info(f"  Jumps: λ={jump_params.intensity:.0f}/yr, recent={jump_params.recent_jump}")
         logger.info(f"  Returns: ret={return_stats.recent_return:+.3%}, σ={return_stats.recent_return_sigma:+.2f}")
         logger.info(f"  Model: YES=${model.yes_fair_value:.4f}, NO=${model.no_fair_value:.4f} [{model.method}]")
         logger.info(f"    BSM base={model.bsm_base:.4f}, JD adj={model.jump_adjustment:+.4f}")
         logger.info(f"    MR adj={model.mean_reversion_adj:+.4f}, candle={model.candle_effect_adj:+.4f}, season={model.seasonality_adj:+.4f}")
-        logger.info(f"  Market: YES=${yes_market_price:.4f}, NO=${no_market_price:.4f}")
-        logger.info(f"  Edge: {primary_edge:+.4f} ({edge_pct:+.1%})")
-        logger.info(f"  Fee: {fee_rate:.2%} (V2 nonlinear) → cost=${fee_cost:.4f}")
-        logger.info(f"  Net EV: ${net_expected_pnl:+.4f}")
-        logger.info(f"  Kelly: f*={kf:.2%}, bet=${kelly_bet:.2f} of ${self.bankroll:.0f} bankroll")
+        logger.info(f"  Market: YES=${signal.yes_market:.4f}, NO=${signal.no_market:.4f}")
+        logger.info(f"  Edge: {signal.edge:+.4f} ({signal.edge_pct:+.1%})")
+        logger.info(f"  Fee: cost=${signal.fee_cost:.4f}, Net EV: ${signal.net_expected_pnl:+.4f}")
+        logger.info(f"  Kelly: f*={signal.kelly_fraction:.2%}, bet=${signal.kelly_bet_usd:.2f} of ${self.bankroll:.0f} bankroll")
         logger.info(f"  Greeks: Δ={model.delta:.6f}, Γ={model.gamma:.6f}, Θ={model.theta:.6f}/min")
-        logger.info(f"  → {direction} {'✓ TRADEABLE' if is_tradeable else '✗ NO TRADE'} (conf={confidence:.0%})")
+        logger.info(f"  → {signal.direction} {'✓ TRADEABLE' if signal.is_tradeable else '✗ NO TRADE'} (conf={signal.confidence:.0%})")
         logger.info("=" * 70)
 
-        return signal
 
     # ------------------------------------------------------------------
     # Exit monitoring
@@ -496,15 +436,24 @@ class MispricingDetector:
         no_market_price: float,
     ) -> ExitSignal:
         """Check if an open position should be exited mid-market."""
-        vol_estimate = self.vol_est.get_vol(method=self.vol_method)
+        current_value, unrealized_pnl, unrealized_pnl_pct = self._compute_exit_value(
+            entry_price, direction, btc_spot, btc_strike,
+            time_remaining_min, yes_market_price, no_market_price,
+        )
+        return self._build_exit_signal(
+            entry_price, current_value, unrealized_pnl,
+            unrealized_pnl_pct, time_remaining_min,
+        )
 
+    def _compute_exit_value(self, entry_price, direction, btc_spot, btc_strike,
+                            time_remaining_min, yes_market_price, no_market_price):
+        """Compute current value and unrealized PnL for an open position."""
+        vol_estimate = self.vol_est.get_vol(method=self.vol_method)
         model = self.pricer.price(
-            spot=btc_spot,
-            strike=btc_strike,
+            spot=btc_spot, strike=btc_strike,
             vol=vol_estimate.annualized_vol,
             time_remaining_min=time_remaining_min,
         )
-
         if direction == "BUY_YES":
             current_model_value = model.yes_fair_value
             current_market_value = yes_market_price
@@ -515,82 +464,49 @@ class MispricingDetector:
         current_value = max(current_model_value, current_market_value)
         unrealized_pnl = current_value - entry_price
         unrealized_pnl_pct = unrealized_pnl / entry_price if entry_price > 0 else 0.0
+        return current_value, unrealized_pnl, unrealized_pnl_pct
 
+    def _build_exit_signal(self, entry_price, current_value, unrealized_pnl,
+                           unrealized_pnl_pct, time_remaining_min):
+        """Build an ExitSignal based on PnL thresholds."""
         if unrealized_pnl_pct >= self.take_profit_pct:
             return ExitSignal(
-                action="TAKE_PROFIT",
-                current_value=current_value,
-                entry_price=entry_price,
-                unrealized_pnl=unrealized_pnl,
+                action="TAKE_PROFIT", current_value=current_value,
+                entry_price=entry_price, unrealized_pnl=unrealized_pnl,
                 unrealized_pnl_pct=unrealized_pnl_pct,
-                reason=f"Profit target hit: {unrealized_pnl_pct:.0%} >= {self.take_profit_pct:.0%}"
+                reason=f"Profit target hit: {unrealized_pnl_pct:.0%} >= {self.take_profit_pct:.0%}",
             )
-
         if unrealized_pnl_pct <= self.cut_loss_pct and time_remaining_min > 2.0:
             return ExitSignal(
-                action="CUT_LOSS",
-                current_value=current_value,
-                entry_price=entry_price,
-                unrealized_pnl=unrealized_pnl,
+                action="CUT_LOSS", current_value=current_value,
+                entry_price=entry_price, unrealized_pnl=unrealized_pnl,
                 unrealized_pnl_pct=unrealized_pnl_pct,
-                reason=f"Stop loss hit: {unrealized_pnl_pct:.0%} <= {self.cut_loss_pct:.0%}"
+                reason=f"Stop loss hit: {unrealized_pnl_pct:.0%} <= {self.cut_loss_pct:.0%}",
             )
-
-        if time_remaining_min < 2.0 and unrealized_pnl_pct < -0.20:
-            return ExitSignal(
-                action="HOLD",
-                current_value=current_value,
-                entry_price=entry_price,
-                unrealized_pnl=unrealized_pnl,
-                unrealized_pnl_pct=unrealized_pnl_pct,
-                reason=f"Near expiry ({time_remaining_min:.1f}min) — hold to resolution"
-            )
-
         return ExitSignal(
-            action="HOLD",
-            current_value=current_value,
-            entry_price=entry_price,
-            unrealized_pnl=unrealized_pnl,
+            action="HOLD", current_value=current_value,
+            entry_price=entry_price, unrealized_pnl=unrealized_pnl,
             unrealized_pnl_pct=unrealized_pnl_pct,
-            reason=f"No exit trigger (PnL={unrealized_pnl_pct:+.0%}, T={time_remaining_min:.1f}min)"
+            reason=f"No exit trigger (PnL={unrealized_pnl_pct:+.0%}, T={time_remaining_min:.1f}min)",
         )
 
     # ------------------------------------------------------------------
     # Greeks-based timing advice
     # ------------------------------------------------------------------
 
-    def optimal_entry_window(
-        self, btc_spot: float, btc_strike: float, total_market_minutes: float = 15.0,
-    ) -> dict:
+    def optimal_entry_window(self, btc_spot: float, btc_strike: float,
+                             total_market_minutes: float = 15.0) -> dict:
         """Analyze Greeks across market lifetime for optimal entry timing."""
-        vol_est = self.vol_est.get_vol(method=self.vol_method)
-        vol = vol_est.annualized_vol
-
+        vol = self.vol_est.get_vol(method=self.vol_method).annualized_vol
         analysis = []
-        for minutes_left in [14, 12, 10, 8, 6, 4, 2, 1, 0.5]:
-            model = self.pricer.price(
-                spot=btc_spot, strike=btc_strike,
-                vol=vol, time_remaining_min=minutes_left,
-            )
-            analysis.append({
-                "T_min": minutes_left,
-                "yes_fv": model.yes_fair_value,
-                "delta": model.delta,
-                "gamma": model.gamma,
-                "theta_per_min": model.theta,
-            })
-
-        best_window = max(
-            [a for a in analysis if a["T_min"] > 1.0],
-            key=lambda x: abs(x["gamma"]) / (abs(x["theta_per_min"]) + 1e-10),
-            default=analysis[0],
-        )
-
-        return {
-            "recommended_entry_T": best_window["T_min"],
-            "profile": analysis,
-            "vol_used": vol,
-        }
+        for ml in [14, 12, 10, 8, 6, 4, 2, 1, 0.5]:
+            m = self.pricer.price(spot=btc_spot, strike=btc_strike, vol=vol, time_remaining_min=ml)
+            analysis.append({"T_min": ml, "yes_fv": m.yes_fair_value,
+                           "delta": m.delta, "gamma": m.gamma, "theta_per_min": m.theta})
+        best = max([a for a in analysis if a["T_min"] > 1.0],
+                   key=lambda x: abs(x["gamma"]) / (abs(x["theta_per_min"]) + 1e-10),
+                   default=analysis[0])
+        return {"recommended_entry_T": best["T_min"], "profile": analysis, "vol_used": vol}
 
     # ------------------------------------------------------------------
     # V2: Update bankroll (for Kelly tracking)

@@ -123,323 +123,132 @@ class PolymarketBTCIntegration:
         logger.info(f"Initialized Polymarket BTC Integration [{mode}]")
     
     async def start(self) -> bool:
-        """
-        Start the Nautilus trading node with Polymarket.
-        
-        Returns:
-            True if started successfully
-        """
+        """Start the Nautilus trading node with Polymarket."""
         try:
-            logger.info("="*80)
-            logger.info("STARTING NAUTILUS-POLYMARKET INTEGRATION")
-            logger.info("="*80)
-            
-            # Create Nautilus config
+            logger.info("=" * 80 + " STARTING NAUTILUS-POLYMARKET " + "=" * 80)
             config = self._create_nautilus_config()
-            
-            # Create trading node
             self.node = TradingNode(config=config)
-            
-            # Add Polymarket factories
             self.node.add_data_client_factory(POLYMARKET, PolymarketLiveDataClientFactory)
             self.node.add_exec_client_factory(POLYMARKET, PolymarketLiveExecClientFactory)
-            
-            # Build node
-            logger.info("Building Nautilus node...")
             self.node.build()
-            
-            logger.info("✓ Nautilus node built successfully")
-            
-            # Start node asynchronously
-            logger.info("Starting node (instruments loading)...")
+            logger.info("✓ Node built, starting...")
             self.node.start()
-            
-            # Wait for instruments to load
             await asyncio.sleep(5)
-            
-            # Find BTC instrument
             await self._find_btc_instrument()
-            
             logger.info("✓ Nautilus-Polymarket integration started")
             return True
-            
         except Exception as e:
-            logger.error(f"Failed to start integration: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"Failed to start: {e}")
+            import traceback; traceback.print_exc()
             return False
-    
+
+    def _create_poly_config(self, instrument_cfg):
+        """Create Polymarket client configs from environment."""
+        env = {k: os.getenv(f"POLYMARKET_{k.upper()}")
+               for k in ("pk", "api_key", "api_secret", "passphrase")}
+        kwargs = {"private_key": env["pk"], "api_key": env["api_key"],
+                  "api_secret": env["api_secret"], "passphrase": env["passphrase"],
+                  "instrument_config": instrument_cfg}
+        return PolymarketDataClientConfig(**kwargs), PolymarketExecClientConfig(**kwargs)
+
     def _create_nautilus_config(self) -> TradingNodeConfig:
         """Create Nautilus trading node configuration."""
-        
-        # Use event_slug_builder to load ONLY BTC 15-min markets
-        # This avoids load_all=True which fetches all 151k+ instruments
-        instrument_cfg = PolymarketInstrumentProviderConfig(
-            event_slug_builder="slug_builders:build_btc_15min_slugs",
-        )
-        
-        logger.info("Loading BTC 15-min markets via event_slug_builder")
-
-        # Polymarket data client config
-        poly_data_cfg = PolymarketDataClientConfig(
-            private_key=os.getenv("POLYMARKET_PK"),
-            api_key=os.getenv("POLYMARKET_API_KEY"),
-            api_secret=os.getenv("POLYMARKET_API_SECRET"),
-            passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
-            instrument_config=instrument_cfg,
-        )
-        
-        # Polymarket execution client config
-        poly_exec_cfg = PolymarketExecClientConfig(
-            private_key=os.getenv("POLYMARKET_PK"),
-            api_key=os.getenv("POLYMARKET_API_KEY"),
-            api_secret=os.getenv("POLYMARKET_API_SECRET"),
-            passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
-            instrument_config=instrument_cfg,
-        )
-        
-        # Trading node config
-        node_config = TradingNodeConfig(
-            environment="live",
-            trader_id="BTC-15MIN-BOT-001",
-            logging=LoggingConfig(
-                log_level="ERROR",
-                log_directory="./logs/nautilus",
-            ),
+        inst_cfg = PolymarketInstrumentProviderConfig(
+            event_slug_builder="slug_builders:build_btc_15min_slugs")
+        data_cfg, exec_cfg = self._create_poly_config(inst_cfg)
+        return TradingNodeConfig(
+            environment="live", trader_id="BTC-15MIN-BOT-001",
+            logging=LoggingConfig(log_level="ERROR", log_directory="./logs/nautilus"),
             data_engine=LiveDataEngineConfig(qsize=6000),
             exec_engine=LiveExecEngineConfig(qsize=6000),
-            risk_engine=LiveRiskEngineConfig(
-                bypass=self.simulation_mode,  # Bypass in simulation
-            ),
-            data_clients={POLYMARKET: poly_data_cfg},
-            exec_clients={POLYMARKET: poly_exec_cfg},
-        )
-        
-        return node_config
-    
+            risk_engine=LiveRiskEngineConfig(bypass=self.simulation_mode),
+            data_clients={POLYMARKET: data_cfg},
+            exec_clients={POLYMARKET: exec_cfg})
+
     async def _find_btc_instrument(self) -> bool:
-        """
-        Find the BTC 15-minute prediction market instrument.
-        
-        Returns:
-            True if found
-        """
+        """Find the BTC 15-minute prediction market instrument."""
         if not self.node:
             return False
-        
-        logger.info("Searching for BTC 15-min prediction market instruments...")
-        
-        # Get all instruments from cache
         instruments = self.node.cache.instruments()
-        
         logger.info(f"Found {len(instruments)} total instruments")
-        
-        # Search for BTC 15-min instruments
-        btc_instruments = []
-        for instrument in instruments:
-            instrument_str = str(instrument.id)
-            if '.POLYMARKET' in instrument_str:
-                # Log all Polymarket instruments for debugging
-                logger.debug(f"  Polymarket instrument: {instrument.id}")
-                
-                # Check if it's a BTC market
-                # Instruments follow pattern: {condition_id}-{token_id}.POLYMARKET
-                # We loaded by slug, so any instrument here should be our BTC 15-min market
-                btc_instruments.append(instrument)
-                logger.info(f"  Found BTC 15-min instrument: {instrument.id}")
-        
-        if not btc_instruments:
-            logger.error("No BTC 15-min instruments found!")
-            logger.error("This usually means:")
-            logger.error("  1. The current 15-min market hasn't been created yet")
-            logger.error("  2. Credentials are incorrect")
-            logger.error("  3. Gamma Markets API is not enabled")
-            return False
-        
-        # Use the first BTC instrument (should be the current 15-min market)
-        self.btc_instrument_id = btc_instruments[0].id
-        logger.info(f"✓ Using BTC 15-min instrument: {self.btc_instrument_id}")
-        
-        # Log market details
-        instrument = btc_instruments[0]
-        logger.info(f"  Market details:")
-        logger.info(f"    Price precision: {instrument.price_precision}")
-        logger.info(f"    Size precision: {instrument.size_precision}")
-        logger.info(f"    Min quantity: {instrument.min_quantity}")
-        
+        btc = [i for i in instruments if '.POLYMARKET' in str(i.id)]
+        if not btc:
+            logger.error("No BTC 15-min instruments found!"); return False
+        self.btc_instrument_id = btc[0].id
+        inst = btc[0]
+        logger.info(f"✓ Using: {self.btc_instrument_id} "
+                    f"(prec={inst.price_precision}/{inst.size_precision}, min={inst.min_quantity})")
         return True
-    
-    async def place_market_order(
-        self,
-        side: str,  # "buy" or "sell"
-        size_usd: Decimal,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> Optional[str]:
-        """
-        Place market order on Polymarket.
-        
-        Args:
-            side: "buy" or "sell"
-            size_usd: Size in USD
-            metadata: Order metadata (signal info, etc.)
-            
-        Returns:
-            Order ID if successful
-        """
+
+    def _calculate_token_qty(self, size_usd, price, precision):
+        """Calculate token quantity from USD amount and price."""
+        qty = float(size_usd) / float(price) if price > 0 else float(size_usd) * 2
+        return round(qty, precision)
+
+    def _get_current_price(self):
+        """Get current mid price from cache, or default 0.5."""
+        quote = self.node.cache.quote(self.btc_instrument_id)
+        if not quote:
+            return Decimal("0.5")
+        return (quote.bid_price + quote.ask_price) / 2
+
+    async def place_market_order(self, side: str, size_usd: Decimal,
+                                  metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """Place market order on Polymarket. Returns order ID."""
         if not self.node or not self.btc_instrument_id:
-            logger.error("Integration not ready - node or instrument missing")
-            return None
-        
+            logger.error("Integration not ready"); return None
         if self.simulation_mode:
-            logger.info(f"[SIMULATION] Would place {side.upper()} order for ${size_usd}")
             return f"sim_order_{datetime.now().timestamp()}"
-        
         try:
-            # Get instrument from cache
             instrument = self.node.cache.instrument(self.btc_instrument_id)
-            
-            if not instrument:
-                logger.error(f"Instrument not in cache: {self.btc_instrument_id}")
-                return None
-            
-            # Convert side
+            if not instrument: return None
             order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
-            
-            # Get current best price from market
-            quote = self.node.cache.quote(self.btc_instrument_id)
-            
-            if not quote:
-                logger.warning("No quote available, using mid price")
-                current_price = Decimal("0.5")
-            else:
-                # Use mid price
-                current_price = (quote.bid_price + quote.ask_price) / 2
-            
-            # Calculate token quantity
-            # For Polymarket, tokens trade 0-1
-            # To spend $X, you need X / price tokens
-            if current_price > 0:
-                token_qty = float(size_usd) / float(current_price)
-            else:
-                token_qty = float(size_usd) * 2  # Fallback
-            
-            # Round to instrument precision
-            precision = instrument.size_precision
-            token_qty = round(token_qty, precision)
-            
-            # Create quantity
-            qty = Quantity(token_qty, precision=precision)
-            
-            # Generate unique order ID
-            timestamp_ms = int(datetime.now().timestamp() * 1000)
-            order_id = f"BTC-15MIN-{side.upper()}-{timestamp_ms}"
-            
-            # Create market order
-            # CRITICAL: Use quote_quantity=False to specify quantity in TOKENS
+            price = self._get_current_price()
+            token_qty = self._calculate_token_qty(size_usd, price, instrument.size_precision)
+            qty = Quantity(token_qty, precision=instrument.size_precision)
+            ts = int(datetime.now().timestamp() * 1000)
+            oid = f"BTC-15MIN-{side.upper()}-{ts}"
             order = self.node.trader.order_factory.market(
-                instrument_id=self.btc_instrument_id,
-                order_side=order_side,
-                quantity=qty,
-                client_order_id=ClientOrderId(order_id),
-                quote_quantity=False,  # TOKENS, not USD
-                time_in_force=TimeInForce.IOC,  # Immediate or cancel
-            )
-            
-            # Submit order
-            logger.info(f"Submitting order: {order_side.name} {token_qty:.6f} tokens")
-            logger.info(f"  Estimated cost: ${size_usd:.2f}")
-            logger.info(f"  Price: ${float(current_price):.4f}")
-            
+                instrument_id=self.btc_instrument_id, order_side=order_side,
+                quantity=qty, client_order_id=ClientOrderId(oid),
+                quote_quantity=False, time_in_force=TimeInForce.IOC)
+            logger.info(f"Submitting: {order_side.name} {token_qty:.6f} tokens ~${size_usd:.2f}")
             self.node.trader.submit_order(order)
-            
             self.orders_submitted += 1
-            
-            logger.info(f"✓ Order submitted: {order_id}")
-            
-            return order_id
-            
+            return oid
         except Exception as e:
-            logger.error(f"Failed to place order: {e}")
-            import traceback
-            traceback.print_exc()
-            self.orders_rejected += 1
-            return None
-    
-    async def place_limit_order(
-        self,
-        side: str,
-        size_usd: Decimal,
-        limit_price: Decimal,  # 0-1 range
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> Optional[str]:
-        """
-        Place limit order on Polymarket.
-        
-        Args:
-            side: "buy" or "sell"
-            size_usd: Size in USD
-            limit_price: Limit price (0-1 range)
-            metadata: Order metadata
-            
-        Returns:
-            Order ID if successful
-        """
+            logger.error(f"Market order failed: {e}")
+            self.orders_rejected += 1; return None
+
+    async def place_limit_order(self, side: str, size_usd: Decimal,
+                                 limit_price: Decimal,
+                                 metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """Place limit order on Polymarket. Returns order ID."""
         if not self.node or not self.btc_instrument_id:
             return None
-        
         if self.simulation_mode:
-            logger.info(f"[SIMULATION] Would place {side.upper()} limit @ ${limit_price:.4f}")
             return f"sim_order_{datetime.now().timestamp()}"
-        
         try:
             instrument = self.node.cache.instrument(self.btc_instrument_id)
-            
-            if not instrument:
-                return None
-            
-            # Convert side
+            if not instrument: return None
             order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
-            
-            # Calculate token quantity
-            token_qty = float(size_usd) / float(limit_price) if limit_price > 0 else float(size_usd) * 2
-            precision = instrument.size_precision
-            token_qty = round(token_qty, precision)
-            
-            qty = Quantity(token_qty, precision=precision)
-            
-            # Format price
+            token_qty = self._calculate_token_qty(size_usd, limit_price, instrument.size_precision)
+            qty = Quantity(token_qty, precision=instrument.size_precision)
             price = Price.from_str(f"{float(limit_price):.4f}")
-            
-            # Generate order ID
-            timestamp_ms = int(datetime.now().timestamp() * 1000)
-            order_id = f"BTC-15MIN-LIMIT-{timestamp_ms}"
-            
-            # Create limit order
+            ts = int(datetime.now().timestamp() * 1000)
+            oid = f"BTC-15MIN-LIMIT-{ts}"
             order = self.node.trader.order_factory.limit(
-                instrument_id=self.btc_instrument_id,
-                order_side=order_side,
-                quantity=qty,
-                price=price,
-                client_order_id=ClientOrderId(order_id),
-                quote_quantity=False,  # Quantity in TOKENS
-                time_in_force=TimeInForce.GTC,  # Good til cancelled
-            )
-            
-            logger.info(f"Submitting limit order: {order_side.name} {token_qty:.6f} @ ${limit_price:.4f}")
-            
+                instrument_id=self.btc_instrument_id, order_side=order_side,
+                quantity=qty, price=price, client_order_id=ClientOrderId(oid),
+                quote_quantity=False, time_in_force=TimeInForce.GTC)
+            logger.info(f"Limit: {order_side.name} {token_qty:.6f} @ ${limit_price:.4f}")
             self.node.trader.submit_order(order)
-            
             self.orders_submitted += 1
-            
-            logger.info(f"✓ Limit order submitted: {order_id}")
-            
-            return order_id
-            
+            return oid
         except Exception as e:
-            logger.error(f"Failed to place limit order: {e}")
-            self.orders_rejected += 1
-            return None
-    
+            logger.error(f"Limit order failed: {e}")
+            self.orders_rejected += 1; return None
+
     def get_open_positions(self) -> list:
         """Get open positions from Nautilus."""
         if not self.node:

@@ -90,39 +90,21 @@ class EventDispatcher:
             logger.debug(f"Unsubscribed from {event_type.value}")
     
     def dispatch(self, event: Event) -> None:
-        """
-        Dispatch event to all subscribers.
-        
-        Args:
-            event: Event to dispatch
-        """
+        """Dispatch event to all subscribers."""
         try:
-            # Update statistics
             self._event_counts[event.type] += 1
-            
-            # Add to history
             self._event_history.append(event)
             if len(self._event_history) > self._max_history:
                 self._event_history.pop(0)
-            
-            # Call all subscribers
-            subscribers = self._subscribers.get(event.type, [])
-            
-            for callback in subscribers:
+            subs = self._subscribers.get(event.type, [])
+            for cb in subs:
                 try:
-                    callback(event)
+                    cb(event)
                 except Exception as e:
-                    logger.error(
-                        f"Error in event subscriber for {event.type.value}: {e}"
-                    )
-            
-            logger.debug(
-                f"Dispatched {event.type.value} to {len(subscribers)} subscribers"
-            )
-            
+                    logger.error(f"Subscriber error for {event.type.value}: {e}")
         except Exception as e:
-            logger.error(f"Error dispatching event: {e}")
-    
+            logger.error(f"Dispatch error: {e}")
+
     def dispatch_price_update(
         self,
         source: str,

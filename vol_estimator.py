@@ -145,40 +145,35 @@ class VolEstimator:
         self.leverage_gamma = leverage_gamma
         self.jump_threshold_sigma = jump_threshold_sigma
 
-        # Raw tick buffer
-        max_ticks = int(window_minutes * 60 / max(resample_interval_sec, 1) * 10)
-        self._raw_ticks: deque = deque(maxlen=max(max_ticks, 1000))
-
-        # Resampled price series (1-minute bars)
-        max_bars = int(window_minutes / (resample_interval_sec / 60)) + 10
-        self._bars: deque = deque(maxlen=max(max_bars, 200))
-        self._last_bar_time: float = 0.0
-
-        # Cache
-        self._cached_vol: Optional[VolEstimate] = None
-        self._cache_time: float = 0.0
-        self._cache_ttl: float = 10.0
-
-        # EWMA decay factor
         self._ewma_lambda = 1.0 - math.log(2) / max(ewma_halflife_samples, 1)
-
-        # V2: Jump tracking
-        self._detected_jumps: deque = deque(maxlen=100)  # (timestamp, return_size)
-        self._recent_jump_window_sec: float = 300.0  # 5 minutes
-
-        # V2: VRP tracking
-        self._iv_observations: deque = deque(maxlen=50)  # (timestamp, iv)
-        self._rv_observations: deque = deque(maxlen=50)  # (timestamp, rv)
-
-        # V2: Simulated time for backtesting
-        # When set, get_vol() uses this instead of time.time() for pruning
         self._simulated_time: Optional[float] = None
+
+        self._init_buffers()
 
         logger.info(
             f"Initialized VolEstimator V2: window={window_minutes}min, "
             f"resample={resample_interval_sec}s, default_vol={default_vol:.0%}, "
             f"leverage_gamma={leverage_gamma}, jump_threshold={jump_threshold_sigma}σ"
         )
+
+    def _init_buffers(self):
+        """Initialize all internal data buffers."""
+        max_ticks = int(self.window_minutes * 60 / max(self.resample_interval_sec, 1) * 10)
+        self._raw_ticks: deque = deque(maxlen=max(max_ticks, 1000))
+
+        max_bars = int(self.window_minutes / (self.resample_interval_sec / 60)) + 10
+        self._bars: deque = deque(maxlen=max(max_bars, 200))
+        self._last_bar_time: float = 0.0
+
+        self._cached_vol: Optional[VolEstimate] = None
+        self._cache_time: float = 0.0
+        self._cache_ttl: float = 10.0
+
+        self._detected_jumps: deque = deque(maxlen=100)
+        self._recent_jump_window_sec: float = 300.0
+
+        self._iv_observations: deque = deque(maxlen=50)
+        self._rv_observations: deque = deque(maxlen=50)
 
     # ------------------------------------------------------------------
     # Data ingestion
@@ -232,44 +227,51 @@ class VolEstimator:
     # Vol estimation
     # ------------------------------------------------------------------
 
+    def _default_vol_estimate(self, now):
+        """Return a default vol estimate when insufficient data."""
+        return VolEstimate(
+            annualized_vol=self.default_vol, sample_minutes=0.0,
+            num_returns=len(self._bars) - 1 if self._bars else 0,
+            vol_per_minute=self.default_vol / math.sqrt(MINUTES_PER_YEAR),
+            method="default", confidence=0.0, timestamp=now)
+
     def get_vol(self, method: str = "ewma") -> VolEstimate:
         """Get current realized vol. Methods: 'close_to_close', 'ewma', 'parkinson'."""
         now = self._now()
-
-        if (self._cached_vol is not None
-                and now - self._cache_time < self._cache_ttl
+        if (self._cached_vol is not None and now - self._cache_time < self._cache_ttl
                 and self._cached_vol.method == method):
             return self._cached_vol
 
-        # Prune old bars
         cutoff = now - self.window_minutes * 60
         while self._bars and self._bars[0].timestamp < cutoff:
             self._bars.popleft()
 
         if len(self._bars) < self.min_samples + 1:
-            estimate = VolEstimate(
-                annualized_vol=self.default_vol,
-                sample_minutes=0.0,
-                num_returns=len(self._bars) - 1 if self._bars else 0,
-                vol_per_minute=self.default_vol / math.sqrt(MINUTES_PER_YEAR),
-                method="default",
-                confidence=0.0,
-                timestamp=now,
-            )
-            self._cached_vol = estimate
-            self._cache_time = now
-            return estimate
-
-        if method == "ewma":
-            estimate = self._ewma_vol_v2()
+            est = self._default_vol_estimate(now)
+        elif method == "ewma":
+            est = self._ewma_vol_v2()
         elif method == "parkinson":
-            estimate = self._parkinson_vol()
+            est = self._parkinson_vol()
         else:
-            estimate = self._close_to_close_vol()
+            est = self._close_to_close_vol()
 
-        self._cached_vol = estimate
+        self._cached_vol = est
         self._cache_time = now
-        return estimate
+        return est
+
+    def _compute_ewma_variance(self, log_returns: list) -> float:
+        """Compute EWMA variance with EGARCH-style leverage effect."""
+        lam = self._ewma_lambda
+        gamma = self.leverage_gamma
+        ewma_var = log_returns[0] ** 2
+
+        for lr in log_returns[1:]:
+            innovation = lr * lr
+            if lr < 0:
+                innovation *= (1.0 + gamma)
+            ewma_var = lam * ewma_var + (1 - lam) * innovation
+
+        return ewma_var
 
     def _ewma_vol_v2(self) -> VolEstimate:
         """
@@ -277,10 +279,6 @@ class VolEstimator:
 
         Standard EWMA: σ²_t = λ·σ²_{t-1} + (1-λ)·r²_t
         V2 with leverage: σ²_t = λ·σ²_{t-1} + (1-λ)·r²_t + γ·I(r<0)·r²_t
-
-        The γ (leverage_gamma) term makes negative returns contribute MORE
-        to volatility than positive returns of the same magnitude.
-        This matches EGARCH(1,1) behavior found optimal for BTC.
         """
         now = self._now()
         bars = list(self._bars)
@@ -292,39 +290,38 @@ class VolEstimator:
                 log_returns.append(lr)
 
         if len(log_returns) < self.min_samples:
-            return VolEstimate(
-                annualized_vol=self.default_vol, sample_minutes=0.0,
-                num_returns=len(log_returns),
-                vol_per_minute=self.default_vol / math.sqrt(MINUTES_PER_YEAR),
-                method="default", confidence=0.0, timestamp=now,
-            )
+            return self._default_vol_estimate(now, len(log_returns))
 
-        lam = self._ewma_lambda
-        gamma = self.leverage_gamma
-        ewma_var = log_returns[0] ** 2
+        ewma_var = self._compute_ewma_variance(log_returns)
+        return self._build_vol_estimate(
+            ewma_var, bars, log_returns, "ewma", now
+        )
 
-        for lr in log_returns[1:]:
-            # Standard EWMA component
-            innovation = lr * lr
-            # EGARCH leverage: negative returns get extra weight
-            if lr < 0:
-                innovation *= (1.0 + gamma)
-            ewma_var = lam * ewma_var + (1 - lam) * innovation
+    def _default_vol_estimate(self, now: float, num_returns: int) -> VolEstimate:
+        """Return default vol estimate when insufficient data."""
+        return VolEstimate(
+            annualized_vol=self.default_vol, sample_minutes=0.0,
+            num_returns=num_returns,
+            vol_per_minute=self.default_vol / math.sqrt(MINUTES_PER_YEAR),
+            method="default", confidence=0.0, timestamp=now,
+        )
 
-        vol_per_interval = math.sqrt(max(ewma_var, 1e-20))
-
+    def _build_vol_estimate(
+        self, variance: float, bars: list, log_returns: list,
+        method: str, now: float,
+    ) -> VolEstimate:
+        """Build a VolEstimate from computed variance."""
+        vol_per_interval = math.sqrt(max(variance, 1e-20))
         interval_minutes = self.resample_interval_sec / 60.0
         vol_per_minute = vol_per_interval / math.sqrt(interval_minutes) if interval_minutes > 0 else 0.0
         annualized = vol_per_minute * math.sqrt(MINUTES_PER_YEAR)
         annualized = max(0.10, min(3.0, annualized))
-
         sample_minutes = (bars[-1].timestamp - bars[0].timestamp) / 60.0
         confidence = min(1.0, len(log_returns) / 30.0)
-
         return VolEstimate(
             annualized_vol=annualized, sample_minutes=sample_minutes,
             num_returns=len(log_returns), vol_per_minute=vol_per_minute,
-            method="ewma", confidence=confidence, timestamp=now,
+            method=method, confidence=confidence, timestamp=now,
         )
 
     def _close_to_close_vol(self) -> VolEstimate:
@@ -338,30 +335,11 @@ class VolEstimator:
                 log_returns.append(math.log(bars[i].price / bars[i - 1].price))
 
         if len(log_returns) < self.min_samples:
-            return VolEstimate(
-                annualized_vol=self.default_vol, sample_minutes=0.0,
-                num_returns=len(log_returns),
-                vol_per_minute=self.default_vol / math.sqrt(MINUTES_PER_YEAR),
-                method="default", confidence=0.0, timestamp=now,
-            )
+            return self._default_vol_estimate(now, len(log_returns))
 
         mean_lr = sum(log_returns) / len(log_returns)
         variance = sum((lr - mean_lr) ** 2 for lr in log_returns) / (len(log_returns) - 1)
-        vol_per_interval = math.sqrt(variance)
-
-        interval_minutes = self.resample_interval_sec / 60.0
-        vol_per_minute = vol_per_interval / math.sqrt(interval_minutes) if interval_minutes > 0 else 0.0
-        annualized = vol_per_minute * math.sqrt(MINUTES_PER_YEAR)
-        annualized = max(0.10, min(3.0, annualized))
-
-        sample_minutes = (bars[-1].timestamp - bars[0].timestamp) / 60.0
-        confidence = min(1.0, len(log_returns) / 30.0)
-
-        return VolEstimate(
-            annualized_vol=annualized, sample_minutes=sample_minutes,
-            num_returns=len(log_returns), vol_per_minute=vol_per_minute,
-            method="close_to_close", confidence=confidence, timestamp=now,
-        )
+        return self._build_vol_estimate(variance, bars, log_returns, "close_to_close", now)
 
     def _parkinson_vol(self) -> VolEstimate:
         """Parkinson high-low vol estimator."""
@@ -371,6 +349,18 @@ class VolEstimator:
         if len(bars) < self.min_samples:
             return self._close_to_close_vol()
 
+        sum_sq, valid_bars = self._parkinson_sum_squares(bars)
+
+        if valid_bars < self.min_samples:
+            return self._close_to_close_vol()
+
+        parkinson_var = sum_sq / (4.0 * valid_bars * math.log(2))
+        # Use valid_bars as pseudo-returns count for confidence
+        pseudo_returns = [0.0] * valid_bars  # placeholder for _build_vol_estimate
+        return self._build_vol_estimate(parkinson_var, bars, pseudo_returns, "parkinson", now)
+
+    def _parkinson_sum_squares(self, bars: list) -> tuple:
+        """Compute Parkinson high-low sum of squares."""
         sum_sq = 0.0
         valid_bars = 0
         for bar in bars:
@@ -379,26 +369,7 @@ class VolEstimator:
                 if hl_ratio > 0:
                     sum_sq += math.log(hl_ratio) ** 2
                     valid_bars += 1
-
-        if valid_bars < self.min_samples:
-            return self._close_to_close_vol()
-
-        parkinson_var = sum_sq / (4.0 * valid_bars * math.log(2))
-        vol_per_interval = math.sqrt(parkinson_var)
-
-        interval_minutes = self.resample_interval_sec / 60.0
-        vol_per_minute = vol_per_interval / math.sqrt(interval_minutes) if interval_minutes > 0 else 0.0
-        annualized = vol_per_minute * math.sqrt(MINUTES_PER_YEAR)
-        annualized = max(0.10, min(3.0, annualized))
-
-        sample_minutes = (bars[-1].timestamp - bars[0].timestamp) / 60.0
-        confidence = min(1.0, valid_bars / 30.0)
-
-        return VolEstimate(
-            annualized_vol=annualized, sample_minutes=sample_minutes,
-            num_returns=valid_bars, vol_per_minute=vol_per_minute,
-            method="parkinson", confidence=confidence, timestamp=now,
-        )
+        return sum_sq, valid_bars
 
     # ------------------------------------------------------------------
     # V2: Jump detection
@@ -426,8 +397,6 @@ class VolEstimator:
     def get_jump_params(self) -> JumpEstimate:
         """
         Export jump parameters for Merton jump-diffusion pricer.
-
-        Estimates λ (intensity), μ_J (mean), σ_J (vol) from detected jumps.
         Falls back to conservative defaults when insufficient data.
         """
         now = self._now()
@@ -439,26 +408,28 @@ class VolEstimator:
         num_jumps = len(self._detected_jumps)
         window_years = self.window_minutes / MINUTES_PER_YEAR
 
-        # Recent jump check (last 5 minutes)
         recent_jump = any(
             ts > now - self._recent_jump_window_sec
             for ts, _ in self._detected_jumps
         )
 
         if num_jumps < 2:
-            # Conservative defaults: ~4 jumps/day, slight negative bias
             return JumpEstimate(
-                intensity=1500.0,   # ~4/day
-                mean=-0.0008,       # Slight negative (liquidation cascades)
-                vol=0.003,          # ~0.3% typical jump size
+                intensity=1500.0, mean=-0.0008, vol=0.003,
                 recent_jump=recent_jump,
-                num_jumps_detected=num_jumps,
-                confidence=0.1,
+                num_jumps_detected=num_jumps, confidence=0.1,
             )
 
-        # Estimate from data
         jump_returns = [lr for _, lr in self._detected_jumps]
+        return self._estimate_jump_distribution(
+            jump_returns, window_years, num_jumps, recent_jump
+        )
 
+    def _estimate_jump_distribution(
+        self, jump_returns: list, window_years: float,
+        num_jumps: int, recent_jump: bool,
+    ) -> JumpEstimate:
+        """Estimate jump distribution parameters from detected jumps."""
         intensity = num_jumps / window_years if window_years > 0 else 1500.0
         mean_jump = sum(jump_returns) / len(jump_returns)
         var_jump = (
@@ -467,23 +438,17 @@ class VolEstimator:
         )
         vol_jump = math.sqrt(max(var_jump, 1e-10))
 
-        # Clamp to reasonable ranges
         intensity = max(100.0, min(50000.0, intensity))
         vol_jump = max(0.001, min(0.05, vol_jump))
-
         confidence = min(1.0, num_jumps / 10.0)
 
-        # If we just had a jump, increase intensity (Hawkes self-excitation)
         if recent_jump:
-            intensity *= 2.0  # Jumps cluster: double intensity after recent jump
+            intensity *= 2.0  # Hawkes self-excitation
 
         return JumpEstimate(
-            intensity=intensity,
-            mean=mean_jump,
-            vol=vol_jump,
+            intensity=intensity, mean=mean_jump, vol=vol_jump,
             recent_jump=recent_jump,
-            num_jumps_detected=num_jumps,
-            confidence=confidence,
+            num_jumps_detected=num_jumps, confidence=confidence,
         )
 
     # ------------------------------------------------------------------
@@ -493,13 +458,7 @@ class VolEstimator:
     def get_return_stats(
         self, reference_price: Optional[float] = None
     ) -> ReturnStats:
-        """
-        Compute return statistics for mean reversion and other overlays.
-
-        Args:
-            reference_price: BTC price at market open (strike). If None,
-                            uses the first bar's price as reference.
-        """
+        """Compute return statistics for mean reversion and other overlays."""
         bars = list(self._bars)
 
         if len(bars) < 2:
@@ -509,41 +468,27 @@ class VolEstimator:
                 num_returns=0,
             )
 
-        # Recent return vs reference
         current_price = bars[-1].price
         ref_price = reference_price or bars[0].price
+        recent_return = (current_price - ref_price) / ref_price if ref_price > 0 and current_price > 0 else 0.0
+        recent_sigma = self._compute_recent_sigma(bars, recent_return)
+        log_returns = [math.log(bars[i].price / bars[i-1].price)
+                       for i in range(1, len(bars)) if bars[i-1].price > 0 and bars[i].price > 0]
+        autocorr = self._compute_autocorr(log_returns) if len(log_returns) > 5 else 0.0
 
-        if ref_price > 0 and current_price > 0:
-            recent_return = (current_price - ref_price) / ref_price
-        else:
-            recent_return = 0.0
+        return ReturnStats(
+            recent_return=recent_return, recent_return_sigma=recent_sigma,
+            rolling_autocorr=autocorr, mean_reversion_active=abs(recent_sigma) > 1.5,
+            num_returns=len(log_returns))
 
-        # Return in sigma units
+    def _compute_recent_sigma(self, bars: list, recent_return: float) -> float:
+        """Compute recent return in sigma units."""
         vol_est = self.get_vol(method="ewma")
         elapsed_minutes = (bars[-1].timestamp - bars[0].timestamp) / 60.0
         if vol_est.vol_per_minute > 0 and elapsed_minutes > 0:
             expected_move = vol_est.vol_per_minute * math.sqrt(max(elapsed_minutes, 0.1))
-            recent_sigma = recent_return / expected_move if expected_move > 0 else 0.0
-        else:
-            recent_sigma = 0.0
-
-        # Rolling first-order autocorrelation of returns
-        log_returns = []
-        for i in range(1, len(bars)):
-            if bars[i - 1].price > 0 and bars[i].price > 0:
-                log_returns.append(math.log(bars[i].price / bars[i - 1].price))
-
-        autocorr = self._compute_autocorr(log_returns) if len(log_returns) > 5 else 0.0
-
-        mean_reversion_active = abs(recent_sigma) > 1.5
-
-        return ReturnStats(
-            recent_return=recent_return,
-            recent_return_sigma=recent_sigma,
-            rolling_autocorr=autocorr,
-            mean_reversion_active=mean_reversion_active,
-            num_returns=len(log_returns),
-        )
+            return recent_return / expected_move if expected_move > 0 else 0.0
+        return 0.0
 
     def _compute_autocorr(self, returns: list) -> float:
         """Compute first-order autocorrelation of return series."""

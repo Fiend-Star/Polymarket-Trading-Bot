@@ -37,81 +37,63 @@ class MetricsHandler(BaseHTTPRequestHandler):
     
     exporter = None  # Will be set by the main class
     
-    def do_GET(self):
-        """Handle GET requests - serve metrics."""
-        parsed = urllib.parse.urlparse(self.path)
-        
-        # Root path - show help
-        if parsed.path == '/' or parsed.path == '':
+    def _send_json(self, data, status=200, cors=False):
+        """Send JSON response."""
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        if cors:
+            self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(data if isinstance(data, bytes) else data.encode())
+
+    def _serve_root(self):
+        """Serve root HTML page."""
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html')
+        self.end_headers()
+        self.wfile.write(b"<html><body><h1>Polymarket Bot Metrics</h1>"
+                        b"<p><a href='/metrics'>/metrics</a> | <a href='/health'>/health</a></p>"
+                        b"</body></html>")
+
+    def _serve_metrics(self):
+        """Serve Prometheus metrics."""
+        try:
+            data = generate_latest(REGISTRY)
             self.send_response(200)
-            self.send_header('Content-Type', 'text/html')
-            self.end_headers()
-            self.wfile.write(b"""
-            <html>
-            <head><title>Polymarket Bot Metrics</title></head>
-            <body>
-            <h1>Polymarket Trading Bot Metrics</h1>
-            <p>Metrics available at <a href="/metrics">/metrics</a></p>
-            <p>Health check at <a href="/health">/health</a></p>
-            </body>
-            </html>
-            """)
-            return
-        
-        # Health check endpoint
-        if parsed.path == '/health':
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"status": "healthy"}')
-            return
-        
-        # Metrics endpoint - this is what Prometheus scrapes
-        if parsed.path == '/metrics':
-            try:
-                # Generate metrics in Prometheus format
-                metrics_data = generate_latest(REGISTRY)
-                
-                self.send_response(200)
-                self.send_header('Content-Type', CONTENT_TYPE_LATEST)
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-                self.send_header('Access-Control-Allow-Headers', 'Accept, Content-Type')
-                self.end_headers()
-                self.wfile.write(metrics_data)
-                return
-                
-            except Exception as e:
-                logger.error(f"Error generating metrics: {e}")
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(f"Error: {e}".encode())
-                return
-        
-        # Handle Grafana's API probe (this fixes the 405 error)
-        if parsed.path.startswith('/api/v1/'):
-            # Return a minimal JSON response that Grafana accepts
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Type', CONTENT_TYPE_LATEST)
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-            
-            # For label queries, return empty list
-            if 'labels' in parsed.path:
-                self.wfile.write(b'{"status":"success","data":[]}')
-            # For query requests, return empty result
-            elif 'query' in parsed.path:
-                self.wfile.write(b'{"status":"success","data":{"resultType":"vector","result":[]}}')
-            # Default response
-            else:
-                self.wfile.write(b'{"status":"success"}')
-            return
-        
-        # Handle CORS preflight
-        self.send_response(404)
-        self.end_headers()
-        self.wfile.write(b"Not Found")
-    
+            self.wfile.write(data)
+        except Exception as e:
+            logger.error(f"Error generating metrics: {e}")
+            self.send_response(500); self.end_headers()
+            self.wfile.write(f"Error: {e}".encode())
+
+    def _serve_api(self, path):
+        """Handle Grafana API probe requests."""
+        if 'labels' in path:
+            body = b'{"status":"success","data":[]}'
+        elif 'query' in path:
+            body = b'{"status":"success","data":{"resultType":"vector","result":[]}}'
+        else:
+            body = b'{"status":"success"}'
+        self._send_json(body, cors=True)
+
+    def do_GET(self):
+        """Handle GET requests - route to appropriate handler."""
+        path = urllib.parse.urlparse(self.path).path
+        if path in ('/', ''):
+            self._serve_root()
+        elif path == '/health':
+            self._send_json(b'{"status": "healthy"}')
+        elif path == '/metrics':
+            self._serve_metrics()
+        elif path.startswith('/api/v1/'):
+            self._serve_api(path)
+        else:
+            self.send_response(404); self.end_headers()
+            self.wfile.write(b"Not Found")
+
     def do_POST(self):
         """Handle POST requests - forward to GET for metrics, handle API queries."""
         parsed = urllib.parse.urlparse(self.path)
@@ -206,143 +188,60 @@ class GrafanaMetricsExporter:
     
     def _setup_metrics(self) -> None:
         """Setup Prometheus metrics."""
-        
-        # Performance metrics
-        self.total_pnl = Gauge(
-            'trading_total_pnl',
-            'Total profit/loss in USD'
-        )
-        
-        self.roi = Gauge(
-            'trading_roi',
-            'Return on investment as percentage'
-        )
-        
-        self.win_rate = Gauge(
-            'trading_win_rate',
-            'Percentage of winning trades'
-        )
-        
-        self.sharpe_ratio = Gauge(
-            'trading_sharpe_ratio',
-            'Sharpe ratio'
-        )
-        
-        self.max_drawdown = Gauge(
-            'trading_max_drawdown',
-            'Maximum drawdown as percentage'
-        )
-        
-        # Trade counters
-        self.total_trades = Counter(
-            'trades_total',
-            'Total number of trades executed'
-        )
-        
-        self.winning_trades = Counter(
-            'trading_winning_trades',
-            'Number of winning trades'
-        )
-        
-        self.losing_trades = Counter(
-            'trading_losing_trades',
-            'Number of losing trades'
-        )
-        
-        # Position metrics
-        self.open_positions = Gauge(
-            'trading_open_positions',
-            'Number of currently open positions'
-        )
-        
-        self.total_exposure = Gauge(
-            'trading_total_exposure',
-            'Total exposure in USD'
-        )
-        
-        # Risk metrics
-        self.risk_utilization = Gauge(
-            'trading_risk_utilization',
-            'Percentage of risk limits utilized'
-        )
-        
-        self.current_capital = Gauge(
-            'trading_current_capital',
-            'Current account capital in USD'
-        )
-        
-        # Signal metrics
-        self.avg_signal_score = Gauge(
-            'trading_avg_signal_score',
-            'Average signal score (0-100)'
-        )
-        
-        self.avg_signal_confidence = Gauge(
-            'trading_avg_signal_confidence',
-            'Average signal confidence (0-1)'
-        )
-        
-        # Trade timing
+        self._setup_gauges()
+        self._setup_counters()
         self.trade_duration = Histogram(
-            'trading_trade_duration_seconds',
-            'Trade duration in seconds',
-            buckets=[60, 300, 900, 1800, 3600, 7200, 14400, 28800]  # 1m to 8h
-        )
-        
-        # Order metrics
-        self.orders_placed = Counter(
-            'trading_orders_placed',
-            'Total orders placed'
-        )
-        
-        self.orders_filled = Counter(
-            'trading_orders_filled',
-            'Total orders filled'
-        )
-        
-        self.orders_rejected = Counter(
-            'trading_orders_rejected',
-            'Total orders rejected'
-        )
+            'trading_trade_duration_seconds', 'Trade duration in seconds',
+            buckets=[60, 300, 900, 1800, 3600, 7200, 14400, 28800])
+
+    def _setup_gauges(self):
+        """Setup all Gauge metrics."""
+        gauge_defs = [
+            ('total_pnl', 'trading_total_pnl', 'Total profit/loss in USD'),
+            ('roi', 'trading_roi', 'Return on investment as percentage'),
+            ('win_rate', 'trading_win_rate', 'Percentage of winning trades'),
+            ('sharpe_ratio', 'trading_sharpe_ratio', 'Sharpe ratio'),
+            ('max_drawdown', 'trading_max_drawdown', 'Maximum drawdown as percentage'),
+            ('open_positions', 'trading_open_positions', 'Number of open positions'),
+            ('total_exposure', 'trading_total_exposure', 'Total exposure in USD'),
+            ('risk_utilization', 'trading_risk_utilization', 'Risk limits utilized pct'),
+            ('current_capital', 'trading_current_capital', 'Current capital in USD'),
+            ('avg_signal_score', 'trading_avg_signal_score', 'Average signal score'),
+            ('avg_signal_confidence', 'trading_avg_signal_confidence', 'Average confidence'),
+        ]
+        for attr, name, desc in gauge_defs:
+            setattr(self, attr, Gauge(name, desc))
+
+    def _setup_counters(self):
+        """Setup all Counter metrics."""
+        counter_defs = [
+            ('total_trades', 'trades_total', 'Total trades executed'),
+            ('winning_trades', 'trading_winning_trades', 'Winning trades'),
+            ('losing_trades', 'trading_losing_trades', 'Losing trades'),
+            ('orders_placed', 'trading_orders_placed', 'Orders placed'),
+            ('orders_filled', 'trading_orders_filled', 'Orders filled'),
+            ('orders_rejected', 'trading_orders_rejected', 'Orders rejected'),
+        ]
+        for attr, name, desc in counter_defs:
+            setattr(self, attr, Counter(name, desc))
 
     def update_metrics(self) -> None:
         """Update all metrics with current values."""
         try:
-            # Get performance metrics
-            perf_metrics = self.performance.calculate_metrics()
-            
-            # Update gauges
-            self.total_pnl.set(float(perf_metrics.total_pnl))
-            self.roi.set(perf_metrics.roi * 100)
-            self.win_rate.set(perf_metrics.win_rate * 100)
-            self.sharpe_ratio.set(perf_metrics.sharpe_ratio)
-            self.max_drawdown.set(perf_metrics.max_drawdown * 100)
-            
-            self.open_positions.set(perf_metrics.open_positions)
-            self.total_exposure.set(float(perf_metrics.total_exposure))
-            
-            self.avg_signal_score.set(perf_metrics.avg_signal_score)
-            self.avg_signal_confidence.set(perf_metrics.avg_signal_confidence)
-            
+            m = self.performance.calculate_metrics()
+            self.total_pnl.set(float(m.total_pnl))
+            self.roi.set(m.roi * 100)
+            self.win_rate.set(m.win_rate * 100)
+            self.sharpe_ratio.set(m.sharpe_ratio)
+            self.max_drawdown.set(m.max_drawdown * 100)
+            self.open_positions.set(m.open_positions)
+            self.total_exposure.set(float(m.total_exposure))
+            self.avg_signal_score.set(m.avg_signal_score)
+            self.avg_signal_confidence.set(m.avg_signal_confidence)
             self.current_capital.set(float(self.performance.current_capital))
-            
-            # Get risk metrics
-            risk_summary = self.risk.get_risk_summary()
-            
-            if risk_summary:
-                self.risk_utilization.set(
-                    risk_summary['exposure']['utilization_pct']
-                )
-            
-            # Get execution stats
-            exec_stats = self.execution.get_statistics()
-            
-            if exec_stats:
-                # Update counters if needed
-                pass
-            
-            logger.debug("Metrics updated successfully")
-            
+            risk = self.risk.get_risk_summary()
+            if risk:
+                self.risk_utilization.set(risk['exposure']['utilization_pct'])
         except Exception as e:
             logger.error(f"Error updating metrics: {e}")
     

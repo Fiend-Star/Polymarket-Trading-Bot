@@ -113,14 +113,9 @@ class RTDSConnector:
     """
 
     def __init__(
-        self,
-        vol_estimator=None,
-        on_chainlink_tick: Optional[Callable] = None,
-        on_binance_tick: Optional[Callable] = None,
-        divergence_threshold_bps: float = 5.0,
-        late_window_min_bps: float = 3.0,      # Min delta for late-window signal
-        late_window_max_sec: float = 15.0,      # Activate within last N seconds
-        late_window_high_conf_bps: float = 10.0,  # >10 bps = high confidence
+        self, vol_estimator=None, on_chainlink_tick=None, on_binance_tick=None,
+        divergence_threshold_bps=5.0, late_window_min_bps=3.0,
+        late_window_max_sec=15.0, late_window_high_conf_bps=10.0,
     ):
         self.vol_estimator = vol_estimator
         self._on_chainlink_tick = on_chainlink_tick
@@ -129,37 +124,32 @@ class RTDSConnector:
         self.late_window_min_bps = late_window_min_bps
         self.late_window_max_sec = late_window_max_sec
         self.late_window_high_conf_bps = late_window_high_conf_bps
+        self._init_price_state()
+        self._init_connection_state()
+        logger.info(f"RTDS Connector: divergence={divergence_threshold_bps}bps, late_window={late_window_max_sec}s")
 
-        # Thread-safe price state
+    def _init_price_state(self):
+        """Initialize thread-safe price tracking."""
         self._lock = threading.Lock()
         self._chainlink_price: float = 0.0
         self._chainlink_ts: int = 0
         self._binance_price: float = 0.0
         self._binance_ts: int = 0
-
-        # Price histories
         self._chainlink_ticks: Deque[PriceTick] = deque(maxlen=PRICE_HISTORY_MAXLEN)
         self._binance_ticks: Deque[PriceTick] = deque(maxlen=PRICE_HISTORY_MAXLEN)
 
-        # Connection state
+    def _init_connection_state(self):
+        """Initialize connection and stats tracking."""
         self._ws = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._connected = False
         self._reconnect_count = 0
         self._total_messages = 0
         self._should_stop = False
-
-        # Stats
         self._chainlink_msg_count = 0
         self._binance_msg_count = 0
         self._avg_latency_ms = 0.0
         self._last_divergence: Optional[DivergenceSignal] = None
-
-        logger.info(
-            f"Initialized RTDS Connector: endpoint={RTDS_WS_URL}, "
-            f"divergence_threshold={divergence_threshold_bps}bps, "
-            f"late_window_max={late_window_max_sec}s"
-        )
 
     # ==================================================================
     # Public: Price access (thread-safe)
@@ -201,25 +191,38 @@ class RTDSConnector:
     # Public: Late-window Chainlink strategy
     # ==================================================================
 
-    def get_late_window_signal(
-        self,
-        strike: float,
-        time_remaining_sec: float,
-    ) -> LateWindowSignal:
-        """
-        Late-window strategy: at T-10s, compare Chainlink price vs strike.
-        
-        At T-10 seconds, BTC direction is ~85% deterministic.
-        If Chainlink shows clear direction, signal postOnly limit order
-        at 0.90-0.95 on the winning side.
+    def _no_signal(self, px, strike, bps, trs, reason):
+        """Build a NO_SIGNAL LateWindowSignal."""
+        return LateWindowSignal(direction="NO_SIGNAL", chainlink_price=px,
+                                strike=strike, delta_bps=bps, confidence=0,
+                                time_remaining_sec=trs, reason=reason)
 
-        Research basis:
-        - "Window delta is king" — BTC price vs strike is strongest signal
-        - Direction becomes 85% knowable in final 10 seconds
-        - postOnly maker orders = 0% fee + daily rebates
-        """
-        chainlink_px = self.chainlink_btc_price
+    def get_late_window_signal(self, strike: float, time_remaining_sec: float) -> LateWindowSignal:
+        """Late-window strategy: at T-10s, compare Chainlink price vs strike."""
+        px = self.chainlink_btc_price
+        no_sig = self._validate_late_window(px, strike, time_remaining_sec)
+        if no_sig is not None:
+            return no_sig
 
+        delta_bps = (px - strike) / strike * 10000.0
+        if delta_bps > self.late_window_min_bps:
+            direction = "BUY_YES"
+        elif delta_bps < -self.late_window_min_bps:
+            direction = "BUY_NO"
+        else:
+            return self._no_signal(px, strike, delta_bps, time_remaining_sec,
+                                   f"Too close to strike: {abs(delta_bps):.1f}bps < {self.late_window_min_bps}bps")
+
+        confidence = self._compute_late_confidence(delta_bps, time_remaining_sec)
+        side = 'above' if delta_bps > 0 else 'below'
+        return LateWindowSignal(
+            direction=direction, chainlink_price=px, strike=strike,
+            delta_bps=delta_bps, confidence=confidence,
+            time_remaining_sec=time_remaining_sec,
+            reason=f"Chainlink {side} strike by {abs(delta_bps):.1f}bps")
+
+    def _validate_late_window(self, chainlink_px, strike, time_remaining_sec):
+        """Validate preconditions for late-window signal. Returns NO_SIGNAL or None."""
         if chainlink_px <= 0 or strike <= 0:
             return LateWindowSignal(
                 direction="NO_SIGNAL", chainlink_price=chainlink_px,
@@ -227,7 +230,6 @@ class RTDSConnector:
                 time_remaining_sec=time_remaining_sec,
                 reason="No Chainlink price available",
             )
-
         if time_remaining_sec > self.late_window_max_sec:
             return LateWindowSignal(
                 direction="NO_SIGNAL", chainlink_price=chainlink_px,
@@ -235,8 +237,6 @@ class RTDSConnector:
                 time_remaining_sec=time_remaining_sec,
                 reason=f"Too early: {time_remaining_sec:.0f}s > {self.late_window_max_sec}s",
             )
-
-        # Check Chainlink data freshness
         age = self.chainlink_age_ms
         if age > 5000:
             return LateWindowSignal(
@@ -245,88 +245,46 @@ class RTDSConnector:
                 time_remaining_sec=time_remaining_sec,
                 reason=f"Chainlink data stale: {age}ms old",
             )
+        return None
 
-        # Compute distance from strike
-        delta_pct = (chainlink_px - strike) / strike
-        delta_bps = delta_pct * 10000.0
-
-        # Direction
-        if delta_bps > self.late_window_min_bps:
-            direction = "BUY_YES"  # Chainlink above strike → Up wins
-        elif delta_bps < -self.late_window_min_bps:
-            direction = "BUY_NO"   # Chainlink below strike → Down wins
-        else:
-            return LateWindowSignal(
-                direction="NO_SIGNAL", chainlink_price=chainlink_px,
-                strike=strike, delta_bps=delta_bps, confidence=0,
-                time_remaining_sec=time_remaining_sec,
-                reason=f"Too close to strike: {abs(delta_bps):.1f}bps < {self.late_window_min_bps}bps",
-            )
-
-        # Confidence: scales with distance and inverse of time remaining
-        # More distance → more confident, less time → more confident
+    def _compute_late_confidence(self, delta_bps, time_remaining_sec):
+        """Compute confidence for late-window signal based on distance and time."""
         dist_factor = min(1.0, abs(delta_bps) / self.late_window_high_conf_bps)
         time_factor = min(1.0, max(0.0, (self.late_window_max_sec - time_remaining_sec)
                                    / self.late_window_max_sec))
         confidence = 0.5 + 0.35 * dist_factor + 0.15 * time_factor
-        confidence = min(0.95, confidence)  # Cap — nothing is certain
-
-        return LateWindowSignal(
-            direction=direction,
-            chainlink_price=chainlink_px,
-            strike=strike,
-            delta_bps=delta_bps,
-            confidence=confidence,
-            time_remaining_sec=time_remaining_sec,
-            reason=f"Chainlink {'above' if delta_bps > 0 else 'below'} strike by {abs(delta_bps):.1f}bps",
-        )
+        return min(0.95, confidence)
 
     # ==================================================================
     # Public: Binance-Chainlink divergence
     # ==================================================================
 
     def get_divergence(self) -> DivergenceSignal:
-        """
-        Compute Binance-Chainlink price divergence.
-        
-        When Binance leads Chainlink significantly, it suggests directional
-        pressure that the settlement oracle hasn't reflected yet.
-        This is a simplified proxy for order flow imbalance:
-        - If Binance >> Chainlink → buying pressure → BTC likely going up
-        - If Binance << Chainlink → selling pressure → BTC likely going down
-        """
+        """Compute Binance-Chainlink price divergence as directional signal."""
         with self._lock:
-            bn_px = self._binance_price
-            cl_px = self._chainlink_price
-            bn_ts = self._binance_ts
-            cl_ts = self._chainlink_ts
+            bn_px, cl_px = self._binance_price, self._chainlink_price
+            bn_ts, cl_ts = self._binance_ts, self._chainlink_ts
 
         if bn_px <= 0 or cl_px <= 0:
-            return DivergenceSignal(
-                binance_price=bn_px, chainlink_price=cl_px,
-                divergence_bps=0.0, direction="NEUTRAL",
-                is_significant=False, staleness_ms=999999,
-            )
+            return DivergenceSignal(binance_price=bn_px, chainlink_price=cl_px,
+                                   divergence_bps=0.0, direction="NEUTRAL",
+                                   is_significant=False, staleness_ms=999999)
 
         now_ms = int(time.time() * 1000)
         staleness = max(now_ms - bn_ts, now_ms - cl_ts) if bn_ts and cl_ts else 999999
+        div_bps = (bn_px - cl_px) / cl_px * 10000.0
 
-        divergence_bps = (bn_px - cl_px) / cl_px * 10000.0
-
-        if divergence_bps > self.divergence_threshold_bps:
+        if div_bps > self.divergence_threshold_bps:
             direction = "BINANCE_LEADING"
-        elif divergence_bps < -self.divergence_threshold_bps:
+        elif div_bps < -self.divergence_threshold_bps:
             direction = "CHAINLINK_LEADING"
         else:
             direction = "NEUTRAL"
 
-        is_significant = abs(divergence_bps) > self.divergence_threshold_bps
-
         signal = DivergenceSignal(
-            binance_price=bn_px, chainlink_price=cl_px,
-            divergence_bps=divergence_bps, direction=direction,
-            is_significant=is_significant, staleness_ms=staleness,
-        )
+            binance_price=bn_px, chainlink_price=cl_px, divergence_bps=div_bps,
+            direction=direction, is_significant=abs(div_bps) > self.divergence_threshold_bps,
+            staleness_ms=staleness)
         self._last_divergence = signal
         return signal
 
@@ -391,38 +349,33 @@ class RTDSConnector:
     # Internal: WebSocket connection + message handling
     # ==================================================================
 
+    async def _process_messages(self, ws):
+        """Process incoming WebSocket messages until stop/error/close."""
+        async for msg in ws:
+            if self._should_stop:
+                break
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                self._handle_message(msg.data)
+            elif msg.type == aiohttp.WSMsgType.ERROR:
+                logger.error(f"RTDS WS error: {ws.exception()}"); break
+            elif msg.type == aiohttp.WSMsgType.CLOSED:
+                logger.warning("RTDS WS closed by server"); break
+
     async def _connect_and_stream(self):
         """Establish WS connection, subscribe, and process messages."""
         self._session = aiohttp.ClientSession()
         try:
             async with self._session.ws_connect(
-                RTDS_WS_URL,
-                heartbeat=PING_INTERVAL_SEC,
+                RTDS_WS_URL, heartbeat=PING_INTERVAL_SEC,
                 timeout=aiohttp.ClientWSTimeout(ws_close=10),
             ) as ws:
                 self._ws = ws
                 self._connected = True
                 self._reconnect_count = 0
                 logger.info(f"✓ RTDS WebSocket connected: {RTDS_WS_URL}")
-
-                # Subscribe to both feeds
                 await self._subscribe(ws)
-
-                # Process messages
-                async for msg in ws:
-                    if self._should_stop:
-                        break
-
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        self._handle_message(msg.data)
-                    elif msg.type == aiohttp.WSMsgType.ERROR:
-                        logger.error(f"RTDS WS error: {ws.exception()}")
-                        break
-                    elif msg.type == aiohttp.WSMsgType.CLOSED:
-                        logger.warning("RTDS WS closed by server")
-                        break
+                await self._process_messages(ws)
         finally:
-            # Always clean up the session — prevents "Unclosed client session" warnings
             self._connected = False
             if self._session and not self._session.closed:
                 await self._session.close()
@@ -514,13 +467,19 @@ class RTDSConnector:
                 f"price=${price:,.2f}, latency={latency}ms"
             )
 
+    def _update_latency(self, latency):
+        """Update exponentially-weighted average latency."""
+        if self._chainlink_msg_count > 1:
+            self._avg_latency_ms = 0.95 * self._avg_latency_ms + 0.05 * latency
+        else:
+            self._avg_latency_ms = float(latency)
+
     def _handle_chainlink_tick(self, price, source_ts, received_ts, latency, payload):
         """Process a Chainlink BTC price tick (SETTLEMENT ORACLE)."""
         tick = PriceTick(
             source="chainlink", symbol=payload.get("symbol", "btc/usd"),
             price=price, source_timestamp_ms=source_ts,
-            received_timestamp_ms=received_ts, latency_ms=latency,
-        )
+            received_timestamp_ms=received_ts, latency_ms=latency)
 
         with self._lock:
             self._chainlink_price = price
@@ -528,29 +487,18 @@ class RTDSConnector:
         self._chainlink_ticks.append(tick)
         self._chainlink_msg_count += 1
 
-        # Chainlink IS the settlement price — more important for the model
         if self.vol_estimator:
             self.vol_estimator.add_price(price, received_ts / 1000.0)
-
         if self._on_chainlink_tick:
             try:
                 self._on_chainlink_tick(tick)
             except Exception as e:
                 logger.debug(f"Chainlink tick callback error: {e}")
 
-        # Update average latency
-        if self._chainlink_msg_count > 1:
-            alpha = 0.05
-            self._avg_latency_ms = (1 - alpha) * self._avg_latency_ms + alpha * latency
-        else:
-            self._avg_latency_ms = float(latency)
-
+        self._update_latency(latency)
         if self._chainlink_msg_count % 100 == 0:
-            logger.debug(
-                f"RTDS Chainlink: {self._chainlink_msg_count} ticks, "
-                f"price=${price:,.2f}, latency={latency}ms, "
-                f"avg_lat={self._avg_latency_ms:.0f}ms"
-            )
+            logger.debug(f"RTDS Chainlink: {self._chainlink_msg_count} ticks, "
+                        f"price=${price:,.2f}, avg_lat={self._avg_latency_ms:.0f}ms")
 
     # ==================================================================
     # Stats

@@ -32,222 +32,101 @@ app = typer.Typer()
 console = Console()
 
 
+def _ok(msg, val, fmt=None):
+    """Print check result. Returns True if val is truthy."""
+    if val:
+        console.print(f" [green]✓ {fmt(val) if fmt else msg}[/green]")
+        return True
+    console.print(f" [red]✗ {msg}[/red]")
+    return False
+
+
 async def test_instruments():
     """Test instrument registry."""
-    console.print("\n[cyan]═══ Testing Instrument Registry ═══[/cyan]")
-    
+    console.print("\n[cyan]═══ Testing Instruments ═══[/cyan]")
     try:
-        registry = get_instrument_registry()
-        
-        # Check instruments
-        console.print(f"Checking registered instruments...", end="")
-        
-        all_instruments = registry.get_all()
-        
-        if len(all_instruments) >= 3:
-            console.print(f" [green]✓ {len(all_instruments)} instruments registered[/green]")
-        else:
-            console.print(" [red]✗ Not enough instruments[/red]")
-            return False
-        
-        # Check specific instruments
-        polymarket = registry.get_polymarket()
-        coinbase = registry.get_coinbase()
-        binance = registry.get_binance()
-        
-        if polymarket and coinbase and binance:
-            console.print("[green]✓ All key instruments available:[/green]")
-            console.print(f"  - Polymarket: {polymarket.id}")
-            console.print(f"  - Coinbase: {coinbase.id}")
-            console.print(f"  - Binance: {binance.id}")
-        else:
-            console.print("[red]✗ Missing instruments[/red]")
-            return False
-        
-        console.print("[green]✓ Instrument Registry - Tests passed![/green]")
+        reg = get_instrument_registry()
+        console.print("Checking instruments...", end="")
+        if not _ok("instruments", len(reg.get_all()) >= 3, lambda n: f"{n} instruments"): return False
+        p, c, b = reg.get_polymarket(), reg.get_coinbase(), reg.get_binance()
+        if not _ok("key instruments", p and c and b): return False
+        console.print("[green]✓ Instrument Registry passed[/green]")
         return True
-        
     except Exception as e:
-        console.print(f"\n[red]Error testing instruments: {e}[/red]")
-        import traceback
-        traceback.print_exc()
-        return False
+        console.print(f"\n[red]Error: {e}[/red]"); return False
 
 
 async def test_event_dispatcher():
     """Test event dispatcher."""
     console.print("\n[cyan]═══ Testing Event Dispatcher ═══[/cyan]")
-    
     try:
-        dispatcher = get_event_dispatcher()
-        
-        # Test subscription
-        console.print("Testing event subscription...", end="")
-        
-        events_received = []
-        
-        def on_price_update(event: Event):
-            events_received.append(event)
-        
-        dispatcher.subscribe(EventType.PRICE_UPDATE, on_price_update)
-        
-        console.print(" [green]✓ Subscribed[/green]")
-        
-        # Test dispatching
-        console.print("Testing event dispatch...", end="")
-        
-        dispatcher.dispatch_price_update(
-            source="test",
-            price=65000.0,
-            metadata={"test": True}
-        )
-        
-        if len(events_received) == 1:
-            console.print(" [green]✓ Event received[/green]")
-            event = events_received[0]
-            console.print(f"  Event type: {event.type.value}")
-            console.print(f"  Source: {event.source}")
-            console.print(f"  Data: {event.data}")
-        else:
-            console.print(" [red]✗ Event not received[/red]")
-            return False
-        
-        # Test statistics
-        console.print("Checking statistics...", end="")
-        stats = dispatcher.get_statistics()
-        
-        if stats["total_events"] > 0:
-            console.print(" [green]✓ Statistics available[/green]")
-            console.print(f"  Total events: {stats['total_events']}")
-        
-        console.print("[green]✓ Event Dispatcher - Tests passed![/green]")
+        d = get_event_dispatcher()
+        evts = []
+        d.subscribe(EventType.PRICE_UPDATE, lambda e: evts.append(e))
+        console.print("Testing dispatch...", end="")
+        d.dispatch_price_update(source="test", price=65000.0, metadata={"test": True})
+        if not _ok("event received", len(evts) == 1): return False
+        console.print(f"  type={evts[0].type.value} src={evts[0].source}")
+        stats = d.get_statistics()
+        console.print(f"  total_events={stats['total_events']}")
+        console.print("[green]✓ Event Dispatcher passed[/green]")
         return True
-        
     except Exception as e:
-        console.print(f"\n[red]Error testing event dispatcher: {e}[/red]")
-        import traceback
-        traceback.print_exc()
-        return False
+        console.print(f"\n[red]Error: {e}[/red]"); return False
+
+
+async def _test_engine_streaming(engine):
+    """Test data streaming and consensus for engine."""
+    console.print("Streaming (10s)...", end="")
+    await asyncio.sleep(10)
+    console.print(" [green]✓[/green]")
+    console.print("Checking consensus...", end="")
+    c = engine.get_price_consensus()
+    if c:
+        console.print(f" [green]✓ avg=${c['average']:,.2f}[/green]")
+    else:
+        console.print(" [yellow]⚠ No consensus yet[/yellow]")
 
 
 async def test_data_engine():
     """Test Nautilus data engine integration."""
-    console.print("\n[cyan]═══ Testing Nautilus Data Engine ═══[/cyan]")
-    
+    console.print("\n[cyan]═══ Testing Data Engine ═══[/cyan]")
+    engine = get_nautilus_engine()
     try:
-        engine = get_nautilus_engine()
-        
-        # Start engine
-        console.print("Starting Nautilus data engine...", end="")
+        console.print("Starting engine...", end="")
         await engine.start()
-        
-        status = engine.get_status()
-        
-        if status["is_running"]:
-            console.print(" [green]✓ Engine started[/green]")
-        else:
-            console.print(" [red]✗ Engine failed to start[/red]")
-            return False
-        
-        # Check instruments
-        console.print(f"Checking registered instruments...", end="")
-        
-        if status["instruments_registered"] >= 3:
-            console.print(f" [green]✓ {status['instruments_registered']} instruments[/green]")
-        else:
-            console.print(" [red]✗ Instruments not registered[/red]")
-        
-        # Check data provider
-        console.print("Checking data provider connection...", end="")
-        
-        if status["data_provider_connected"]:
-            console.print(" [green]✓ Data provider connected[/green]")
-        else:
-            console.print(" [yellow]⚠ Data provider not connected[/yellow]")
-        
-        # Let data stream for a bit
-        console.print("Streaming data (10 seconds)...", end="")
-        await asyncio.sleep(10)
-        console.print(" [green]✓ Completed[/green]")
-        
-        # Check price consensus
-        console.print("Checking price consensus...", end="")
-        consensus = engine.get_price_consensus()
-        
-        if consensus:
-            console.print(" [green]✓ Consensus available[/green]")
-            console.print(f"  Average price: ${consensus['average']:,.2f}")
-            console.print(f"  Sources: {', '.join(consensus['sources'].keys())}")
-        else:
-            console.print(" [yellow]⚠ No consensus yet (may need more time)[/yellow]")
-        
-        # Stop engine
-        console.print("Stopping engine...", end="")
+        s = engine.get_status()
+        if not _ok("engine started", s["is_running"]): return False
+        console.print(f"  instruments={s['instruments_registered']}")
+        await _test_engine_streaming(engine)
         await engine.stop()
-        console.print(" [green]✓ Stopped[/green]")
-        
-        console.print("[green]✓ Nautilus Data Engine - Tests passed![/green]")
+        console.print("[green]✓ Data Engine passed[/green]")
         return True
-        
     except Exception as e:
-        console.print(f"\n[red]Error testing data engine: {e}[/red]")
-        import traceback
-        traceback.print_exc()
-        
-        # Make sure to stop engine
-        try:
-            await engine.stop()
-        except:
-            pass
-        
+        console.print(f"\n[red]Error: {e}[/red]")
+        try: await engine.stop()
+        except: pass
         return False
 
 
 async def run_all_tests():
     """Run all Phase 3 tests."""
-    console.print(Panel.fit(
-        "[bold cyan]PHASE 3: NAUTILUS CORE - TEST SUITE[/bold cyan]\n\n"
-        "Testing Nautilus integration...",
-        border_style="cyan"
-    ))
-    
-    results = {}
-    
-    # Test each component
-    results["Instrument Registry"] = await test_instruments()
-    results["Event Dispatcher"] = await test_event_dispatcher()
-    results["Nautilus Data Engine"] = await test_data_engine()
-    
-    # Summary
-    console.print("\n" + "="*60)
-    console.print("[bold]TEST SUMMARY[/bold]")
-    console.print("="*60)
-    
+    console.print(Panel.fit("[bold cyan]PHASE 3: NAUTILUS CORE TESTS[/bold cyan]", border_style="cyan"))
+    results = {"Instruments": await test_instruments(),
+               "Dispatcher": await test_event_dispatcher(),
+               "Data Engine": await test_data_engine()}
+    console.print("\n" + "=" * 60 + "\n[bold]SUMMARY[/bold]\n" + "=" * 60)
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Component", style="cyan", width=25)
     table.add_column("Status", width=15)
-    table.add_column("Ready for Phase 4", width=15)
-    
-    for component, passed in results.items():
-        status = "[green]✓ PASSED[/green]" if passed else "[red]✗ FAILED[/red]"
-        ready = "[green]Yes[/green]" if passed else "[red]No[/red]"
-        table.add_row(component, status, ready)
-    
+    for name, ok in results.items():
+        table.add_row(name, "[green]✓[/green]" if ok else "[red]✗[/red]")
     console.print(table)
-    
-    # Overall result
-    all_passed = all(results.values())
-    
-    console.print("\n" + "="*60)
-    if all_passed:
-        console.print("[bold green]✓ ALL TESTS PASSED![/bold green]")
-        console.print("\n[cyan]Phase 3 is complete and working![/cyan]")
-        console.print("[cyan]You can now proceed to Phase 4: Strategy Brain[/cyan]")
-        return 0
+    if all(results.values()):
+        console.print("[bold green]✓ ALL PASSED → Phase 4[/bold green]")
     else:
-        console.print("[bold red]✗ SOME TESTS FAILED[/bold red]")
-        console.print("\n[yellow]Fix the failed components before proceeding to Phase 4.[/yellow]")
-        return 1
+        console.print("[bold red]✗ SOME FAILED[/bold red]")
+    return 0 if all(results.values()) else 1
 
 
 @app.command()

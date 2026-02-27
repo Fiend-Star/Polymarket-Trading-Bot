@@ -105,40 +105,17 @@ class CoinbaseDataSource:
             return None
     
     async def get_order_book(self, level: int = 2) -> Optional[Dict[str, Any]]:
-        """
-        Get order book data.
-        
-        Args:
-            level: 1=best bid/ask, 2=top 50, 3=full book
-            
-        Returns:
-            Order book dict with bids and asks
-        """
+        """Get order book data. Level: 1=best, 2=top50, 3=full."""
         try:
-            response = await self.session.get(
-                f"/products/{self.product_id}/book",
-                params={"level": level}
-            )
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            return {
-                "timestamp": datetime.now(),
-                "bids": [
-                    {"price": Decimal(b[0]), "size": Decimal(b[1])}
-                    for b in data.get("bids", [])
-                ],
-                "asks": [
-                    {"price": Decimal(a[0]), "size": Decimal(a[1])}
-                    for a in data.get("asks", [])
-                ],
-            }
-            
+            resp = await self.session.get(f"/products/{self.product_id}/book", params={"level": level})
+            resp.raise_for_status()
+            data = resp.json()
+            parse = lambda levels: [{"price": Decimal(l[0]), "size": Decimal(l[1])} for l in levels]
+            return {"timestamp": datetime.now(), "bids": parse(data.get("bids", [])),
+                    "asks": parse(data.get("asks", []))}
         except Exception as e:
-            logger.error(f"Error fetching Coinbase order book: {e}")
-            return None
-    
+            logger.error(f"Coinbase order book error: {e}"); return None
+
     async def get_24h_stats(self) -> Optional[Dict[str, Any]]:
         """
         Get 24-hour statistics.
@@ -166,82 +143,30 @@ class CoinbaseDataSource:
             return None
     
     async def get_recent_trades(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """
-        Get recent trades.
-        
-        Args:
-            limit: Maximum number of trades to return
-            
-        Returns:
-            List of recent trades
-        """
+        """Get recent trades."""
         try:
-            response = await self.session.get(
-                f"/products/{self.product_id}/trades",
-                params={"limit": limit}
-            )
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            trades = []
-            for trade in data[:limit]:
-                trades.append({
-                    "timestamp": datetime.fromisoformat(trade["time"].replace("Z", "+00:00")),
-                    "trade_id": trade["trade_id"],
-                    "price": Decimal(str(trade["price"])),
-                    "size": Decimal(str(trade["size"])),
-                    "side": trade["side"],  # "buy" or "sell"
-                })
-            
-            return trades
-            
+            resp = await self.session.get(f"/products/{self.product_id}/trades", params={"limit": limit})
+            resp.raise_for_status()
+            return [{"timestamp": datetime.fromisoformat(t["time"].replace("Z", "+00:00")),
+                     "trade_id": t["trade_id"], "price": Decimal(str(t["price"])),
+                     "size": Decimal(str(t["size"])), "side": t["side"]}
+                    for t in resp.json()[:limit]]
         except Exception as e:
-            logger.error(f"Error fetching Coinbase trades: {e}")
-            return []
-    
-    async def get_candles(
-        self,
-        granularity: int = 300,  # 5 minutes
-        limit: int = 100
-    ) -> List[Dict[str, Any]]:
-        """
-        Get historical candles (OHLCV data).
-        
-        Args:
-            granularity: Candle size in seconds (60, 300, 900, 3600, 21600, 86400)
-            limit: Number of candles to return
-            
-        Returns:
-            List of candle data
-        """
+            logger.error(f"Coinbase trades error: {e}"); return []
+
+    async def get_candles(self, granularity: int = 300, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get historical candles (OHLCV). Granularity in seconds."""
         try:
-            response = await self.session.get(
-                f"/products/{self.product_id}/candles",
-                params={"granularity": granularity}
-            )
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            candles = []
-            for candle in data[:limit]:
-                # Format: [time, low, high, open, close, volume]
-                candles.append({
-                    "timestamp": datetime.fromtimestamp(candle[0]),
-                    "open": Decimal(str(candle[3])),
-                    "high": Decimal(str(candle[2])),
-                    "low": Decimal(str(candle[1])),
-                    "close": Decimal(str(candle[4])),
-                    "volume": Decimal(str(candle[5])),
-                })
-            
-            return candles
-            
+            resp = await self.session.get(f"/products/{self.product_id}/candles",
+                                          params={"granularity": granularity})
+            resp.raise_for_status()
+            return [{"timestamp": datetime.fromtimestamp(c[0]), "open": Decimal(str(c[3])),
+                     "high": Decimal(str(c[2])), "low": Decimal(str(c[1])),
+                     "close": Decimal(str(c[4])), "volume": Decimal(str(c[5]))}
+                    for c in resp.json()[:limit]]
         except Exception as e:
-            logger.error(f"Error fetching Coinbase candles: {e}")
-            return []
-    
+            logger.error(f"Coinbase candles error: {e}"); return []
+
     @property
     def last_price(self) -> Optional[Decimal]:
         """Get cached last price."""

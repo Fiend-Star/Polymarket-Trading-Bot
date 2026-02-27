@@ -27,87 +27,47 @@ class WebSocketManager:
     - Message buffering
     """
     
-    def __init__(
-        self,
-        name: str,
-        connect_func: Callable,
-        stream_func: Callable,
-        max_reconnect_attempts: int = 5,
-        initial_backoff: float = 1.0,
-        max_backoff: float = 60.0,
-    ):
-        """
-        Initialize WebSocket manager.
-        
-        Args:
-            name: Connection name for logging
-            connect_func: Async function to establish connection
-            stream_func: Async function to stream data
-            max_reconnect_attempts: Max reconnection attempts before giving up
-            initial_backoff: Initial backoff delay in seconds
-            max_backoff: Maximum backoff delay in seconds
-        """
+    def __init__(self, name: str, connect_func: Callable, stream_func: Callable,
+                 max_reconnect_attempts: int = 5, initial_backoff: float = 1.0,
+                 max_backoff: float = 60.0):
+        """Initialize WebSocket manager."""
         self.name = name
         self.connect_func = connect_func
         self.stream_func = stream_func
         self.max_reconnect_attempts = max_reconnect_attempts
         self.initial_backoff = initial_backoff
         self.max_backoff = max_backoff
-        
-        # State
         self.state = ConnectionState.DISCONNECTED
         self.reconnect_attempts = 0
         self.last_message_time: Optional[datetime] = None
         self.last_error: Optional[str] = None
-        
-        # Tasks
         self._stream_task: Optional[asyncio.Task] = None
         self._health_check_task: Optional[asyncio.Task] = None
-        
-        # Callbacks
         self.on_connected: Optional[Callable] = None
         self.on_disconnected: Optional[Callable] = None
         self.on_error: Optional[Callable] = None
         self.on_message: Optional[Callable] = None
-        
-        logger.info(f"Initialized WebSocket manager: {name}")
-    
+        logger.info(f"WS manager: {name}")
+
     async def connect(self) -> bool:
-        """
-        Connect to WebSocket.
-        
-        Returns:
-            True if connection successful
-        """
+        """Connect to WebSocket. Returns True if successful."""
         try:
             self.state = ConnectionState.CONNECTING
-            logger.info(f"{self.name}: Connecting...")
-            
-            # Call connect function
             success = await self.connect_func()
-            
             if success:
                 self.state = ConnectionState.CONNECTED
                 self.reconnect_attempts = 0
                 self.last_message_time = datetime.now()
-                
-                logger.info(f"{self.name}: Connected successfully")
-                
-                if self.on_connected:
-                    await self.on_connected()
-                
+                logger.info(f"{self.name}: Connected")
+                if self.on_connected: await self.on_connected()
                 return True
-            else:
-                self.state = ConnectionState.FAILED
-                logger.error(f"{self.name}: Connection failed")
-                return False
-                
+            self.state = ConnectionState.FAILED
+            logger.error(f"{self.name}: Connection failed"); return False
         except Exception as e:
             self.state = ConnectionState.FAILED
             self.last_error = str(e)
-            logger.error(f"{self.name}: Connection error: {e}")
-            return False
-    
+            logger.error(f"{self.name}: Error: {e}"); return False
+
     async def disconnect(self) -> None:
         """Disconnect from WebSocket."""
         logger.info(f"{self.name}: Disconnecting...")
@@ -199,35 +159,18 @@ class WebSocketManager:
         await asyncio.sleep(backoff)
     
     async def _monitor_health(self, check_interval: int = 30) -> None:
-        """
-        Monitor connection health.
-        
-        Args:
-            check_interval: Seconds between health checks
-        """
+        """Monitor connection health. Reconnects if stale."""
         while True:
             try:
                 await asyncio.sleep(check_interval)
-                
-                if self.state != ConnectionState.CONNECTED:
-                    continue
-                
-                # Check if we've received messages recently
+                if self.state != ConnectionState.CONNECTED: continue
                 if self.last_message_time:
-                    time_since_message = datetime.now() - self.last_message_time
-                    
-                    if time_since_message > timedelta(seconds=check_interval * 2):
-                        logger.warning(
-                            f"{self.name}: No messages for {time_since_message.seconds}s, "
-                            "connection may be stale"
-                        )
-                        
-                        # Force reconnection
+                    age = (datetime.now() - self.last_message_time).seconds
+                    if age > check_interval * 2:
+                        logger.warning(f"{self.name}: No msgs for {age}s — reconnecting")
                         self.state = ConnectionState.RECONNECTING
                         await self.disconnect()
-                
-            except asyncio.CancelledError:
-                break
+            except asyncio.CancelledError: break
             except Exception as e:
                 logger.error(f"{self.name}: Health check error: {e}")
     

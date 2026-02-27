@@ -196,42 +196,29 @@ class BacktestResult:
 BINANCE_KLINE_URL = "https://api.binance.com/api/v3/klines"
 
 
-def fetch_binance_klines(
-    start_dt: datetime, end_dt: datetime,
-    symbol: str = "BTCUSDT", interval: str = "1m",
-) -> List[Candle]:
+def _parse_binance_kline(k) -> Candle:
+    """Parse a single Binance kline array into a Candle."""
+    return Candle(timestamp=datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc),
+                  open=float(k[1]), high=float(k[2]), low=float(k[3]),
+                  close=float(k[4]), volume=float(k[5]))
+
+
+def fetch_binance_klines(start_dt: datetime, end_dt: datetime,
+                         symbol: str = "BTCUSDT", interval: str = "1m") -> List[Candle]:
     """Fetch 1-minute BTC/USDT candles from Binance public API."""
     candles: List[Candle] = []
-    start_ms = int(start_dt.timestamp() * 1000)
-    end_ms = int(end_dt.timestamp() * 1000)
-
-    logger.info(f"Fetching Binance klines: {symbol} {interval} "
-                f"from {start_dt.date()} to {end_dt.date()}")
-
+    start_ms, end_ms = int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
+    logger.info(f"Fetching {symbol} {interval}: {start_dt.date()} to {end_dt.date()}")
     with httpx.Client(timeout=30.0) as client:
         cursor = start_ms
         while cursor < end_ms:
-            params = {
-                "symbol": symbol, "interval": interval,
-                "startTime": cursor, "endTime": end_ms, "limit": 1000,
-            }
-            resp = client.get(BINANCE_KLINE_URL, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-
-            if not data:
-                break
-
-            for k in data:
-                ts = datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc)
-                candles.append(Candle(
-                    timestamp=ts, open=float(k[1]), high=float(k[2]),
-                    low=float(k[3]), close=float(k[4]), volume=float(k[5]),
-                ))
-
+            params = {"symbol": symbol, "interval": interval,
+                      "startTime": cursor, "endTime": end_ms, "limit": 1000}
+            data = client.get(BINANCE_KLINE_URL, params=params).raise_for_status().json()
+            if not data: break
+            candles.extend(_parse_binance_kline(k) for k in data)
             cursor = int(data[-1][0]) + 60_000
             time.sleep(0.15)
-
     logger.info(f"Fetched {len(candles)} candles")
     return candles
 
@@ -296,24 +283,28 @@ def classify_funding(rate: float) -> Tuple[str, float]:
         return "NEUTRAL", 0.0
 
 
+def _parse_funding_entry(entry) -> FundingSnapshot:
+    """Parse a single funding rate API entry."""
+    ts = datetime.fromtimestamp(entry["fundingTime"] / 1000, tz=timezone.utc)
+    rate = float(entry["fundingRate"])
+    classification, bias = classify_funding(rate)
+    return FundingSnapshot(
+        timestamp=ts, rate=rate, rate_pct=rate * 100,
+        classification=classification, mean_reversion_bias=bias)
+
+
 def fetch_funding_rates(start_dt: datetime, end_dt: datetime) -> List[FundingSnapshot]:
     """Fetch historical BTCUSDT funding rates from Binance Futures (every 8h)."""
     url = "https://fapi.binance.com/fapi/v1/fundingRate"
     snapshots: List[FundingSnapshot] = []
     start_ms = int(start_dt.timestamp() * 1000)
     end_ms = int(end_dt.timestamp() * 1000)
-
     logger.info(f"Fetching Binance funding rates: {start_dt.date()} to {end_dt.date()}")
 
     with httpx.Client(timeout=30.0) as client:
         cursor = start_ms
         while cursor < end_ms:
-            params = {
-                "symbol": "BTCUSDT",
-                "startTime": cursor,
-                "endTime": end_ms,
-                "limit": 1000,
-            }
+            params = {"symbol": "BTCUSDT", "startTime": cursor, "endTime": end_ms, "limit": 1000}
             try:
                 resp = client.get(url, params=params)
                 resp.raise_for_status()
@@ -321,22 +312,9 @@ def fetch_funding_rates(start_dt: datetime, end_dt: datetime) -> List[FundingSna
             except Exception as e:
                 logger.warning(f"Funding rate fetch failed: {e}")
                 break
-
             if not data:
                 break
-
-            for entry in data:
-                ts = datetime.fromtimestamp(entry["fundingTime"] / 1000, tz=timezone.utc)
-                rate = float(entry["fundingRate"])
-                classification, bias = classify_funding(rate)
-                snapshots.append(FundingSnapshot(
-                    timestamp=ts,
-                    rate=rate,
-                    rate_pct=rate * 100,
-                    classification=classification,
-                    mean_reversion_bias=bias,
-                ))
-
+            snapshots.extend(_parse_funding_entry(e) for e in data)
             cursor = int(data[-1]["fundingTime"]) + 1
             time.sleep(0.15)
 
@@ -400,75 +378,54 @@ class RealisticConfig:
 # =============================================================================
 # Synthetic Polymarket probability from BTC price action
 # =============================================================================
+def _intrawindow_vol(window_candles, decision_minute):
+    """Compute intra-window realized vol from candle returns."""
+    if len(window_candles) <= 1:
+        return 0.0
+    returns = []
+    for i in range(1, min(decision_minute + 1, len(window_candles))):
+        prev = window_candles[i - 1].close
+        curr = window_candles[i].close
+        if prev > 0:
+            returns.append((curr - prev) / prev)
+    if not returns:
+        return 0.0
+    return (sum(r ** 2 for r in returns) / len(returns)) ** 0.5
+
+
+def _realistic_probability(pct_change, realistic, model_fair_value, window_candles, decision_minute):
+    """Compute realistic-mode synthetic probability."""
+    iwv = _intrawindow_vol(window_candles, decision_minute)
+    vol_factor = max(0.5, min(1.2, 1.2 - iwv * 80))
+    base_prob = 0.50 + pct_change * 11.0 * vol_factor
+
+    if model_fair_value is not None:
+        base_prob = (realistic.market_efficiency * model_fair_value
+                     + (1.0 - realistic.market_efficiency) * base_prob)
+
+    return base_prob + random.gauss(0, realistic.market_noise_std)
+
+
 def btc_to_probability(
     window_candles: List[Candle],
     decision_minute: int = 2,
     realistic: Optional[RealisticConfig] = None,
     model_fair_value: Optional[float] = None,
 ) -> float:
-    """
-    Convert BTC price movement into a synthetic Polymarket "Up" probability.
-
-    Default mode: Simple linear mapping (sensitivity=15.0).
-    Realistic mode: Vol-aware + noise + partial model efficiency.
-
-    The realistic mode produces tighter edges because:
-    - Market makers on Polymarket use similar quant models
-    - The crowd is noisy but not dumb
-    - Prices cluster around fair value with random dispersion
-    """
+    """Convert BTC price movement into a synthetic Polymarket 'Up' probability."""
     if len(window_candles) < decision_minute + 1:
         return 0.50
-
     window_open = window_candles[0].open
     current = window_candles[decision_minute].close
-
     if window_open == 0:
         return 0.50
 
     pct_change = (current - window_open) / window_open
 
     if realistic and realistic.enabled:
-        # ── Vol-aware sensitivity ─────────────────────────────────────
-        # High vol → crowd is uncertain → prices stay closer to 0.50
-        # Low vol → crowd is confident → prices move further from 0.50
-        # Calibrated: ~12x at low vol, ~8x at high vol
-        intrawindow_vol = 0.0
-        if len(window_candles) > 1:
-            returns = []
-            for i in range(1, min(decision_minute + 1, len(window_candles))):
-                prev = window_candles[i - 1].close
-                curr = window_candles[i].close
-                if prev > 0:
-                    returns.append((curr - prev) / prev)
-            if returns:
-                intrawindow_vol = (sum(r ** 2 for r in returns) / len(returns)) ** 0.5
-
-        # Scale sensitivity inversely with local vol
-        # Low vol (< 0.001) → sensitivity ~14 (market is sure)
-        # High vol (> 0.005) → sensitivity ~8 (market is uncertain)
-        vol_factor = max(0.5, min(1.2, 1.2 - intrawindow_vol * 80))
-        sensitivity = 11.0 * vol_factor
-
-        base_prob = 0.50 + pct_change * sensitivity
-
-        # ── Market efficiency: partial reflection of model view ───────
-        if model_fair_value is not None:
-            # The Polymarket crowd partially knows what the model knows
-            # efficiency=0.35 means the market price is 35% model + 65% base
-            base_prob = (
-                realistic.market_efficiency * model_fair_value
-                + (1.0 - realistic.market_efficiency) * base_prob
-            )
-
-        # ── Random noise from retail flow / MM repositioning ──────────
-        noise = random.gauss(0, realistic.market_noise_std)
-        prob = base_prob + noise
-
+        prob = _realistic_probability(pct_change, realistic, model_fair_value, window_candles, decision_minute)
     else:
-        # Original linear mapping
-        sensitivity = 15.0
-        prob = 0.50 + pct_change * sensitivity
+        prob = 0.50 + pct_change * 15.0
 
     return max(0.05, min(0.95, prob))
 
@@ -513,81 +470,44 @@ def create_fusion_processors() -> Optional[Dict]:
     }
 
 
-def run_confirmation(
-    processors: Optional[Dict],
-    current_price: Decimal,
-    price_history: List[Decimal],
-    metadata: Dict[str, Any],
-    model_bullish: bool,
-) -> Tuple[int, int]:
-    """
-    Run old signal processors as CONFIRMATION.
-    Returns (confirming_count, contradicting_count).
-    Mirrors V3 bot Steps 7-8.
-    """
-    if processors is None:
-        return (0, 0)
-
+def _collect_processor_signals(processors, current_price, price_history, pm):
+    """Run all fusion processors and collect signals."""
     signals = []
-    pm = {}
-    for key, value in metadata.items():
-        pm[key] = Decimal(str(value)) if isinstance(value, float) else value
-
     for name in ["spike", "sentiment", "divergence", "tick_velocity"]:
         proc = processors.get(name)
         if proc is None:
             continue
         try:
-            sig = proc.process(
-                current_price=current_price,
-                historical_prices=price_history,
-                metadata=pm,
-            )
+            sig = proc.process(current_price=current_price, historical_prices=price_history, metadata=pm)
             if sig:
                 signals.append(sig)
         except Exception:
             pass
+    return signals
 
-    confirming = 0
-    contradicting = 0
+
+def _count_confirmations(signals, model_bullish):
+    """Count confirming vs contradicting signals."""
+    confirming = contradicting = 0
     for sig in signals:
-        sig_bullish = "BULLISH" in str(sig.direction).upper()
-        if sig_bullish == model_bullish:
+        if ("BULLISH" in str(sig.direction).upper()) == model_bullish:
             confirming += 1
         else:
             contradicting += 1
-
     return confirming, contradicting
 
 
-def build_confirmation_metadata(
-    window_candles: List[Candle],
-    decision_minute: int,
-    historical_btc_closes: List[float],
-) -> Dict[str, Any]:
-    """Build metadata dict for confirmation signal processors."""
-    if len(window_candles) <= decision_minute:
-        return {}
+def run_confirmation(processors, current_price, price_history, metadata, model_bullish):
+    """Run old signal processors as CONFIRMATION. Returns (confirming, contradicting)."""
+    if processors is None:
+        return (0, 0)
+    pm = {k: (Decimal(str(v)) if isinstance(v, float) else v) for k, v in metadata.items()}
+    signals = _collect_processor_signals(processors, current_price, price_history, pm)
+    return _count_confirmations(signals, model_bullish)
 
-    current_close = window_candles[decision_minute].close
-    window_open = window_candles[0].open
 
-    recent = historical_btc_closes[-20:]
-    sma_20 = sum(recent) / len(recent) if recent else current_close
-    deviation = (current_close - sma_20) / sma_20 if sma_20 != 0 else 0.0
-
-    if len(historical_btc_closes) >= 5:
-        p5 = historical_btc_closes[-5]
-        momentum = (current_close - p5) / p5 if p5 != 0 else 0.0
-    else:
-        momentum = 0.0
-
-    variance = sum((p - sma_20) ** 2 for p in recent) / len(recent) if recent else 0.0
-    volatility = math.sqrt(variance)
-
-    rsi = compute_rsi(historical_btc_closes, period=14)
-
-    # Synthetic tick buffer
+def _build_tick_buffer(window_candles, decision_minute):
+    """Build synthetic tick buffer from candle data."""
     tick_buffer = []
     start_idx = max(0, decision_minute - 2)
     for i in range(start_idx, min(decision_minute + 1, len(window_candles))):
@@ -595,15 +515,30 @@ def build_confirmation_metadata(
         for j, px in enumerate([c.open, (c.open + c.close) / 2, c.close]):
             tick_ts = c.timestamp + timedelta(seconds=j * 20)
             tick_buffer.append({"ts": tick_ts, "price": Decimal(str(round(px, 4)))})
+    return tick_buffer
 
+
+def build_confirmation_metadata(window_candles, decision_minute, historical_btc_closes):
+    """Build metadata dict for confirmation signal processors."""
+    if len(window_candles) <= decision_minute:
+        return {}
+    current_close = window_candles[decision_minute].close
+    recent = historical_btc_closes[-20:]
+    sma_20 = sum(recent) / len(recent) if recent else current_close
+    deviation = (current_close - sma_20) / sma_20 if sma_20 != 0 else 0.0
+    if len(historical_btc_closes) >= 5:
+        p5 = historical_btc_closes[-5]
+        momentum = (current_close - p5) / p5 if p5 != 0 else 0.0
+    else:
+        momentum = 0.0
+    variance = sum((p - sma_20) ** 2 for p in recent) / len(recent) if recent else 0.0
+    rsi = compute_rsi(historical_btc_closes, period=14)
     return {
-        "deviation": deviation,
-        "momentum": momentum,
-        "volatility": volatility,
-        "sentiment_score": rsi,
+        "deviation": deviation, "momentum": momentum,
+        "volatility": math.sqrt(variance), "sentiment_score": rsi,
         "sentiment_classification": _classify_sentiment(rsi),
         "spot_price": current_close,
-        "tick_buffer": tick_buffer,
+        "tick_buffer": _build_tick_buffer(window_candles, decision_minute),
         "yes_token_id": None,
     }
 
@@ -617,74 +552,37 @@ def _classify_sentiment(score: float) -> str:
 
 
 # =============================================================================
-# Main backtest loop — V3 QUANT STRATEGY
+# Backtest helpers (Rule of 30 decomposition)
 # =============================================================================
-def run_backtest_v3(
-    candles: List[Candle],
-    decision_minute: int = 2,
-    verbose: bool = False,
-    use_confirmation: bool = True,
-    use_maker: bool = True,
-    use_funding: bool = True,
-    funding_snapshots: Optional[List[FundingSnapshot]] = None,
-    realistic: Optional[RealisticConfig] = None,
-) -> BacktestResult:
-    """
-    Backtest the V3.1 quant strategy:
-      1. Feed candle data to VolEstimator → vol + jumps + return stats
-      2. BinaryOptionPricer (Merton JD + overlays) → model fair value
-      3. MispricingDetector → edge, Kelly sizing, tradeability
-         V3.1: + vol_skew correction + funding rate bias
-      4. Fusion processors → confirmation (optional)
-      5. P&L with correct nonlinear fees
 
-    Realistic mode adds:
-      - Smarter synthetic market (vol-aware, noisy, partially efficient)
-      - Bid-ask spread on entry
-      - Fill rate simulation
-      - Higher edge floor (kills noise trades)
-      - Vol confidence gate
-      - Consecutive loss throttle
-    """
-
-    # ── Initialize quant modules ─────────────────────────────────────────
+def _init_backtest_modules():
+    """Initialize quant modules for backtesting."""
     pricer = BinaryOptionPricer()
     vol_est = VolEstimator(
-        window_minutes=60.0,
-        resample_interval_sec=60.0,
-        ewma_halflife_samples=20,
-        min_samples=5,
-        default_vol=DEFAULT_VOL,
+        window_minutes=60.0, resample_interval_sec=60.0,
+        ewma_halflife_samples=20, min_samples=5, default_vol=DEFAULT_VOL,
     )
     detector = MispricingDetector(
-        pricer=pricer,
-        vol_estimator=vol_est,
-        maker_fee=0.00,
-        min_edge_cents=MIN_EDGE_CENTS,
-        min_edge_after_fees=0.005,
-        take_profit_pct=TAKE_PROFIT_PCT,
-        cut_loss_pct=CUT_LOSS_PCT,
-        vol_method=VOL_METHOD,
-        bankroll=BANKROLL_USD,
-        use_half_kelly=True,
-        max_kelly_fraction=0.05,
+        pricer=pricer, vol_estimator=vol_est, maker_fee=0.00,
+        min_edge_cents=MIN_EDGE_CENTS, min_edge_after_fees=0.005,
+        take_profit_pct=TAKE_PROFIT_PCT, cut_loss_pct=CUT_LOSS_PCT,
+        vol_method=VOL_METHOD, bankroll=BANKROLL_USD,
+        use_half_kelly=True, max_kelly_fraction=0.05,
     )
+    return vol_est, detector
 
-    fusion_processors = create_fusion_processors() if use_confirmation else None
 
-    # ── Chunk candles into 15-minute windows ─────────────────────────────
+def _chunk_candles_to_windows(candles: List[Candle]) -> List[List[Candle]]:
+    """Chunk 1-min candles into 15-minute windows."""
     windows: List[List[Candle]] = []
     current_window: List[Candle] = []
     window_start: Optional[datetime] = None
-
     for c in candles:
         minute_slot = c.timestamp.minute // WINDOW_MINUTES
         slot_start = c.timestamp.replace(
-            minute=minute_slot * WINDOW_MINUTES, second=0, microsecond=0
-        )
+            minute=minute_slot * WINDOW_MINUTES, second=0, microsecond=0)
         if window_start is None:
             window_start = slot_start
-
         if slot_start != window_start:
             if len(current_window) >= WINDOW_MINUTES:
                 windows.append(current_window)
@@ -692,580 +590,456 @@ def run_backtest_v3(
             window_start = slot_start
         else:
             current_window.append(c)
-
     if len(current_window) >= WINDOW_MINUTES:
         windows.append(current_window)
-
     logger.info(f"Created {len(windows)} complete 15-minute windows")
+    return windows
 
-    # ── State tracking ───────────────────────────────────────────────────
-    price_history: List[Decimal] = []
-    historical_btc_closes: List[float] = []
-    trades: List[BacktestTrade] = []
-    equity_curve: List[float] = [0.0]
-    bankroll = BANKROLL_USD
-    total_fees = 0.0
-    skipped = 0
-    total_windows = len(windows)
 
-    skip_reasons: Dict[str, int] = {
-        "warmup": 0, "no_edge": 0, "confirmation_veto": 0,
-        "theta_decay": 0, "no_data": 0, "funding_veto": 0,
-        "vol_confidence": 0, "streak_throttle": 0, "no_fill": 0,
-        "edge_too_small": 0, "trade_rate_cap": 0,
-    }
-
-    # Realistic mode state
-    rc = realistic if (realistic and realistic.enabled) else None
-    consecutive_losses = 0
-    trades_this_session = 0
-    windows_processed = 0
-
-    # ── Process each window ──────────────────────────────────────────────
-    last_model_yes: Optional[float] = None   # For realistic market efficiency
-
-    for wi, window in enumerate(windows):
-
-        # Feed ALL candle closes to vol estimator (builds vol across windows)
-        for c in window:
-            vol_est.add_price(c.close, c.timestamp.timestamp())
-            historical_btc_closes.append(c.close)
-
-        # Set simulated time to the decision point in this window
-        # (so VolEstimator prunes bars relative to backtest time, not wall clock)
-        decision_ts = window[min(decision_minute, len(window) - 1)].timestamp.timestamp()
-        vol_est.set_simulated_time(decision_ts)
-
-        # Warmup: need enough history for vol estimation
-        if len(historical_btc_closes) < 30:
-            skip_reasons["warmup"] += 1
-            skipped += 1
-            continue
-
-        windows_processed += 1
-
-        # Actual outcome
-        btc_open = window[0].open
-        btc_close = window[-1].close
-        btc_moved_up = btc_close > btc_open
-
-        # Strike price = BTC at window open (same as live bot)
-        btc_strike = btc_open
-
-        # BTC spot at decision time
-        if len(window) <= decision_minute:
-            skip_reasons["no_data"] += 1
-            skipped += 1
-            continue
-        btc_spot = window[decision_minute].close
-
-        # Time remaining at decision point
-        time_remaining_min = float(WINDOW_MINUTES - decision_minute)
-
-        # ── Realistic: Streak throttle ────────────────────────────────
-        if rc and consecutive_losses >= rc.max_consecutive_losses:
-            skip_reasons["streak_throttle"] += 1
-            skipped += 1
-            consecutive_losses = max(0, consecutive_losses - 1)  # Cool down
-            continue
-
-        # ── Realistic: Trade rate cap ─────────────────────────────────
-        if rc and windows_processed > 20:
-            current_trade_rate = trades_this_session / windows_processed
-            if current_trade_rate > rc.max_trade_rate:
-                skip_reasons["trade_rate_cap"] += 1
-                skipped += 1
-                continue
-
-        # Synthetic Polymarket market price (what the crowd would price)
-        poly_price = btc_to_probability(
-            window, decision_minute,
-            realistic=rc,
-            model_fair_value=last_model_yes,
-        )
-        yes_market = poly_price
-        no_market = 1.0 - poly_price
-
-        # Track price history for confirmation processors
-        price_history.append(Decimal(str(round(poly_price, 4))))
-        if len(price_history) > 100:
-            price_history.pop(0)
-
-        # ── V3.1: Compute vol skew correction ────────────────────────────
-        vol_estimate = vol_est.get_vol(VOL_METHOD)
-        vol_skew = BinaryOptionPricer.estimate_btc_vol_skew(
-            spot=btc_spot,
-            strike=btc_strike,
-            vol=vol_estimate.annualized_vol,
-            time_remaining_min=time_remaining_min,
-        )
-
-        # ── V3.1: Get funding rate bias at this timestamp ────────────────
-        window_ts = window[decision_minute].timestamp
-        if use_funding and funding_snapshots:
-            funding_bias = get_funding_bias_at(funding_snapshots, window_ts)
-            # Find the regime for logging
-            funding_regime = "NEUTRAL"
-            for s in funding_snapshots:
-                if s.timestamp <= window_ts:
-                    funding_regime = s.classification
-                else:
-                    break
-        else:
-            funding_bias = 0.0
-            funding_regime = "DISABLED"
-
-        # ── Run V3.1 mispricing detector ─────────────────────────────────
-        signal = detector.detect(
-            yes_market_price=yes_market,
-            no_market_price=no_market,
-            btc_spot=btc_spot,
-            btc_strike=btc_strike,
-            time_remaining_min=time_remaining_min,
-            position_size_usd=MARKET_BUY_USD,
-            use_maker=use_maker,
-            vol_skew=vol_skew,
-            funding_bias=funding_bias,
-        )
-
-        if not signal.is_tradeable:
-            skip_reasons["no_edge"] += 1
-            skipped += 1
-            last_model_yes = signal.yes_model  # Track even on skip
-            continue
-
-        # Update model tracking for realistic market efficiency
-        last_model_yes = signal.yes_model
-
-        # ── Realistic: Vol confidence gate ────────────────────────────
-        if rc and signal.vol_confidence < rc.min_vol_confidence:
-            skip_reasons["vol_confidence"] += 1
-            skipped += 1
-            continue
-
-        # ── Realistic: Higher edge floor (kills noise trades) ─────────
-        if rc and abs(signal.edge) < rc.min_edge_realistic:
-            skip_reasons["edge_too_small"] += 1
-            skipped += 1
-            continue
-
-        # ── Fusion confirmation (mirrors V3 bot Steps 7-8) ──────────────
-        model_bullish = signal.direction == "BUY_YES"
-        confirming, contradicting = 0, 0
-
-        if use_confirmation and fusion_processors and len(price_history) >= 5:
-            metadata = build_confirmation_metadata(
-                window, decision_minute, historical_btc_closes[-100:],
-            )
-            if metadata:
-                confirming, contradicting = run_confirmation(
-                    fusion_processors,
-                    Decimal(str(round(poly_price, 4))),
-                    list(price_history),
-                    metadata,
-                    model_bullish,
-                )
-
-                # V3 veto rule: if more processors disagree AND model confidence < 60%
-                if contradicting > confirming and signal.confidence < 0.6:
-                    skip_reasons["confirmation_veto"] += 1
-                    skipped += 1
-                    continue
-
-        # ── Determine trade direction + outcome ──────────────────────────
-        if signal.direction == "BUY_YES":
-            direction = "long"
-            entry_price = yes_market
-        else:
-            direction = "short"
-            entry_price = no_market
-
-        # ── Realistic: Bid-ask spread (enter at worse side) ───────────
-        if rc:
-            half_spread = rc.spread_cents / 2.0
-            # Spread widens in last 3 minutes
-            if time_remaining_min <= 3.0:
-                half_spread += rc.spread_widen_late / 2.0
-            # Long = buy at ask (higher), short = buy at ask of NO (higher)
-            entry_price = min(0.95, entry_price + half_spread)
-
-        # ── Realistic: Fill rate simulation ───────────────────────────
-        if rc:
-            edge_boost = min(0.15, abs(signal.edge) * rc.fill_rate_boost_edge / 0.10)
-            effective_fill_rate = min(0.95, rc.fill_rate + edge_boost)
-            if random.random() > effective_fill_rate:
-                skip_reasons["no_fill"] += 1
-                skipped += 1
-                continue
-
-        # Position size: Kelly-determined, capped
-        if rc:
-            # Realistic: Scale position with edge quality
-            # Small edges ($0.05-$0.10): reduced size for safety
-            # Medium edges ($0.10-$0.20): full $1 position
-            # Large edges ($0.20+): up to 1.5x position (high confidence)
-            abs_edge = abs(signal.edge)
-            if abs_edge < 0.10:
-                edge_scale = 0.6  # 60% position on small edges
-            elif abs_edge < 0.20:
-                edge_scale = 1.0  # Full position
+def _get_funding_at_window(use_funding, funding_snapshots, window_ts):
+    """Get funding bias and regime for a window timestamp."""
+    if use_funding and funding_snapshots:
+        bias = get_funding_bias_at(funding_snapshots, window_ts)
+        regime = "NEUTRAL"
+        for s in funding_snapshots:
+            if s.timestamp <= window_ts:
+                regime = s.classification
             else:
-                edge_scale = 1.5  # 150% position on large edges
-            max_position = MARKET_BUY_USD * edge_scale
-            position_size = min(signal.kelly_bet_usd, bankroll * 0.05, max_position)
+                break
+        return bias, regime
+    return 0.0, "DISABLED"
+
+
+def _apply_realistic_entry(rc, entry_price, time_remaining_min):
+    """Apply realistic spread to entry price."""
+    if not rc:
+        return entry_price
+    half_spread = rc.spread_cents / 2.0
+    if time_remaining_min <= 3.0:
+        half_spread += rc.spread_widen_late / 2.0
+    return min(0.95, entry_price + half_spread)
+
+
+def _check_realistic_fill(rc, signal):
+    """Return True if order fills in realistic mode."""
+    if not rc:
+        return True
+    edge_boost = min(0.15, abs(signal.edge) * rc.fill_rate_boost_edge / 0.10)
+    eff = min(0.95, rc.fill_rate + edge_boost)
+    return random.random() <= eff
+
+
+def _compute_position_size(rc, signal, bankroll):
+    """Compute position size with optional realistic edge-scaling."""
+    if rc:
+        ae = abs(signal.edge)
+        if ae < 0.10:
+            scale = 0.6
+        elif ae < 0.20:
+            scale = 1.0
         else:
-            position_size = min(signal.kelly_bet_usd, bankroll * 0.05, MARKET_BUY_USD)
-        position_size = max(position_size, 0.10)  # Min $0.10
+            scale = 1.5
+        cap = MARKET_BUY_USD * scale
+        ps = min(signal.kelly_bet_usd, bankroll * 0.05, cap)
+    else:
+        ps = min(signal.kelly_bet_usd, bankroll * 0.05, MARKET_BUY_USD)
+    return max(ps, 0.10)
 
-        # Outcome
-        if direction == "long":
-            won = btc_moved_up
-        else:
-            won = not btc_moved_up
 
-        outcome = "WIN" if won else "LOSS"
+def _compute_trade_pnl(direction, entry_price, btc_moved_up, position_size, use_maker):
+    """Compute PnL and fees for a single trade."""
+    won = btc_moved_up if direction == "long" else not btc_moved_up
+    outcome = "WIN" if won else "LOSS"
+    num_tokens = position_size / entry_price if entry_price > 0 else 0
+    fee_rate = 0.0 if use_maker else polymarket_taker_fee(entry_price)
+    fee = fee_rate * num_tokens * entry_price
+    pnl_bf = num_tokens * (1.0 - entry_price) if won else -num_tokens * entry_price
+    return won, outcome, pnl_bf - fee, pnl_bf, fee
 
-        # Track consecutive losses for streak throttle
-        if won:
-            consecutive_losses = 0
-        else:
-            consecutive_losses += 1
-        trades_this_session += 1
 
-        # ── P&L with correct fees ────────────────────────────────────────
-        num_tokens = position_size / entry_price if entry_price > 0 else 0
+def _check_window_skip(hist_len, window_len, dm, rc, closs, tts, wp, sr):
+    """Check if window should be skipped. Returns reason string or None."""
+    if hist_len < 30:
+        sr["warmup"] += 1
+        return "warmup"
+    if window_len <= dm:
+        sr["no_data"] += 1
+        return "no_data"
+    if rc and closs >= rc.max_consecutive_losses:
+        sr["streak_throttle"] += 1
+        return "streak_throttle"
+    if rc and wp > 20 and tts / wp > rc.max_trade_rate:
+        sr["trade_rate_cap"] += 1
+        return "trade_rate_cap"
+    return None
 
-        if use_maker:
-            fee_rate = 0.0  # Maker pays 0%
-        else:
-            fee_rate = polymarket_taker_fee(entry_price)
 
-        fee = fee_rate * num_tokens * entry_price
+def _run_backtest_confirmation(use_conf, fproc, ph, window, dm, hbc, pp, mb):
+    """Run fusion confirmation; returns (confirming, contradicting)."""
+    if not (use_conf and fproc and len(ph) >= 5):
+        return 0, 0
+    md = build_confirmation_metadata(window, dm, hbc[-100:])
+    if not md:
+        return 0, 0
+    return run_confirmation(fproc, Decimal(str(round(pp, 4))), list(ph), md, mb)
 
-        if won:
-            pnl_before_fees = num_tokens * (1.0 - entry_price)
-        else:
-            pnl_before_fees = -num_tokens * entry_price
 
-        pnl = pnl_before_fees - fee
-        total_fees += fee
+def _build_backtest_trade(window, direction, entry_price, position_size,
+                          btc_open, btc_close, btc_moved_up, outcome,
+                          pnl, pnl_bf, fee, signal, conf, contra,
+                          vol_skew, funding_bias, funding_regime, trm):
+    """Build a BacktestTrade dataclass instance."""
+    return BacktestTrade(
+        window_start=window[0].timestamp, direction=direction,
+        entry_price=round(entry_price, 4), position_size=round(position_size, 2),
+        actual_btc_open=btc_open, actual_btc_close=btc_close,
+        btc_moved_up=btc_moved_up, outcome=outcome,
+        pnl=round(pnl, 4), pnl_before_fees=round(pnl_bf, 4),
+        fee_paid=round(fee, 4),
+        model_yes_price=round(signal.yes_model, 4),
+        model_no_price=round(signal.no_model, 4),
+        edge=round(signal.edge, 4), edge_pct=round(signal.edge_pct, 4),
+        kelly_fraction=round(signal.kelly_fraction, 4),
+        realized_vol=round(signal.realized_vol, 4),
+        implied_vol=round(signal.implied_vol, 4),
+        vrp=round(signal.vrp, 4), pricing_method=signal.pricing_method,
+        confirming_signals=conf, contradicting_signals=contra,
+        vol_skew=round(vol_skew, 8), funding_bias=round(funding_bias, 6),
+        funding_regime=funding_regime, time_remaining_min=trm,
+    )
 
-        # Update bankroll
-        bankroll += pnl
-        bankroll = max(1.0, bankroll)  # Floor at $1
-        detector.update_bankroll(bankroll)
 
-        # Equity curve
-        cum_pnl = equity_curve[-1] + pnl
-        equity_curve.append(cum_pnl)
-
-        trade = BacktestTrade(
-            window_start=window[0].timestamp,
-            direction=direction,
-            entry_price=round(entry_price, 4),
-            position_size=round(position_size, 2),
-            actual_btc_open=btc_open,
-            actual_btc_close=btc_close,
-            btc_moved_up=btc_moved_up,
-            outcome=outcome,
-            pnl=round(pnl, 4),
-            pnl_before_fees=round(pnl_before_fees, 4),
-            fee_paid=round(fee, 4),
-            model_yes_price=round(signal.yes_model, 4),
-            model_no_price=round(signal.no_model, 4),
-            edge=round(signal.edge, 4),
-            edge_pct=round(signal.edge_pct, 4),
-            kelly_fraction=round(signal.kelly_fraction, 4),
-            realized_vol=round(signal.realized_vol, 4),
-            implied_vol=round(signal.implied_vol, 4),
-            vrp=round(signal.vrp, 4),
-            pricing_method=signal.pricing_method,
-            confirming_signals=confirming,
-            contradicting_signals=contradicting,
-            vol_skew=round(vol_skew, 8),
-            funding_bias=round(funding_bias, 6),
-            funding_regime=funding_regime,
-            time_remaining_min=time_remaining_min,
-        )
-        trades.append(trade)
-
-        if verbose:
-            arrow = "^" if btc_moved_up else "v"
-            emoji = "✅" if won else "❌"
-            fund_tag = f" fund={funding_regime[:3]}" if funding_bias != 0 else ""
-            logger.info(
-                f"W{wi+1:>4}/{total_windows} | "
-                f"{window[0].timestamp.strftime('%m-%d %H:%M')} | "
-                f"BTC ${btc_open:,.0f}{arrow}${btc_close:,.0f} | "
-                f"{'long' if direction == 'long' else 'short':>5} @{entry_price:.2f} "
-                f"(model={signal.yes_model:.2f}/{signal.no_model:.2f}) | "
-                f"edge={signal.edge:+.3f} kelly={signal.kelly_fraction:.1%} "
-                f"${position_size:.2f} | "
-                f"{emoji} ${pnl:+.4f} (fee=${fee:.4f}) | "
-                f"cum=${cum_pnl:+.2f} bank=${bankroll:.2f} | "
-                f"RV={signal.realized_vol:.0%} IV={signal.implied_vol:.0%} "
-                f"VRP={signal.vrp:+.0%} [{signal.pricing_method}]{fund_tag}"
-            )
-
-    # ── Compute statistics ───────────────────────────────────────────────
-    wins = sum(1 for t in trades if t.outcome == "WIN")
-    losses = sum(1 for t in trades if t.outcome == "LOSS")
-    total_pnl = sum(t.pnl for t in trades)
-    win_rate = (wins / len(trades) * 100) if trades else 0.0
-    avg_pnl = (total_pnl / len(trades)) if trades else 0.0
-    avg_edge = (sum(abs(t.edge) for t in trades) / len(trades)) if trades else 0.0
-    avg_kelly = (sum(t.kelly_fraction for t in trades) / len(trades)) if trades else 0.0
-    best_trade = max((t.pnl for t in trades), default=0.0)
-    worst_trade = min((t.pnl for t in trades), default=0.0)
-
-    # Max drawdown
-    peak = 0.0
-    max_dd = 0.0
+def _compute_max_drawdown(equity_curve):
+    peak = max_dd = 0.0
     for val in equity_curve:
         if val > peak:
             peak = val
         dd = peak - val
         if dd > max_dd:
             max_dd = dd
+    return max_dd
 
-    # Profit factor
-    gross_profit = sum(t.pnl for t in trades if t.pnl > 0)
-    gross_loss = abs(sum(t.pnl for t in trades if t.pnl < 0))
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")
 
-    # Sharpe ratio (annualized, using trade PnLs)
-    if len(trades) > 1:
-        pnls = [t.pnl for t in trades]
-        mean_pnl = sum(pnls) / len(pnls)
-        std_pnl = math.sqrt(sum((p - mean_pnl) ** 2 for p in pnls) / (len(pnls) - 1))
-        # ~96 windows/day × 365 days
-        trades_per_year = 96 * 365
-        sharpe = (mean_pnl / std_pnl * math.sqrt(trades_per_year)) if std_pnl > 0 else 0.0
-    else:
-        sharpe = 0.0
+def _compute_profit_factor(trades):
+    gp = sum(t.pnl for t in trades if t.pnl > 0)
+    gl = abs(sum(t.pnl for t in trades if t.pnl < 0))
+    return (gp / gl) if gl > 0 else float("inf")
 
-    bankroll_growth = ((bankroll - BANKROLL_USD) / BANKROLL_USD * 100) if BANKROLL_USD > 0 else 0.0
 
-    result = BacktestResult(
+def _compute_sharpe(trades):
+    if len(trades) <= 1:
+        return 0.0
+    pnls = [t.pnl for t in trades]
+    mu = sum(pnls) / len(pnls)
+    sd = math.sqrt(sum((p - mu) ** 2 for p in pnls) / (len(pnls) - 1))
+    return (mu / sd * math.sqrt(96 * 365)) if sd > 0 else 0.0
+
+
+def _compute_backtest_stats(trades, eq, tw, skipped, candles, bankroll, tf, rc):
+    """Compute all backtest statistics and return BacktestResult."""
+    n = len(trades)
+    wins = sum(1 for t in trades if t.outcome == "WIN")
+    tp = sum(t.pnl for t in trades)
+    return BacktestResult(
         start_date=candles[0].timestamp.strftime("%Y-%m-%d") if candles else "",
         end_date=candles[-1].timestamp.strftime("%Y-%m-%d") if candles else "",
         strategy_mode="quant_v3.1_realistic" if (rc and rc.enabled) else "quant_v3.1",
-        total_windows=total_windows,
-        trades_taken=len(trades),
-        trades_skipped=skipped,
-        wins=wins,
-        losses=losses,
-        win_rate=round(win_rate, 2),
-        total_pnl=round(total_pnl, 4),
-        total_fees=round(total_fees, 4),
-        max_drawdown=round(max_dd, 4),
-        profit_factor=round(profit_factor, 2),
-        avg_pnl_per_trade=round(avg_pnl, 4),
-        avg_edge_per_trade=round(avg_edge, 4),
-        avg_kelly=round(avg_kelly, 4),
-        best_trade=round(best_trade, 4),
-        worst_trade=round(worst_trade, 4),
-        sharpe_ratio=round(sharpe, 2),
+        total_windows=tw, trades_taken=n, trades_skipped=skipped,
+        wins=wins, losses=n - wins,
+        win_rate=round((wins / n * 100) if n else 0.0, 2),
+        total_pnl=round(tp, 4), total_fees=round(tf, 4),
+        max_drawdown=round(_compute_max_drawdown(eq), 4),
+        profit_factor=round(_compute_profit_factor(trades), 2),
+        avg_pnl_per_trade=round((tp / n) if n else 0.0, 4),
+        avg_edge_per_trade=round((sum(abs(t.edge) for t in trades) / n) if n else 0.0, 4),
+        avg_kelly=round((sum(t.kelly_fraction for t in trades) / n) if n else 0.0, 4),
+        best_trade=round(max((t.pnl for t in trades), default=0.0), 4),
+        worst_trade=round(min((t.pnl for t in trades), default=0.0), 4),
+        sharpe_ratio=round(_compute_sharpe(trades), 2),
         bankroll_final=round(bankroll, 2),
-        bankroll_growth=round(bankroll_growth, 2),
-        trades=trades,
-        equity_curve=equity_curve,
+        bankroll_growth=round(((bankroll - BANKROLL_USD) / BANKROLL_USD * 100) if BANKROLL_USD > 0 else 0.0, 2),
+        trades=trades, equity_curve=eq,
     )
 
-    # Log skip reasons
+
+def _log_backtest_trade(wi, tw, w, bo, bc, bmu, d, ep, sig, ps, won, pnl, fee, cum, br, fr, fb):
+    """Log a single backtest trade in verbose mode."""
+    arrow = "^" if bmu else "v"
+    emoji = "✅" if won else "❌"
+    ft = f" fund={fr[:3]}" if fb != 0 else ""
+    logger.info(
+        f"W{wi+1:>4}/{tw} | {w[0].timestamp.strftime('%m-%d %H:%M')} | "
+        f"BTC ${bo:,.0f}{arrow}${bc:,.0f} | {d:>5} @{ep:.2f} "
+        f"(model={sig.yes_model:.2f}/{sig.no_model:.2f}) | "
+        f"edge={sig.edge:+.3f} kelly={sig.kelly_fraction:.1%} ${ps:.2f} | "
+        f"{emoji} ${pnl:+.4f} (fee=${fee:.4f}) | cum=${cum:+.2f} bank=${br:.2f} | "
+        f"RV={sig.realized_vol:.0%} IV={sig.implied_vol:.0%} "
+        f"VRP={sig.vrp:+.0%} [{sig.pricing_method}]{ft}"
+    )
+
+
+# =============================================================================
+# Main backtest loop — V3 QUANT STRATEGY (decomposed)
+# =============================================================================
+
+def _get_signal_for_window(vol_est, detector, window, decision_minute, rc, lmy, use_funding, funding_snapshots, use_maker, ph):
+    """Compute market price, vol skew, funding, and detect signal for a window."""
+    bo = window[0].open
+    bs = window[decision_minute].close
+    trm = float(WINDOW_MINUTES - decision_minute)
+
+    pp = btc_to_probability(window, decision_minute, realistic=rc, model_fair_value=lmy)
+    ph.append(Decimal(str(round(pp, 4))))
+    if len(ph) > 100:
+        ph.pop(0)
+
+    ve = vol_est.get_vol(VOL_METHOD)
+    vs = BinaryOptionPricer.estimate_btc_vol_skew(spot=bs, strike=bo, vol=ve.annualized_vol, time_remaining_min=trm)
+    fb, fr = _get_funding_at_window(use_funding, funding_snapshots, window[decision_minute].timestamp)
+
+    sig = detector.detect(
+        yes_market_price=pp, no_market_price=1.0 - pp,
+        btc_spot=bs, btc_strike=bo, time_remaining_min=trm,
+        position_size_usd=MARKET_BUY_USD, use_maker=use_maker, vol_skew=vs, funding_bias=fb)
+
+    return pp, vs, fb, fr, sig, trm
+
+
+def _should_skip_signal(sig, rc, sr, use_conf, fproc, ph, window, dm, hbc, pp):
+    """Check if a tradeable signal should be skipped due to filters. Returns True if skip."""
+    if rc and sig.vol_confidence < rc.min_vol_confidence:
+        sr["vol_confidence"] += 1; return True
+    if rc and abs(sig.edge) < rc.min_edge_realistic:
+        sr["edge_too_small"] += 1; return True
+    mb = sig.direction == "BUY_YES"
+    conf, contra = _run_backtest_confirmation(use_conf, fproc, ph, window, dm, hbc, pp, mb)
+    if contra > conf and sig.confidence < 0.6:
+        sr["confirmation_veto"] += 1; return True
+    return False
+
+
+def _execute_window_trade(sig, pp, rc, trm, use_maker, bankroll):
+    """Compute direction, entry, fill, size, pnl for a single window. Returns None if no fill."""
+    d = "long" if sig.direction == "BUY_YES" else "short"
+    ep = pp if d == "long" else 1.0 - pp
+    ep = _apply_realistic_entry(rc, ep, trm)
+    if not _check_realistic_fill(rc, sig):
+        return None
+    ps = _compute_position_size(rc, sig, bankroll)
+    return d, ep, ps
+
+
+def _init_backtest_state(realistic):
+    """Initialize mutable backtest state."""
+    return {
+        "ph": [], "hbc": [], "trades": [], "eq": [0.0],
+        "bankroll": BANKROLL_USD, "tf": 0.0, "skipped": 0,
+        "sr": {"warmup": 0, "no_edge": 0, "confirmation_veto": 0, "theta_decay": 0,
+               "no_data": 0, "funding_veto": 0, "vol_confidence": 0,
+               "streak_throttle": 0, "no_fill": 0, "edge_too_small": 0, "trade_rate_cap": 0},
+        "rc": realistic if (realistic and realistic.enabled) else None,
+        "closs": 0, "tts": 0, "wp": 0, "lmy": None,
+    }
+
+
+def _record_trade(st, window, d, ep, ps, sig, vs, fb, fr, trm, use_maker, use_conf, fproc, dm, pp, wi, tw, verbose):
+    """Record a trade result and update backtest state. Returns pnl."""
+    bo, bc = window[0].open, window[-1].close
+    won, _, pnl, pnl_bf, fee = _compute_trade_pnl(d, ep, bc > bo, ps, use_maker)
+    st["closs"] = 0 if won else st["closs"] + 1; st["tts"] += 1; st["tf"] += fee
+    st["bankroll"] = max(1.0, st["bankroll"] + pnl)
+    cum = st["eq"][-1] + pnl; st["eq"].append(cum)
+    conf, contra = _run_backtest_confirmation(use_conf, fproc, st["ph"], window, dm, st["hbc"], pp, sig.direction == "BUY_YES")
+    st["trades"].append(_build_backtest_trade(window, d, ep, ps, bo, bc, bc > bo, "WIN" if won else "LOSS", pnl, pnl_bf, fee, sig, conf, contra, vs, fb, fr, trm))
     if verbose:
-        logger.info(f"Skip reasons: {skip_reasons}")
+        _log_backtest_trade(wi, tw, window, bo, bc, bc > bo, d, ep, sig, ps, won, pnl, fee, cum, st["bankroll"], fr, fb)
 
-    return result
+
+def _process_window(wi, window, st, vol_est, detector, fproc, dm, use_conf, use_maker, use_funding, fs, tw, verbose):
+    """Process a single backtest window. Modifies state dict in place."""
+    for c in window:
+        vol_est.add_price(c.close, c.timestamp.timestamp()); st["hbc"].append(c.close)
+    vol_est.set_simulated_time(window[min(dm, len(window)-1)].timestamp.timestamp())
+    skip = _check_window_skip(len(st["hbc"]), len(window), dm, st["rc"], st["closs"], st["tts"], st["wp"], st["sr"])
+    if skip:
+        st["skipped"] += 1
+        if skip == "streak_throttle": st["closs"] = max(0, st["closs"]-1)
+        return
+    st["wp"] += 1
+    pp, vs, fb, fr, sig, trm = _get_signal_for_window(
+        vol_est, detector, window, dm, st["rc"], st["lmy"], use_funding, fs, use_maker, st["ph"])
+    if not sig.is_tradeable:
+        st["sr"]["no_edge"] += 1; st["skipped"] += 1; st["lmy"] = sig.yes_model; return
+    st["lmy"] = sig.yes_model
+    if _should_skip_signal(sig, st["rc"], st["sr"], use_conf, fproc, st["ph"], window, dm, st["hbc"], pp):
+        st["skipped"] += 1; return
+    result = _execute_window_trade(sig, pp, st["rc"], trm, use_maker, st["bankroll"])
+    if result is None:
+        st["sr"]["no_fill"] += 1; st["skipped"] += 1; return
+    d, ep, ps = result
+    _record_trade(st, window, d, ep, ps, sig, vs, fb, fr, trm, use_maker, use_conf, fproc, dm, pp, wi, tw, verbose)
+    detector.update_bankroll(st["bankroll"])
+
+
+def run_backtest_v3(
+    candles: List[Candle], decision_minute: int = 2, verbose: bool = False,
+    use_confirmation: bool = True, use_maker: bool = True, use_funding: bool = True,
+    funding_snapshots: Optional[List[FundingSnapshot]] = None,
+    realistic: Optional[RealisticConfig] = None,
+) -> BacktestResult:
+    """Backtest the V3.1 quant strategy."""
+    vol_est, detector = _init_backtest_modules()
+    fproc = create_fusion_processors() if use_confirmation else None
+    windows = _chunk_candles_to_windows(candles)
+    st = _init_backtest_state(realistic)
+    tw = len(windows)
+
+    for wi, window in enumerate(windows):
+        _process_window(wi, window, st, vol_est, detector, fproc, decision_minute,
+                        use_confirmation, use_maker, use_funding, funding_snapshots, tw, verbose)
+
+    if verbose:
+        logger.info(f"Skip reasons: {st['sr']}")
+    return _compute_backtest_stats(
+        st["trades"], st["eq"], tw, st["skipped"], candles, st["bankroll"], st["tf"], st["rc"])
 
 
 # =============================================================================
-# Pretty printer
+# Pretty printer (split into sub-functions)
 # =============================================================================
-def print_results(result: BacktestResult):
+
+def _print_summary_header(r: BacktestResult):
+    """Print the top-level summary section."""
     print()
     print("=" * 90)
-    print(f"          BACKTEST RESULTS — {result.strategy_mode.upper()}")
+    print(f"          BACKTEST RESULTS — {r.strategy_mode.upper()}")
     print("=" * 90)
-    print(f"  Period:              {result.start_date} → {result.end_date}")
-    print(f"  Total 15m windows:   {result.total_windows}")
-    print(f"  Trades taken:        {result.trades_taken}")
-    print(f"  Trades skipped:      {result.trades_skipped}")
-    print(f"  Trade rate:          {result.trades_taken / max(result.total_windows, 1) * 100:.1f}%")
+    print(f"  Period:              {r.start_date} → {r.end_date}")
+    print(f"  Total 15m windows:   {r.total_windows}")
+    print(f"  Trades taken:        {r.trades_taken}")
+    print(f"  Trades skipped:      {r.trades_skipped}")
+    print(f"  Trade rate:          {r.trades_taken / max(r.total_windows, 1) * 100:.1f}%")
     print("-" * 90)
-    print(f"  Wins:                {result.wins}")
-    print(f"  Losses:              {result.losses}")
-    print(f"  Win Rate:            {result.win_rate:.1f}%")
+    print(f"  Wins / Losses:       {r.wins} / {r.losses}")
+    print(f"  Win Rate:            {r.win_rate:.1f}%")
     print("-" * 90)
-    print(f"  Total P&L:           ${result.total_pnl:+.4f}")
-    print(f"  Total Fees Paid:     ${result.total_fees:.4f}")
-    print(f"  Avg P&L / Trade:     ${result.avg_pnl_per_trade:+.4f}")
-    print(f"  Avg Edge / Trade:    ${result.avg_edge_per_trade:.4f}")
-    print(f"  Avg Kelly Fraction:  {result.avg_kelly:.1%}")
-    print(f"  Best Trade:          ${result.best_trade:+.4f}")
-    print(f"  Worst Trade:         ${result.worst_trade:+.4f}")
-    print(f"  Max Drawdown:        ${result.max_drawdown:.4f}")
-    print(f"  Profit Factor:       {result.profit_factor:.2f}")
-    print(f"  Sharpe Ratio (ann):  {result.sharpe_ratio:.2f}")
+    print(f"  Total P&L:           ${r.total_pnl:+.4f}")
+    print(f"  Total Fees Paid:     ${r.total_fees:.4f}")
+    print(f"  Avg P&L / Trade:     ${r.avg_pnl_per_trade:+.4f}")
+    print(f"  Avg Edge / Trade:    ${r.avg_edge_per_trade:.4f}")
+    print(f"  Avg Kelly Fraction:  {r.avg_kelly:.1%}")
+    print(f"  Best / Worst Trade:  ${r.best_trade:+.4f} / ${r.worst_trade:+.4f}")
+    print(f"  Max Drawdown:        ${r.max_drawdown:.4f}")
+    print(f"  Profit Factor:       {r.profit_factor:.2f}")
+    print(f"  Sharpe Ratio (ann):  {r.sharpe_ratio:.2f}")
     print("-" * 90)
-    print(f"  Starting Bankroll:   ${BANKROLL_USD:.2f}")
-    print(f"  Ending Bankroll:     ${result.bankroll_final:.2f}")
-    print(f"  Bankroll Growth:     {result.bankroll_growth:+.1f}%")
+    print(f"  Bankroll:            ${BANKROLL_USD:.2f} → ${r.bankroll_final:.2f} ({r.bankroll_growth:+.1f}%)")
     print("=" * 90)
 
-    if not result.trades:
-        print("\n  No trades taken.")
-        return
 
-    # Direction breakdown
-    longs = [t for t in result.trades if t.direction == "long"]
-    shorts = [t for t in result.trades if t.direction == "short"]
-    long_wins = sum(1 for t in longs if t.outcome == "WIN")
-    short_wins = sum(1 for t in shorts if t.outcome == "WIN")
-    print(f"\n  Long trades:  {len(longs):>4} | Wins: {long_wins:>4} | "
-          f"Win rate: {(long_wins / len(longs) * 100) if longs else 0:.1f}%")
-    print(f"  Short trades: {len(shorts):>4} | Wins: {short_wins:>4} | "
-          f"Win rate: {(short_wins / len(shorts) * 100) if shorts else 0:.1f}%")
+def _print_direction_and_vol(r: BacktestResult):
+    """Print direction breakdown and vol analysis."""
+    longs = [t for t in r.trades if t.direction == "long"]
+    shorts = [t for t in r.trades if t.direction == "short"]
+    lw = sum(1 for t in longs if t.outcome == "WIN")
+    sw = sum(1 for t in shorts if t.outcome == "WIN")
+    print(f"\n  Long:  {len(longs):>4} ({(lw / len(longs) * 100) if longs else 0:.1f}% WR) | "
+          f"Short: {len(shorts):>4} ({(sw / len(shorts) * 100) if shorts else 0:.1f}% WR)")
 
-    # Vol / VRP analysis
-    avg_rv = sum(t.realized_vol for t in result.trades) / len(result.trades)
-    avg_iv = sum(t.implied_vol for t in result.trades) / len(result.trades)
-    avg_vrp = sum(t.vrp for t in result.trades) / len(result.trades)
-    print(f"\n  Avg Realized Vol:    {avg_rv:.0%}")
-    print(f"  Avg Implied Vol:     {avg_iv:.0%}")
-    print(f"  Avg VRP (IV - RV):   {avg_vrp:+.0%}")
+    n = len(r.trades)
+    arv = sum(t.realized_vol for t in r.trades) / n
+    aiv = sum(t.implied_vol for t in r.trades) / n
+    avrp = sum(t.vrp for t in r.trades) / n
+    print(f"  Avg RV: {arv:.0%} | IV: {aiv:.0%} | VRP: {avrp:+.0%}")
 
-    # Pricing method breakdown
     methods: Dict[str, int] = {}
-    for t in result.trades:
+    for t in r.trades:
         methods[t.pricing_method] = methods.get(t.pricing_method, 0) + 1
-    print(f"\n  Pricing methods used:")
-    for m, count in sorted(methods.items(), key=lambda x: -x[1]):
-        print(f"    {m:<20} {count:>4} trades ({count / len(result.trades) * 100:.0f}%)")
+    print(f"\n  Pricing methods:")
+    for m, c in sorted(methods.items(), key=lambda x: -x[1]):
+        print(f"    {m:<20} {c:>4} ({c / n * 100:.0f}%)")
 
-    # Funding regime breakdown
+
+def _print_funding_and_edge(r: BacktestResult):
+    """Print funding regime breakdown and edge distribution."""
     regimes: Dict[str, List[BacktestTrade]] = {}
-    for t in result.trades:
-        r = t.funding_regime
-        regimes.setdefault(r, []).append(t)
-    if any(t.funding_regime != "DISABLED" for t in result.trades):
+    for t in r.trades:
+        regimes.setdefault(t.funding_regime, []).append(t)
+    if any(t.funding_regime != "DISABLED" for t in r.trades):
         print(f"\n  Funding regime breakdown:")
-        for regime, regime_trades in sorted(regimes.items()):
-            rw = sum(1 for t in regime_trades if t.outcome == "WIN")
-            rpnl = sum(t.pnl for t in regime_trades)
-            wr = (rw / len(regime_trades) * 100) if regime_trades else 0
-            print(f"    {regime:<20} {len(regime_trades):>4} trades, "
-                  f"{wr:.1f}% win rate, PnL ${rpnl:+.4f}")
+        for regime, rt in sorted(regimes.items()):
+            rw = sum(1 for t in rt if t.outcome == "WIN")
+            rp = sum(t.pnl for t in rt)
+            print(f"    {regime:<20} {len(rt):>4} trades, "
+                  f"{(rw / len(rt) * 100) if rt else 0:.1f}% WR, PnL ${rp:+.4f}")
 
-    # Edge distribution
-    edges = sorted([abs(t.edge) for t in result.trades])
-    print(f"\n  Edge distribution:")
-    print(f"    Min:    ${edges[0]:.4f}")
-    print(f"    25th:   ${edges[len(edges) // 4]:.4f}")
-    print(f"    Median: ${edges[len(edges) // 2]:.4f}")
-    print(f"    75th:   ${edges[3 * len(edges) // 4]:.4f}")
-    print(f"    Max:    ${edges[-1]:.4f}")
+    edges = sorted([abs(t.edge) for t in r.trades])
+    n = len(edges)
+    print(f"\n  Edge dist: min=${edges[0]:.4f} | 25th=${edges[n//4]:.4f} | "
+          f"med=${edges[n//2]:.4f} | 75th=${edges[3*n//4]:.4f} | max=${edges[-1]:.4f}")
 
-    # Win rate by edge bucket
     print(f"\n  Win rate by edge size:")
-    buckets = [(0.02, 0.05), (0.05, 0.10), (0.10, 0.20), (0.20, 1.00)]
-    for lo, hi in buckets:
-        bucket_trades = [t for t in result.trades if lo <= abs(t.edge) < hi]
-        if bucket_trades:
-            bw = sum(1 for t in bucket_trades if t.outcome == "WIN")
-            print(f"    ${lo:.2f}-${hi:.2f}: {len(bucket_trades):>4} trades, "
-                  f"{bw / len(bucket_trades) * 100:.1f}% win rate, "
-                  f"avg PnL ${sum(t.pnl for t in bucket_trades) / len(bucket_trades):+.4f}")
+    for lo, hi in [(0.02, 0.05), (0.05, 0.10), (0.10, 0.20), (0.20, 1.00)]:
+        bt = [t for t in r.trades if lo <= abs(t.edge) < hi]
+        if bt:
+            bw = sum(1 for t in bt if t.outcome == "WIN")
+            print(f"    ${lo:.2f}-${hi:.2f}: {len(bt):>4}, {bw / len(bt) * 100:.1f}% WR, "
+                  f"avg PnL ${sum(t.pnl for t in bt) / len(bt):+.4f}")
 
-    # Last 15 trades
+
+def _print_recent_trades(r: BacktestResult):
+    """Print last 15 trades table."""
     print(f"\n  Last 15 trades:")
     print(f"  {'Time':<13} {'Dir':<6} {'Entry':<6} {'Model':<6} "
           f"{'Edge':<7} {'Kelly':<6} {'Size':<6} {'Result':<5} {'P&L':<9} {'Fee':<6} "
           f"{'RV':<5} {'IV':<5} {'Method'}")
     print(f"  {'-' * 105}")
-    for t in result.trades[-15:]:
-        model_val = t.model_yes_price if t.direction == "long" else t.model_no_price
+    for t in r.trades[-15:]:
+        mv = t.model_yes_price if t.direction == "long" else t.model_no_price
         print(
             f"  {t.window_start.strftime('%m-%d %H:%M'):<13} "
-            f"{t.direction:<6} "
-            f"{t.entry_price:<6.2f} "
-            f"{model_val:<6.2f} "
-            f"{t.edge:+6.3f} "
-            f"{t.kelly_fraction:5.1%} "
+            f"{t.direction:<6} {t.entry_price:<6.2f} {mv:<6.2f} "
+            f"{t.edge:+6.3f} {t.kelly_fraction:5.1%} "
             f"${t.position_size:<5.2f} "
             f"{'W' if t.outcome == 'WIN' else 'L':<5} "
-            f"${t.pnl:+8.4f} "
-            f"${t.fee_paid:<5.4f} "
-            f"{t.realized_vol:4.0%} "
-            f"{t.implied_vol:4.0%} "
-            f"{t.pricing_method}"
-        )
+            f"${t.pnl:+8.4f} ${t.fee_paid:<5.4f} "
+            f"{t.realized_vol:4.0%} {t.implied_vol:4.0%} {t.pricing_method}")
 
-    print()
-    print("  NOTES:")
-    print("  • Market prices are synthetic (BTC move → probability via sensitivity curve)")
-    print("  • Fees use correct Polymarket nonlinear formula (max 1.56% taker, 0% maker)")
-    print("  • Position sizing via half-Kelly, capped at 5% of bankroll")
-    print("  • V3.1: Vol skew correction + historical Binance funding rate bias")
-    print("  • OrderBook/DeribitPCR skipped (require live data)")
-    print("  • Sentiment is RSI-based proxy for Fear & Greed Index")
+
+def print_results(result: BacktestResult):
+    """Pretty-print backtest results."""
+    _print_summary_header(result)
+    if not result.trades:
+        print("\n  No trades taken.")
+        return
+    _print_direction_and_vol(result)
+    _print_funding_and_edge(result)
+    _print_recent_trades(result)
+    print("\n  NOTES:")
+    print("  • Market prices are synthetic | Fees: correct nonlinear formula")
+    print("  • Sizing: half-Kelly, 5% cap | V3.1: vol skew + funding bias")
     print()
 
 
 # =============================================================================
 # Export
 # =============================================================================
+
 def export_results(result: BacktestResult, output_path: str):
+    """Export results to JSON."""
     data = {
         "summary": {
-            "strategy_mode": result.strategy_mode,
-            "start_date": result.start_date,
-            "end_date": result.end_date,
-            "total_windows": result.total_windows,
-            "trades_taken": result.trades_taken,
-            "trades_skipped": result.trades_skipped,
-            "wins": result.wins,
-            "losses": result.losses,
-            "win_rate": result.win_rate,
-            "total_pnl": result.total_pnl,
-            "total_fees": result.total_fees,
-            "max_drawdown": result.max_drawdown,
-            "profit_factor": result.profit_factor,
-            "avg_pnl_per_trade": result.avg_pnl_per_trade,
-            "avg_edge_per_trade": result.avg_edge_per_trade,
-            "avg_kelly": result.avg_kelly,
-            "sharpe_ratio": result.sharpe_ratio,
-            "bankroll_final": result.bankroll_final,
-            "bankroll_growth": result.bankroll_growth,
+            k: getattr(result, k) for k in [
+                "strategy_mode", "start_date", "end_date", "total_windows",
+                "trades_taken", "trades_skipped", "wins", "losses", "win_rate",
+                "total_pnl", "total_fees", "max_drawdown", "profit_factor",
+                "avg_pnl_per_trade", "avg_edge_per_trade", "avg_kelly",
+                "sharpe_ratio", "bankroll_final", "bankroll_growth",
+            ]
         },
         "trades": [
-            {
-                "window_start": t.window_start.isoformat(),
-                "direction": t.direction,
-                "entry_price": t.entry_price,
-                "position_size": t.position_size,
-                "actual_btc_open": t.actual_btc_open,
-                "actual_btc_close": t.actual_btc_close,
-                "btc_moved_up": t.btc_moved_up,
-                "outcome": t.outcome,
-                "pnl": t.pnl,
-                "pnl_before_fees": t.pnl_before_fees,
-                "fee_paid": t.fee_paid,
-                "model_yes_price": t.model_yes_price,
-                "model_no_price": t.model_no_price,
-                "edge": t.edge,
-                "edge_pct": t.edge_pct,
-                "kelly_fraction": t.kelly_fraction,
-                "realized_vol": t.realized_vol,
-                "implied_vol": t.implied_vol,
-                "vrp": t.vrp,
-                "pricing_method": t.pricing_method,
-                "confirming_signals": t.confirming_signals,
-                "contradicting_signals": t.contradicting_signals,
-                "vol_skew": t.vol_skew,
-                "funding_bias": t.funding_bias,
-                "funding_regime": t.funding_regime,
-            }
+            {k: (getattr(t, k).isoformat() if k == "window_start" else getattr(t, k))
+             for k in BacktestTrade.__dataclass_fields__}
             for t in result.trades
         ],
         "equity_curve": result.equity_curve,
@@ -1276,145 +1050,116 @@ def export_results(result: BacktestResult, output_path: str):
 
 
 # =============================================================================
-# CLI
+# CLI (split into helpers)
 # =============================================================================
-def main():
-    parser = argparse.ArgumentParser(
-        description="Backtest V3.1 — BTC 15-Min Polymarket Quant Strategy",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python backtest_v3.py                           # Last 7 days, V3.1 quant
-  python backtest_v3.py --realistic               # Realistic mode (spread + noise + filters)
-  python backtest_v3.py --realistic --days 100    # 100-day realistic backtest
-  python backtest_v3.py --days 30                 # Last 30 days
-  python backtest_v3.py --start 2026-02-01 --end 2026-02-27
-  python backtest_v3.py --csv data.csv            # From local CSV
-  python backtest_v3.py --verbose                 # Print each trade
-  python backtest_v3.py --no-confirmation         # Skip fusion confirmation
-  python backtest_v3.py --no-funding              # Disable funding rate overlay
-  python backtest_v3.py --taker                   # Simulate taker fills (1.56% max fee)
-  python backtest_v3.py --realistic --spread 4    # Override spread to 4 cents
-  python backtest_v3.py --realistic --fill-rate 0.65  # Override fill rate
-  python backtest_v3.py --output results.json
-        """,
-    )
-    parser.add_argument("--start", type=str, help="Start date (YYYY-MM-DD)")
-    parser.add_argument("--end", type=str, help="End date (YYYY-MM-DD)")
-    parser.add_argument("--days", type=int, default=7, help="Days to backtest (default: 7)")
-    parser.add_argument("--csv", type=str, help="Path to CSV file with 1m candles")
-    parser.add_argument("--decision-minute", type=int, default=2,
-                        help="Minute within 15-min window to decide (default: 2)")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Print each trade")
-    parser.add_argument("--output", "-o", type=str, help="Export results to JSON")
-    parser.add_argument("--no-confirmation", action="store_true",
-                        help="Skip fusion processor confirmation (pure quant model)")
-    parser.add_argument("--taker", action="store_true",
-                        help="Simulate taker fills with nonlinear fees (default: maker/0%%)")
-    parser.add_argument("--no-funding", action="store_true",
-                        help="Disable funding rate filter overlay")
-    parser.add_argument("--realistic", action="store_true",
-                        help="Realistic mode: spread, fill rate, noise, smarter filters")
-    parser.add_argument("--spread", type=float, default=None,
-                        help="Override spread in cents (default: 3 in realistic mode)")
-    parser.add_argument("--fill-rate", type=float, default=None,
-                        help="Override fill rate 0.0-1.0 (default: 0.72 in realistic mode)")
-    args = parser.parse_args()
 
+def _parse_args():
+    """Parse CLI arguments."""
+    p = argparse.ArgumentParser(
+        description="Backtest V3.1 — BTC 15-Min Polymarket Quant Strategy",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--start", type=str)
+    p.add_argument("--end", type=str)
+    p.add_argument("--days", type=int, default=7)
+    p.add_argument("--csv", type=str)
+    p.add_argument("--decision-minute", type=int, default=2)
+    p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument("--output", "-o", type=str)
+    p.add_argument("--no-confirmation", action="store_true")
+    p.add_argument("--taker", action="store_true")
+    p.add_argument("--no-funding", action="store_true")
+    p.add_argument("--realistic", action="store_true")
+    p.add_argument("--spread", type=float, default=None)
+    p.add_argument("--fill-rate", type=float, default=None)
+    return p.parse_args()
+
+
+def _build_realistic_config(args):
+    """Build RealisticConfig from CLI args."""
+    rc = RealisticConfig(enabled=args.realistic)
+    if args.spread is not None:
+        rc.spread_cents = args.spread
+    if args.fill_rate is not None:
+        rc.fill_rate = args.fill_rate
+    if rc.enabled:
+        random.seed(42)
+    return rc
+
+
+def _print_config_banner(args, rc, use_maker, use_funding):
+    """Print the configuration banner."""
+    label = "V3.1 REALISTIC" if rc.enabled else "V3.1"
+    print("=" * 90)
+    print(f"  POLYMARKET BTC 15-MIN — {label} QUANT BACKTESTER")
+    print("=" * 90)
+    print(f"  Fees: {'Maker 0%' if use_maker else 'Taker (max 1.56%)'} | "
+          f"Min edge: ${rc.min_edge_realistic if rc.enabled else MIN_EDGE_CENTS:.2f} | "
+          f"Vol: {VOL_METHOD}")
+    print(f"  Confirmation: {'ON' if not args.no_confirmation else 'OFF'} | "
+          f"Funding: {'ON' if use_funding else 'OFF'} | "
+          f"Decision min: {args.decision_minute}")
+    if rc.enabled:
+        print(f"  Realistic: spread={rc.spread_cents*100:.0f}¢ | "
+              f"fill={rc.fill_rate:.0%} | noise=±{rc.market_noise_std*100:.1f}¢ | "
+              f"eff={rc.market_efficiency:.0%}")
+    print()
+
+
+def _load_candles(args):
+    """Load candle data from CSV or Binance API."""
+    if args.csv:
+        return load_csv_candles(args.csv)
+    if args.start and args.end:
+        s = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        e = datetime.strptime(args.end, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    else:
+        e = datetime.now(timezone.utc)
+        s = e - timedelta(days=args.days)
+    return fetch_binance_klines(s, e)
+
+
+def _load_funding(candles, use_funding):
+    """Load historical funding rates if enabled."""
+    if not use_funding:
+        return None, use_funding
+    try:
+        snaps = fetch_funding_rates(candles[0].timestamp, candles[-1].timestamp)
+        if snaps:
+            rc: Dict[str, int] = {}
+            for s in snaps:
+                rc[s.classification] = rc.get(s.classification, 0) + 1
+            print(f"  Funding: {len(snaps)} snapshots — " +
+                  ", ".join(f"{k}: {v}" for k, v in sorted(rc.items())))
+            print()
+        return snaps, use_funding
+    except Exception as ex:
+        print(f"  WARNING: Funding rates unavailable: {ex}")
+        return None, False
+
+
+def main():
+    args = _parse_args()
     if args.verbose:
         logger.remove()
         logger.add(sys.stderr, level="DEBUG")
 
     use_maker = not args.taker
     use_funding = not args.no_funding
+    rc = _build_realistic_config(args)
+    _print_config_banner(args, rc, use_maker, use_funding)
 
-    # ── Build realistic config ───────────────────────────────────────────
-    rc = RealisticConfig(enabled=args.realistic)
-    if args.spread is not None:
-        rc.spread_cents = args.spread
-    if args.fill_rate is not None:
-        rc.fill_rate = args.fill_rate
-
-    # Set random seed for reproducibility in realistic mode
-    if rc.enabled:
-        random.seed(42)
-
-    mode_label = "V3.1 REALISTIC" if rc.enabled else "V3.1"
-
-    print("=" * 90)
-    print(f"  POLYMARKET BTC 15-MIN STRATEGY — {mode_label} QUANT BACKTESTER")
-    print("=" * 90)
-    print(f"  Model:             Merton Jump-Diffusion + Mean Reversion + Seasonality")
-    print(f"  Sizing:            Half-Kelly, capped at 5% of ${BANKROLL_USD:.0f} bankroll")
-    print(f"  Fees:              {'Maker (0%)' if use_maker else 'Taker (nonlinear, max 1.56%)'}")
-    print(f"  Min edge:          ${rc.min_edge_realistic if rc.enabled else MIN_EDGE_CENTS:.2f}")
-    print(f"  Vol method:        {VOL_METHOD}")
-    print(f"  Confirmation:      {'ON' if not args.no_confirmation else 'OFF (pure quant)'}")
-    print(f"  Funding filter:    {'ON' if use_funding else 'OFF'}")
-    print(f"  Vol skew:          ON (BTC crash risk premium)")
-    print(f"  Decision minute:   {args.decision_minute}")
-    if rc.enabled:
-        print(f"  ── REALISTIC MODE ──")
-        print(f"  Spread:            {rc.spread_cents*100:.0f}¢ ({(rc.spread_cents + rc.spread_widen_late)*100:.0f}¢ late window)")
-        print(f"  Fill rate:         {rc.fill_rate:.0%} base (+{rc.fill_rate_boost_edge:.0%}/10¢ edge)")
-        print(f"  Market noise:      ±{rc.market_noise_std * 100:.1f}¢")
-        print(f"  Market efficiency: {rc.market_efficiency:.0%} (MM partially reflects model)")
-        print(f"  Vol conf. gate:    >{rc.min_vol_confidence:.0%}")
-        print(f"  Streak throttle:   skip after {rc.max_consecutive_losses} consecutive losses")
-    print()
-
-    # ── Load candle data ─────────────────────────────────────────────────
-    if args.csv:
-        candles = load_csv_candles(args.csv)
-    else:
-        if args.start and args.end:
-            start_dt = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            end_dt = datetime.strptime(args.end, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        else:
-            end_dt = datetime.now(timezone.utc)
-            start_dt = end_dt - timedelta(days=args.days)
-
-        candles = fetch_binance_klines(start_dt, end_dt)
-
+    candles = _load_candles(args)
     if not candles:
         print("ERROR: No candle data available")
         sys.exit(1)
 
-    # ── Fetch historical funding rates (V3.1) ────────────────────────────
-    funding_snapshots: Optional[List[FundingSnapshot]] = None
-    if use_funding:
-        candle_start = candles[0].timestamp
-        candle_end = candles[-1].timestamp
-        try:
-            funding_snapshots = fetch_funding_rates(candle_start, candle_end)
-            if funding_snapshots:
-                regime_counts: Dict[str, int] = {}
-                for s in funding_snapshots:
-                    regime_counts[s.classification] = regime_counts.get(s.classification, 0) + 1
-                print(f"  Funding rates loaded: {len(funding_snapshots)} snapshots")
-                for regime, count in sorted(regime_counts.items()):
-                    print(f"    {regime}: {count}")
-                print()
-        except Exception as e:
-            print(f"  WARNING: Could not fetch funding rates: {e}")
-            print(f"  Proceeding without funding filter")
-            funding_snapshots = None
-            use_funding = False
-
-    # ── Run backtest ─────────────────────────────────────────────────────
+    funding_snapshots, use_funding = _load_funding(candles, use_funding)
     result = run_backtest_v3(
-        candles=candles,
-        decision_minute=args.decision_minute,
-        verbose=args.verbose,
-        use_confirmation=not args.no_confirmation,
-        use_maker=use_maker,
-        use_funding=use_funding,
-        funding_snapshots=funding_snapshots,
-        realistic=rc,
-    )
-
+        candles=candles, decision_minute=args.decision_minute,
+        verbose=args.verbose, use_confirmation=not args.no_confirmation,
+        use_maker=use_maker, use_funding=use_funding,
+        funding_snapshots=funding_snapshots, realistic=rc)
     print_results(result)
-
     if args.output:
         export_results(result, args.output)
 

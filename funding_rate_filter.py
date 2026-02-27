@@ -193,20 +193,35 @@ class FundingRateFilter:
         index_price = float(data.get("indexPrice", 0))
         next_funding_time = int(data.get("nextFundingTime", 0))
 
-        funding_pct = funding_rate * 100  # e.g., 0.0001 → 0.01%
+        classification, bias = self._classify(funding_rate)
+        regime = self._build_regime(
+            funding_rate, mark_price, index_price,
+            next_funding_time, classification, bias,
+        )
 
-        # Basis = (mark - index) / index
+        with self._lock:
+            self._regime = regime
+            self._last_fetch = time.time()
+            self._fetch_count += 1
+
+        logger.info(
+            f"Funding rate: {funding_rate:+.6f} ({regime.funding_rate_pct:+.4f}%) → "
+            f"{classification}, bias={bias:+.3f}, basis={regime.basis_bps:+.1f}bps"
+        )
+        return regime
+
+    def _build_regime(self, funding_rate, mark_price, index_price,
+                      next_funding_time, classification, bias):
+        """Build a FundingRegime from parsed data."""
+        funding_pct = funding_rate * 100
         basis_bps = 0.0
         if index_price > 0:
             basis_bps = (mark_price - index_price) / index_price * 10000
 
-        # Classify regime
-        classification, bias = self._classify(funding_rate)
-
-        regime = FundingRegime(
+        return FundingRegime(
             funding_rate=funding_rate,
             funding_rate_pct=funding_pct,
-            predicted_rate=None,  # Could fetch from predicted endpoint
+            predicted_rate=None,
             classification=classification,
             mean_reversion_bias=bias,
             index_price=index_price,
@@ -216,17 +231,6 @@ class FundingRateFilter:
             last_update=time.time(),
         )
 
-        with self._lock:
-            self._regime = regime
-            self._last_fetch = time.time()
-            self._fetch_count += 1
-
-        logger.info(
-            f"Funding rate: {funding_rate:+.6f} ({funding_pct:+.4f}%) → "
-            f"{classification}, bias={bias:+.3f}, basis={basis_bps:+.1f}bps"
-        )
-
-        return regime
 
     def _classify(self, rate: float) -> tuple:
         """Classify funding rate into regime + compute mean-reversion bias."""
