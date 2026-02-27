@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 import math
 from decimal import Decimal
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Dict
 import random
 
@@ -50,7 +50,7 @@ from nautilus_trader.adapters.polymarket.factories import (
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.model.identifiers import InstrumentId, ClientOrderId
 from nautilus_trader.model.enums import OrderSide, TimeInForce
-from nautilus_trader.model.objects import Quantity
+from nautilus_trader.model.objects import Quantity, Price
 from nautilus_trader.model.data import QuoteTick
 
 from dotenv import load_dotenv
@@ -81,9 +81,24 @@ else:
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-QUOTE_STABILITY_REQUIRED = 3      # Need only 3 valid ticks to be stable (faster startup)
+QUOTE_STABILITY_REQUIRED = 3      # Need 3 valid ticks to be stable
 QUOTE_MIN_SPREAD = 0.001          # Both bid AND ask must be at least this
 MARKET_INTERVAL_SECONDS = 900     # 15-minute markets
+
+# =============================================================================
+# CHANGED: Read config from .env with sensible defaults
+# These were previously hardcoded or ignored.
+# =============================================================================
+TRADE_WINDOW_START_SEC = int(os.getenv("TRADE_WINDOW_START", "60"))   # CHANGED: was 780 (min 13). Now min 1.
+TRADE_WINDOW_END_SEC = int(os.getenv("TRADE_WINDOW_END", "180"))      # CHANGED: was 840 (min 14). Now min 3.
+POSITION_SIZE_USD = Decimal(os.getenv("MARKET_BUY_USD", "1.00"))      # CHANGED: reads from .env
+USE_LIMIT_ORDERS = os.getenv("USE_LIMIT_ORDERS", "true").lower() == "true"  # NEW: maker orders
+LIMIT_ORDER_OFFSET = Decimal(os.getenv("LIMIT_ORDER_OFFSET", "0.01"))       # NEW: how far inside spread
+MIN_FUSION_SIGNALS = int(os.getenv("MIN_FUSION_SIGNALS", "2"))         # CHANGED: was 1. Now requires 2+ agreeing signals.
+MIN_FUSION_SCORE = float(os.getenv("MIN_FUSION_SCORE", "55.0"))       # CHANGED: was 40. Raised threshold.
+TREND_UP_THRESHOLD = float(os.getenv("TREND_UP_THRESHOLD", "0.60"))    # Used as a SKIP gate only, not direction override
+TREND_DOWN_THRESHOLD = float(os.getenv("TREND_DOWN_THRESHOLD", "0.40"))
+MAX_RETRIES_PER_WINDOW = int(os.getenv("MAX_RETRIES_PER_WINDOW", "3"))  # NEW: cap FAK retry storms
 
 
 @dataclass
@@ -109,6 +124,25 @@ class PaperTrade:
         }
 
 
+# =============================================================================
+# NEW: Track open positions for resolution
+# =============================================================================
+@dataclass
+class OpenPosition:
+    """Track a live position until market resolves"""
+    market_slug: str
+    direction: str  # "long" or "short"
+    entry_price: float
+    size_usd: float
+    entry_time: datetime
+    market_end_time: datetime
+    instrument_id: object  # InstrumentId
+    order_id: str
+    resolved: bool = False
+    exit_price: Optional[float] = None
+    pnl: Optional[float] = None
+
+
 def init_redis():
     """Initialize Redis connection for simulation mode control."""
     try:
@@ -131,10 +165,17 @@ def init_redis():
 
 class IntegratedBTCStrategy(Strategy):
     """
-    Integrated BTC Strategy - FIXED VERSION
-    - Subscribes immediately at startup
-    - Forces stability for first trade
-    - Correct timing for market switching
+    Integrated BTC Strategy - V2 (EARLY WINDOW + MAKER ORDERS)
+
+    KEY CHANGES FROM V1:
+    1. Trades at minutes 1-3 (signal-driven prediction) instead of 13-14 (trend-following)
+    2. Uses limit orders (0% maker fee) instead of market orders (10% taker fee)
+    3. Fusion engine DRIVES direction (min 2 signals required), no trend override
+    4. Persistent data source connections (no reconnect per decision)
+    5. Subscribes to BOTH YES and NO token quotes (risk engine works)
+    6. No synthetic price history poisoning
+    7. Position resolution tracking
+    8. Retry rate limiting on FAK rejections
     """
 
     def __init__(self, redis_client=None, enable_grafana=True, test_mode=False):
@@ -157,24 +198,34 @@ class IntegratedBTCStrategy(Strategy):
         self._stable_tick_count = 0
         self._market_stable = False
         self._last_instrument_switch = None
-        
-        # =========================================================================
-        # FIX 1: Force first trade by setting last_trade_time to -1
-        # =========================================================================
-        self.last_trade_time = -1  # Force first trade immediately!
-        self._waiting_for_market_open = False  # True when waiting for a future market to open
-        self._last_bid_ask = None  # (bid_decimal, ask_decimal) from last tick, for liquidity checks
+
+        self.last_trade_time = -1  # Force first trade immediately
+        self._waiting_for_market_open = False
+        self._last_bid_ask = None
+
+        # CHANGED: Retry counter per trade window to prevent FAK storms
+        self._retry_count_this_window = 0
 
         # Tick buffer: rolling 90s of ticks for TickVelocityProcessor
         from collections import deque
-        self._tick_buffer: deque = deque(maxlen=500)  # ~500 ticks = well over 90s
+        self._tick_buffer: deque = deque(maxlen=500)
 
-        # YES token id for the current market (set in _load_all_btc_instruments)
+        # YES/NO token ids for the current market
         self._yes_token_id: Optional[str] = None
+
+        # NEW: Track open positions
+        self._open_positions: List[OpenPosition] = []
+
+        # =============================================================================
+        # CHANGED: Persistent data source clients (initialized once, not per-decision)
+        # =============================================================================
+        self._news_source = None
+        self._coinbase_source = None
+        self._data_sources_initialized = False
 
         # Phase 4: Signal Processors
         self.spike_detector = SpikeDetectionProcessor(
-            spike_threshold=0.05,       # FIXED: was 0.15 (too high for probabilities)
+            spike_threshold=float(os.getenv("SPIKE_THRESHOLD", "0.05")),  # CHANGED: reads .env
             lookback_periods=20,
         )
         self.sentiment_processor = SentimentProcessor(
@@ -182,32 +233,31 @@ class IntegratedBTCStrategy(Strategy):
             extreme_greed_threshold=75,
         )
         self.divergence_processor = PriceDivergenceProcessor(
-            divergence_threshold=0.05,
+            divergence_threshold=float(os.getenv("DIVERGENCE_THRESHOLD", "0.05")),  # CHANGED: reads .env
         )
         self.orderbook_processor = OrderBookImbalanceProcessor(
-            imbalance_threshold=0.30,   # 30% skew to signal
-            min_book_volume=50.0,       # ignore illiquid books
+            imbalance_threshold=0.30,
+            min_book_volume=50.0,
         )
         self.tick_velocity_processor = TickVelocityProcessor(
-            velocity_threshold_60s=0.015,  # 1.5% move in 60s
-            velocity_threshold_30s=0.010,  # 1.0% move in 30s
+            velocity_threshold_60s=0.015,
+            velocity_threshold_30s=0.010,
         )
         self.deribit_pcr_processor = DeribitPCRProcessor(
             bullish_pcr_threshold=1.20,
             bearish_pcr_threshold=0.70,
             max_days_to_expiry=2,
-            cache_seconds=300,          # refresh every 5 min
+            cache_seconds=300,
         )
 
-        # Phase 4: Signal Fusion — update weights for 6 processors
+        # Phase 4: Signal Fusion
         self.fusion_engine = get_fusion_engine()
-        # Rebalanced weights (must sum ≤ 1.0; higher = more influence)
-        self.fusion_engine.set_weight("OrderBookImbalance", 0.30)  # best real-time signal
-        self.fusion_engine.set_weight("TickVelocity",       0.25)  # fast poly momentum
-        self.fusion_engine.set_weight("PriceDivergence",    0.18)  # spot momentum
-        self.fusion_engine.set_weight("SpikeDetection",     0.12)  # mean reversion
-        self.fusion_engine.set_weight("DeribitPCR",         0.10)  # institutional sentiment
-        self.fusion_engine.set_weight("SentimentAnalysis",  0.05)  # daily F&G (weak)
+        self.fusion_engine.set_weight("OrderBookImbalance", 0.30)
+        self.fusion_engine.set_weight("TickVelocity",       0.25)
+        self.fusion_engine.set_weight("PriceDivergence",    0.18)
+        self.fusion_engine.set_weight("SpikeDetection",     0.12)
+        self.fusion_engine.set_weight("DeribitPCR",         0.10)
+        self.fusion_engine.set_weight("SentimentAnalysis",  0.05)
 
         # Phase 5: Risk Management
         self.risk_engine = get_risk_engine()
@@ -239,12 +289,12 @@ class IntegratedBTCStrategy(Strategy):
             logger.info("=" * 80)
 
         logger.info("=" * 80)
-        logger.info("INTEGRATED BTC STRATEGY INITIALIZED - FIXED VERSION")
-        logger.info("  Phase 4: Signal processors ready")
-        logger.info("  Phase 5: Risk engine ready")
-        logger.info("  Phase 6: Performance tracking ready")
-        logger.info("  Phase 7: Learning engine ready")
-        logger.info("  $1 per trade maximum")
+        logger.info("INTEGRATED BTC STRATEGY V2 - EARLY WINDOW + MAKER ORDERS")
+        logger.info(f"  Trade window: {TRADE_WINDOW_START_SEC}s–{TRADE_WINDOW_END_SEC}s ({TRADE_WINDOW_START_SEC/60:.0f}–{TRADE_WINDOW_END_SEC/60:.0f} min)")
+        logger.info(f"  Order type: {'LIMIT (maker, 0% fee)' if USE_LIMIT_ORDERS else 'MARKET (taker, 10% fee)'}")
+        logger.info(f"  Position size: ${POSITION_SIZE_USD}")
+        logger.info(f"  Fusion: min {MIN_FUSION_SIGNALS} signals, min score {MIN_FUSION_SCORE}")
+        logger.info(f"  Skip zone: {TREND_DOWN_THRESHOLD:.0%}–{TREND_UP_THRESHOLD:.0%} (coin flip)")
         logger.info("=" * 80)
 
     # ------------------------------------------------------------------
@@ -280,6 +330,49 @@ class IntegratedBTCStrategy(Strategy):
         self._stable_tick_count = 0
 
     # ------------------------------------------------------------------
+    # CHANGED: Persistent data source connections
+    # ------------------------------------------------------------------
+
+    async def _init_data_sources(self):
+        """Initialize persistent connections to external data sources."""
+        if self._data_sources_initialized:
+            return
+
+        try:
+            from data_sources.news_social.adapter import NewsSocialDataSource
+            self._news_source = NewsSocialDataSource()
+            await self._news_source.connect()
+            logger.info("✓ Persistent news/social data source connected")
+        except Exception as e:
+            logger.warning(f"Could not connect news source: {e}")
+            self._news_source = None
+
+        try:
+            from data_sources.coinbase.adapter import CoinbaseDataSource
+            self._coinbase_source = CoinbaseDataSource()
+            await self._coinbase_source.connect()
+            logger.info("✓ Persistent Coinbase data source connected")
+        except Exception as e:
+            logger.warning(f"Could not connect Coinbase source: {e}")
+            self._coinbase_source = None
+
+        self._data_sources_initialized = True
+
+    async def _teardown_data_sources(self):
+        """Disconnect persistent data sources."""
+        if self._news_source:
+            try:
+                await self._news_source.disconnect()
+            except Exception:
+                pass
+        if self._coinbase_source:
+            try:
+                await self._coinbase_source.disconnect()
+            except Exception:
+                pass
+        self._data_sources_initialized = False
+
+    # ------------------------------------------------------------------
     # Redis
     # ------------------------------------------------------------------
 
@@ -309,21 +402,23 @@ class IntegratedBTCStrategy(Strategy):
     def on_start(self):
         """Called when strategy starts - LOAD ALL MARKETS AND SUBSCRIBE IMMEDIATELY"""
         logger.info("=" * 80)
-        logger.info("INTEGRATED BTC STRATEGY STARTED - FIXED VERSION")
+        logger.info("INTEGRATED BTC STRATEGY V2 STARTED")
         logger.info("=" * 80)
 
-        # =========================================================================
-        # FIX 2: Load ALL BTC instruments at startup
-        # =========================================================================
+        # Load ALL BTC instruments at startup
         self._load_all_btc_instruments()
 
-        # =========================================================================
-        # FIX 3: Force subscribe to current market IMMEDIATELY
-        # =========================================================================
+        # Subscribe to current market IMMEDIATELY
         if self.instrument_id:
             self.subscribe_quote_ticks(self.instrument_id)
-            logger.info(f"✓ SUBSCRIBED to market: {self.instrument_id}")
-            
+            logger.info(f"✓ SUBSCRIBED to YES token: {self.instrument_id}")
+
+            # CHANGED: Also subscribe to NO token so risk engine has price data
+            no_id = getattr(self, '_no_instrument_id', None)
+            if no_id:
+                self.subscribe_quote_ticks(no_id)
+                logger.info(f"✓ SUBSCRIBED to NO token: {no_id}")
+
             # Try to get current price from cache
             try:
                 quote = self.cache.quote_tick(self.instrument_id)
@@ -334,13 +429,16 @@ class IntegratedBTCStrategy(Strategy):
             except Exception as e:
                 logger.debug(f"No initial price yet: {e}")
 
-        # Generate synthetic history if needed
-        if len(self.price_history) < 20:
-            self._generate_synthetic_history(target_count=20, existing_count=len(self.price_history))
+        # =============================================================================
+        # CHANGED: No synthetic price history. Wait for real ticks.
+        # Synthetic data was poisoning the spike detector MA calculation.
+        # We just need 5 ticks to start (not 20), and spike detector
+        # will return no signal until it has enough data.
+        # =============================================================================
+        if len(self.price_history) < 5:
+            logger.info(f"Waiting for real price data ({len(self.price_history)}/5 ticks so far)")
 
-        # =========================================================================
-        # FIX 4: Start the timer loop (but don't rely on it for trading)
-        # =========================================================================
+        # Start the timer loop
         self.run_in_executor(self._start_timer_loop)
 
         if self.grafana_exporter:
@@ -348,29 +446,9 @@ class IntegratedBTCStrategy(Strategy):
             threading.Thread(target=self._start_grafana_sync, daemon=True).start()
 
         logger.info("=" * 80)
-        logger.info("Strategy active - will trade every 15 minutes")
+        logger.info("Strategy active — trading in early window (minutes 1-3)")
         logger.info(f"Price history: {len(self.price_history)} points")
-        if len(self.price_history) >= 20:
-            logger.info("✓ READY TO TRADE NOW!")
-        else:
-            logger.warning(f"⚠ Need more history ({len(self.price_history)}/20)")
         logger.info("=" * 80)
-
-    def _generate_synthetic_history(self, target_count: int = 20, existing_count: int = 0):
-        """Generate synthetic price history for testing"""
-        if self.price_history:
-            base_price = self.price_history[-1]
-        else:
-            base_price = Decimal("0.5")
-        needed = target_count - existing_count
-        if needed <= 0:
-            return
-        for _ in range(needed):
-            change = Decimal(str(random.uniform(-0.03, 0.03)))
-            new_price = base_price * (Decimal("1.0") + change)
-            new_price = max(Decimal("0.01"), min(Decimal("0.99"), new_price))
-            self.price_history.append(new_price)
-            base_price = new_price
 
     # ------------------------------------------------------------------
     # Load all BTC instruments at once
@@ -380,42 +458,30 @@ class IntegratedBTCStrategy(Strategy):
         """Load ALL BTC instruments from cache and sort by start time"""
         instruments = self.cache.instruments()
         logger.info(f"Loading ALL BTC instruments from {len(instruments)} total...")
-        
+
         now = datetime.now(timezone.utc)
         current_timestamp = int(now.timestamp())
-        
+
         btc_instruments = []
-        
+
         for instrument in instruments:
             try:
                 if hasattr(instrument, 'info') and instrument.info:
                     question = instrument.info.get('question', '').lower()
                     slug = instrument.info.get('market_slug', '').lower()
-                    
+
                     if ('btc' in question or 'btc' in slug) and '15m' in slug:
                         try:
                             timestamp_part = slug.split('-')[-1]
                             market_timestamp = int(timestamp_part)
-                            
-                            # The slug timestamp IS the market start time (Unix, no offset).
-                            # end_date_iso is a DATE-only string (e.g. "2026-02-20"), NOT a datetime,
-                            # so parsing it gives midnight UTC which is wrong for intraday markets.
-                            # Always derive end_timestamp from the slug: start + 900s.
+
                             real_start_ts = market_timestamp
-                            end_timestamp = market_timestamp + 900  # 15-min markets always
+                            end_timestamp = market_timestamp + 900
                             time_diff = real_start_ts - current_timestamp
-                            
-                            # Only include markets that haven't ended yet
+
                             if end_timestamp > current_timestamp:
-                                # Extract YES token ID for CLOB order book API.
-                                # Nautilus instrument ID format:
-                                #   {condition_id}-{token_id}.POLYMARKET
-                                # The CLOB /book endpoint only accepts the token_id
-                                # (the part after the dash, before .POLYMARKET).
                                 raw_id = str(instrument.id)
-                                # Strip .POLYMARKET suffix first
                                 without_suffix = raw_id.split('.')[0] if '.' in raw_id else raw_id
-                                # Then take the token_id after the condition_id dash
                                 yes_token_id = without_suffix.split('-')[-1] if '-' in without_suffix else without_suffix
 
                                 btc_instruments.append({
@@ -432,42 +498,34 @@ class IntegratedBTCStrategy(Strategy):
                             continue
             except Exception:
                 continue
-        
-        # Pair YES and NO tokens by slug.
-        # Each Polymarket market has two tokens loaded as separate Nautilus instruments.
-        # The first instrument found for a slug is stored as the primary (YES/UP).
-        # The second instrument found for the same slug is the NO/DOWN token.
+
+        # Pair YES and NO tokens by slug
         seen_slugs = {}
         deduped = []
         for inst in btc_instruments:
             slug = inst['slug']
             if slug not in seen_slugs:
-                # First token seen = YES (UP)
                 inst['yes_instrument_id'] = inst['instrument'].id
-                inst['no_instrument_id'] = None  # will be filled when second token found
+                inst['no_instrument_id'] = None
                 seen_slugs[slug] = inst
                 deduped.append(inst)
             else:
-                # Second token seen = NO (DOWN) — store it on the existing entry
                 seen_slugs[slug]['no_instrument_id'] = inst['instrument'].id
         btc_instruments = deduped
-        
-        # Sort by start time (absolute timestamp, not time-of-day)
+
         btc_instruments.sort(key=lambda x: x['market_timestamp'])
-        
+
         logger.info("=" * 80)
         logger.info(f"FOUND {len(btc_instruments)} BTC 15-MIN MARKETS:")
         for i, inst in enumerate(btc_instruments):
-            # A market is ACTIVE if it has started AND not yet ended
             is_active = inst['time_diff_minutes'] <= 0 and inst['end_timestamp'] > current_timestamp
             status = "ACTIVE" if is_active else "FUTURE" if inst['time_diff_minutes'] > 0 else "PAST"
             logger.info(f"  [{i}] {inst['slug']}: {status} (starts at {inst['start_time'].strftime('%H:%M:%S')}, ends at {inst['end_time'].strftime('%H:%M:%S')})")
         logger.info("=" * 80)
-        
+
         self.all_btc_instruments = btc_instruments
-        
+
         # Find current market and SUBSCRIBE IMMEDIATELY
-        # FIXED: A market is current if it has STARTED and not yet ENDED (use end_time, not a hardcoded 15-min window)
         for i, inst in enumerate(btc_instruments):
             is_active = inst['time_diff_minutes'] <= 0 and inst['end_timestamp'] > current_timestamp
             if is_active:
@@ -480,23 +538,22 @@ class IntegratedBTCStrategy(Strategy):
                 logger.info(f"✓ CURRENT MARKET: {inst['slug']} (index {i})")
                 logger.info(f"  Next switch at: {self.next_switch_time.strftime('%H:%M:%S')}")
                 logger.info(f"  YES token: {self._yes_token_id[:16]}…" if self._yes_token_id else "  YES token: unknown")
-                
-                # =========================================================================
-                # CRITICAL FIX: Subscribe immediately!
-                # =========================================================================
+
                 self.subscribe_quote_ticks(self.instrument_id)
-                logger.info(f"  ✓ SUBSCRIBED to current market")
+                logger.info(f"  ✓ SUBSCRIBED to current market (YES)")
+
+                # CHANGED: Subscribe to NO token too
+                if inst.get('no_instrument_id'):
+                    self.subscribe_quote_ticks(inst['no_instrument_id'])
+                    logger.info(f"  ✓ SUBSCRIBED to current market (NO)")
                 break
-        
+
         if self.current_instrument_index == -1 and btc_instruments:
-            # No currently-active market — find the NEAREST upcoming one
-            # (smallest positive time_diff_minutes = starts soonest)
             future_markets = [inst for inst in btc_instruments if inst['time_diff_minutes'] > 0]
             if future_markets:
                 nearest = min(future_markets, key=lambda x: x['time_diff_minutes'])
                 nearest_idx = btc_instruments.index(nearest)
             else:
-                # All markets are in the past — use the last one
                 nearest = btc_instruments[-1]
                 nearest_idx = len(btc_instruments) - 1
 
@@ -506,66 +563,133 @@ class IntegratedBTCStrategy(Strategy):
             self._yes_token_id = inst.get('yes_token_id')
             self._yes_instrument_id = inst.get('yes_instrument_id', inst['instrument'].id)
             self._no_instrument_id = inst.get('no_instrument_id')
-            self.next_switch_time = inst['start_time']  # switch_time = when it OPENS
+            self.next_switch_time = inst['start_time']
             logger.info(f"⚠ NO CURRENT MARKET - WAITING FOR NEAREST FUTURE: {inst['slug']}")
             logger.info(f"  Starts in {inst['time_diff_minutes']:.1f} min at {self.next_switch_time.strftime('%H:%M:%S')} UTC")
 
-            # Subscribe so we get ticks when it opens
             self.subscribe_quote_ticks(self.instrument_id)
-            logger.info(f"  ✓ SUBSCRIBED to future market")
-            # Block trading until the market actually opens (timer loop sets _market_open flag)
+            # CHANGED: Subscribe NO token for future market too
+            if inst.get('no_instrument_id'):
+                self.subscribe_quote_ticks(inst['no_instrument_id'])
+            logger.info(f"  ✓ SUBSCRIBED to future market (YES + NO)")
             self._waiting_for_market_open = True
-            
+
     def _switch_to_next_market(self):
         """Switch to the next market in the pre-loaded list"""
         if not self.all_btc_instruments:
             logger.error("No instruments loaded!")
             return False
-        
+
         next_index = self.current_instrument_index + 1
         if next_index >= len(self.all_btc_instruments):
             logger.warning("No more markets available - will restart bot")
             return False
-        
+
         next_market = self.all_btc_instruments[next_index]
         now = datetime.now(timezone.utc)
-        
-        # Check if next market is ready
+
         if now < next_market['start_time']:
             logger.info(f"Waiting for next market at {next_market['start_time'].strftime('%H:%M:%S')}")
             return False
-        
-        # Switch to next market
+
+        # =============================================================================
+        # CHANGED: Check resolution of positions from the PREVIOUS market before switching
+        # =============================================================================
+        self._resolve_positions_for_market(self.current_instrument_index)
+
         self.current_instrument_index = next_index
         self.instrument_id = next_market['instrument'].id
         self.next_switch_time = next_market['end_time']
         self._yes_token_id = next_market.get('yes_token_id')
         self._yes_instrument_id = next_market.get('yes_instrument_id', next_market['instrument'].id)
         self._no_instrument_id = next_market.get('no_instrument_id')
-        
+
         logger.info("=" * 80)
         logger.info(f"SWITCHING TO NEXT MARKET: {next_market['slug']}")
         logger.info(f"  Current time: {now.strftime('%H:%M:%S')}")
         logger.info(f"  Market ends at: {self.next_switch_time.strftime('%H:%M:%S')}")
         logger.info("=" * 80)
-        
-        # =========================================================================
-        # FIX 5: Force stability for new market and reset trade timer correctly
-        # =========================================================================
-        self._stable_tick_count = QUOTE_STABILITY_REQUIRED  # Force stable immediately
-        self._market_stable = True
-        self._waiting_for_market_open = False  # Market is now active
-        
-        # Reset trade timer so we trade at the NEXT quote we receive
-        # Use -1 so any interval will trigger (same as startup)
+
+        # CHANGED: Use actual QUOTE_STABILITY_REQUIRED constant for the gate
+        self._stable_tick_count = 0
+        self._market_stable = False
+        self._waiting_for_market_open = False
+
+        # Reset trade timer and retry counter
         self.last_trade_time = -1
-        logger.info(f"  Trade timer reset — will trade on next tick")
-        
+        self._retry_count_this_window = 0  # CHANGED: reset retry counter
+        logger.info(f"  Trade timer reset — will trade after {QUOTE_STABILITY_REQUIRED} stable ticks")
+
         self.subscribe_quote_ticks(self.instrument_id)
+        # CHANGED: subscribe to NO token
+        if next_market.get('no_instrument_id'):
+            self.subscribe_quote_ticks(next_market['no_instrument_id'])
+        logger.info(f"  ✓ SUBSCRIBED to new market (YES + NO)")
+
         return True
 
     # ------------------------------------------------------------------
-    # Timer loop - SIMPLIFIED
+    # NEW: Position resolution tracking
+    # ------------------------------------------------------------------
+
+    def _resolve_positions_for_market(self, market_index: int):
+        """
+        When a market ends, check the final price to determine P&L
+        of any positions we had in that market.
+        """
+        if market_index < 0 or market_index >= len(self.all_btc_instruments):
+            return
+
+        market = self.all_btc_instruments[market_index]
+        slug = market['slug']
+
+        for pos in self._open_positions:
+            if pos.market_slug == slug and not pos.resolved:
+                # Try to get the last known price for this instrument
+                try:
+                    quote = self.cache.quote_tick(pos.instrument_id)
+                    if quote:
+                        final_price = float((quote.bid_price.as_decimal() + quote.ask_price.as_decimal()) / 2)
+                    else:
+                        final_price = None
+                except Exception:
+                    final_price = None
+
+                if final_price is not None:
+                    if pos.direction == "long":
+                        # Bought YES: profit if final > entry
+                        pnl = pos.size_usd * (final_price - pos.entry_price) / pos.entry_price
+                    else:
+                        # Bought NO: profit if final < entry (YES price dropped)
+                        pnl = pos.size_usd * (pos.entry_price - final_price) / pos.entry_price
+
+                    pos.resolved = True
+                    pos.exit_price = final_price
+                    pos.pnl = pnl
+
+                    outcome = "WIN" if pnl > 0 else "LOSS"
+                    logger.info(f"📊 POSITION RESOLVED: {slug} {pos.direction.upper()}")
+                    logger.info(f"   Entry: ${pos.entry_price:.4f} → Exit: ${final_price:.4f}")
+                    logger.info(f"   P&L: ${pnl:+.4f} ({outcome})")
+
+                    # Record in performance tracker
+                    self.performance_tracker.record_trade(
+                        trade_id=pos.order_id,
+                        direction=pos.direction,
+                        entry_price=Decimal(str(pos.entry_price)),
+                        exit_price=Decimal(str(final_price)),
+                        size=Decimal(str(pos.size_usd)),
+                        entry_time=pos.entry_time,
+                        exit_time=datetime.now(timezone.utc),
+                        signal_score=0,
+                        signal_confidence=0,
+                        metadata={"resolved": True, "market": slug}
+                    )
+                else:
+                    logger.warning(f"Could not resolve position for {slug} — no final price")
+
+    # ------------------------------------------------------------------
+    # Timer loop
     # ------------------------------------------------------------------
 
     def _start_timer_loop(self):
@@ -578,15 +702,16 @@ class IntegratedBTCStrategy(Strategy):
             loop.close()
 
     async def _timer_loop(self):
-        """
-        Timer loop: checks every 10 seconds if it's time to switch markets.
-        Also handles the case where we're waiting for a future market to open.
-        """
+        """Timer loop: checks every 10 seconds if it's time to switch markets."""
+        # CHANGED: Initialize persistent data sources in timer loop (has its own event loop)
+        await self._init_data_sources()
+
         while True:
             # --- auto-restart check ---
             uptime_minutes = (datetime.now(timezone.utc) - self.bot_start_time).total_seconds() / 60
             if uptime_minutes >= self.restart_after_minutes:
                 logger.warning("AUTO-RESTART TIME - Loading fresh filters")
+                await self._teardown_data_sources()
                 import signal as _signal
                 os.kill(os.getpid(), _signal.SIGTERM)
                 return
@@ -595,36 +720,35 @@ class IntegratedBTCStrategy(Strategy):
 
             if self.next_switch_time and now >= self.next_switch_time:
                 if self._waiting_for_market_open:
-                    # The future market we were waiting for has now opened
-                    # Treat it like a market switch so trade timer resets
                     logger.info("=" * 80)
                     logger.info(f"⏰ WAITING MARKET NOW OPEN: {now.strftime('%H:%M:%S')} UTC")
                     logger.info("=" * 80)
-                    # Update next_switch_time to the market's END time
                     if (self.current_instrument_index >= 0 and
                             self.current_instrument_index < len(self.all_btc_instruments)):
                         current_market = self.all_btc_instruments[self.current_instrument_index]
                         self.next_switch_time = current_market['end_time']
                         logger.info(f"  Market ends at {self.next_switch_time.strftime('%H:%M:%S')} UTC")
                     self._waiting_for_market_open = False
-                    self._market_stable = True
-                    self._stable_tick_count = QUOTE_STABILITY_REQUIRED
-                    self.last_trade_time = -1  # Trade immediately on next tick
-                    logger.info("  ✓ MARKET OPEN — ready to trade on next tick")
+                    # CHANGED: Don't force stable — let real ticks prove stability
+                    self._stable_tick_count = 0
+                    self._market_stable = False
+                    self.last_trade_time = -1
+                    self._retry_count_this_window = 0
+                    logger.info("  ✓ MARKET OPEN — waiting for stable quotes before trading")
                 else:
-                    # Normal market switch
                     self._switch_to_next_market()
 
             await asyncio.sleep(10)
 
     # ------------------------------------------------------------------
-    # Quote tick handler - SIMPLIFIED
+    # Quote tick handler
     # ------------------------------------------------------------------
 
     def on_quote_tick(self, tick: QuoteTick):
-        """Handle quote tick - TRADE when market opens and at each 15-min boundary"""
+        """Handle quote tick - TRADE in early window (minutes 1-3) using signal-driven prediction"""
         try:
-            # Only process ticks from current instrument
+            # Only process ticks from current YES instrument
+            # (We also subscribe to NO, but only for risk engine pricing — we don't need to trade off NO ticks)
             if self.instrument_id is None or tick.instrument_id != self.instrument_id:
                 return
 
@@ -634,7 +758,7 @@ class IntegratedBTCStrategy(Strategy):
 
             if bid is None or ask is None:
                 return
-                
+
             try:
                 bid_decimal = bid.as_decimal()
                 ask_decimal = ask.as_decimal()
@@ -646,99 +770,76 @@ class IntegratedBTCStrategy(Strategy):
             self.price_history.append(mid_price)
             if len(self.price_history) > self.max_history:
                 self.price_history.pop(0)
-            
-            # Store latest bid/ask for liquidity check before order placement
+
             self._last_bid_ask = (bid_decimal, ask_decimal)
 
-            # Tick buffer for TickVelocityProcessor (rolling 90s window)
+            # Tick buffer for TickVelocityProcessor
             self._tick_buffer.append({'ts': now, 'price': mid_price})
 
-            # Stability gate
+            # =============================================================================
+            # CHANGED: Stability gate actually uses QUOTE_STABILITY_REQUIRED
+            # =============================================================================
             if not self._market_stable:
-                self._stable_tick_count += 1
-                if self._stable_tick_count >= 1:
-                    self._market_stable = True
-                    logger.info(f"✓ Market STABLE immediately")
+                if self._is_quote_valid(bid_decimal, ask_decimal):
+                    self._stable_tick_count += 1
+                    if self._stable_tick_count >= QUOTE_STABILITY_REQUIRED:
+                        self._market_stable = True
+                        logger.info(f"✓ Market STABLE after {QUOTE_STABILITY_REQUIRED} valid ticks")
+                    else:
+                        return  # Still waiting for stability
                 else:
+                    self._stable_tick_count = 0  # Reset on invalid tick
                     return
-
-            # =========================================================================
-            # FIXED TRADING LOGIC:
-            # 
-            # We trade once per 15-min market interval.
-            # Instead of checking wall-clock 15-min boundaries (which caused the 2-hour
-            # wait), we use a simple counter keyed to the Polymarket market's OWN
-            # start time.
-            #
-            # The market's start_time is stored in all_btc_instruments[current_index].
-            # Within each market, we compute a "sub-interval" index:
-            #   sub_interval = elapsed_seconds_since_market_open // 900
-            # Trade ID = (market_start_timestamp, sub_interval)
-            # This fires once at market open AND once after every 15 min within
-            # the same market if it's a multi-interval market.
-            #
-            # If _waiting_for_market_open is True (started before market opens),
-            # we block trading until the timer loop calls _switch_to_next_market.
-            # =========================================================================
 
             # Block trading if waiting for a future market to open
             if self._waiting_for_market_open:
                 return
 
-            # Get current market info
             if (self.current_instrument_index < 0 or
                     self.current_instrument_index >= len(self.all_btc_instruments)):
                 return
 
             current_market = self.all_btc_instruments[self.current_instrument_index]
-            market_start_ts = current_market['market_timestamp']  # Slug timestamp = market start (Unix)
+            market_start_ts = current_market['market_timestamp']
 
-            # How many 15-min intervals have elapsed since this market opened?
             elapsed_secs = now.timestamp() - market_start_ts
             if elapsed_secs < 0:
-                # Market hasn't started yet — block
                 return
 
             sub_interval = int(elapsed_secs // MARKET_INTERVAL_SECONDS)
-
-            # Unique trade key: (market_start_timestamp, sub_interval)
             trade_key = (market_start_ts, sub_interval)
 
-            # =========================================================================
-            # TRADE WINDOW: minutes 13–14 of each 15-min market (780–840 seconds in)
+            # =============================================================================
+            # CHANGED: Early trade window (configurable via .env, default minutes 1-3)
             #
-            # WHY LATE IN THE MARKET:
-            #   At 13 minutes in, the UP/DOWN result is nearly decided. The price IS
-            #   the trend — if YES is at $0.78, BTC went up during this interval.
-            #   We're not predicting anymore, we're reading a nearly-resolved outcome.
+            # WHY EARLY:
+            #   At minutes 1-3, the market price is near 0.50. Signal processors
+            #   (orderbook, Deribit PCR, tick velocity, divergence) have actual
+            #   PREDICTIVE edge here — they detect developing moves before price
+            #   confirms them. This is where alpha lives.
             #
-            # WHY NOT EARLIER (the old 30–90s window):
-            #   At 30 seconds in, nobody knows which way BTC will move. The signals
-            #   have no edge. This is why we were losing at prices near $0.50.
+            # WHY NOT LATE (minutes 13-14, the old approach):
+            #   At minute 13, price is 0.80 or 0.20 — the move already happened.
+            #   You're paying $0.77+$0.10 fee for something worth $0.77.
+            #   Zero edge, negative EV from fees.
             #
-            # TREND FILTER (applied in _make_trading_decision):
-            #   Price > 0.60 → clear UP trend → buy YES
-            #   Price < 0.40 → clear DOWN trend → buy NO
-            #   Price 0.40–0.60 → coin flip → SKIP (don't trade)
-            #
-            # Share count intuition:
-            #   1.4 shares = price $0.71 → strong trend, win rate ~71%
-            #   1.9 shares = price $0.53 → weak trend, near coin flip
-            #   2.0+ shares = price $0.50 → pure coin flip, SKIP
-            # =========================================================================
+            # SAFETY: Fusion engine requires 2+ agreeing signals (no single-signal
+            #   pass-through). Coin-flip zone (0.40-0.60) skip still applies as a
+            #   sanity check, but it rarely triggers at minutes 1-3 since prices
+            #   start near 0.50.
+            # =============================================================================
             seconds_into_sub_interval = elapsed_secs % MARKET_INTERVAL_SECONDS
-            TRADE_WINDOW_START = 780   # 13 minutes in
-            TRADE_WINDOW_END   = 840   # 14 minutes in (60s window)
 
-            if TRADE_WINDOW_START <= seconds_into_sub_interval < TRADE_WINDOW_END and trade_key != self.last_trade_time:
+            if (TRADE_WINDOW_START_SEC <= seconds_into_sub_interval < TRADE_WINDOW_END_SEC
+                    and trade_key != self.last_trade_time):
                 self.last_trade_time = trade_key
+                self._retry_count_this_window = 0  # Reset retry counter for new window
 
                 logger.info("=" * 80)
-                logger.info(f" LATE-WINDOW TRADE: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                logger.info(f"🎯 EARLY-WINDOW TRADE: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
                 logger.info(f"   Market: {current_market['slug']}")
                 logger.info(f"   Sub-interval #{sub_interval} ({seconds_into_sub_interval:.1f}s in = {seconds_into_sub_interval/60:.1f} min)")
                 logger.info(f"   Price: ${float(mid_price):,.4f} | Bid: ${float(bid_decimal):,.4f} | Ask: ${float(ask_decimal):,.4f}")
-                logger.info(f"   Trend strength: {'STRONG ✓' if float(mid_price) > 0.60 or float(mid_price) < 0.40 else 'WEAK — may skip'}")
                 logger.info(f"   Price history: {len(self.price_history)} points")
                 logger.info("=" * 80)
 
@@ -748,49 +849,42 @@ class IntegratedBTCStrategy(Strategy):
             logger.error(f"Error processing quote tick: {e}")
 
     # ------------------------------------------------------------------
-    # Trading decision (unchanged)
+    # Trading decision
     # ------------------------------------------------------------------
 
     def _make_trading_decision_sync(self, current_price):
-        from decimal import Decimal
-        price_decimal = Decimal(str(current_price))
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(self._make_trading_decision(price_decimal))
-        finally:
-            loop.close()
-    
-    def _make_trading_decision_sync(self, current_price):
         """Synchronous wrapper for trading decision (called from executor)."""
-        # Convert float back to Decimal for processing
         from decimal import Decimal
         price_decimal = Decimal(str(current_price))
-        
+
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(self._make_trading_decision(price_decimal))
         finally:
             loop.close()
-            
+
     async def _fetch_market_context(self, current_price: Decimal) -> dict:
         """
         Fetch REAL external data to populate signal processor metadata.
 
-        Returns a dict with:
-          - sentiment_score (float 0-100): live Fear & Greed index, or None
-          - spot_price (float): live BTC-USD from Coinbase, or None
-          - deviation (float): polymarket price vs SMA-20 (always computed)
-          - momentum (float): 5-period rate of change (always computed)
-          - volatility (float): price std-dev over last 20 ticks (always computed)
+        CHANGED: Uses persistent connections instead of connect/disconnect per call.
         """
         current_price_float = float(current_price)
 
-        # --- Always-available stats from local price_history ---
         recent_prices = [float(p) for p in self.price_history[-20:]]
+        if len(recent_prices) < 5:
+            # Not enough history yet — return minimal metadata
+            return {
+                "deviation": 0.0,
+                "momentum": 0.0,
+                "volatility": 0.0,
+                "tick_buffer": list(self._tick_buffer),
+                "yes_token_id": self._yes_token_id,
+            }
+
         sma_20 = sum(recent_prices) / len(recent_prices)
-        deviation = (current_price_float - sma_20) / sma_20
+        deviation = (current_price_float - sma_20) / sma_20 if sma_20 != 0 else 0.0
         momentum = (
             (current_price_float - float(self.price_history[-5])) / float(self.price_history[-5])
             if len(self.price_history) >= 5 else 0.0
@@ -802,45 +896,29 @@ class IntegratedBTCStrategy(Strategy):
             "deviation": deviation,
             "momentum": momentum,
             "volatility": volatility,
-            # Tick buffer for TickVelocityProcessor
             "tick_buffer": list(self._tick_buffer),
-            # YES token id for OrderBookImbalanceProcessor
             "yes_token_id": self._yes_token_id,
         }
 
-        # --- Real sentiment: Fear & Greed Index via NewsSocialDataSource ---
-        try:
-            from data_sources.news_social.adapter import NewsSocialDataSource
-            news_source = NewsSocialDataSource()
-            await news_source.connect()
-            fg = await news_source.get_fear_greed_index()
-            await news_source.disconnect()
-            if fg and "value" in fg:
-                metadata["sentiment_score"] = float(fg["value"])
-                metadata["sentiment_classification"] = fg.get("classification", "")
-                logger.info(
-                    f"Fear & Greed: {metadata['sentiment_score']:.0f} "
-                    f"({metadata['sentiment_classification']})"
-                )
-            else:
-                logger.warning("Fear & Greed fetch returned no data — sentiment processor skipped")
-        except Exception as e:
-            logger.warning(f"Could not fetch Fear & Greed index: {e} — sentiment processor skipped")
+        # CHANGED: Use persistent connections
+        if self._news_source:
+            try:
+                fg = await self._news_source.get_fear_greed_index()
+                if fg and "value" in fg:
+                    metadata["sentiment_score"] = float(fg["value"])
+                    metadata["sentiment_classification"] = fg.get("classification", "")
+                    logger.info(f"Fear & Greed: {metadata['sentiment_score']:.0f} ({metadata['sentiment_classification']})")
+            except Exception as e:
+                logger.warning(f"Fear & Greed fetch failed: {e}")
 
-        # --- Real spot price: Coinbase BTC-USD REST API ---
-        try:
-            from data_sources.coinbase.adapter import CoinbaseDataSource
-            coinbase = CoinbaseDataSource()
-            await coinbase.connect()
-            spot = await coinbase.get_current_price()
-            await coinbase.disconnect()
-            if spot:
-                metadata["spot_price"] = float(spot)
-                logger.info(f"Coinbase spot price: ${float(spot):,.2f}")
-            else:
-                logger.warning("Coinbase price fetch returned None — divergence processor skipped")
-        except Exception as e:
-            logger.warning(f"Could not fetch Coinbase spot price: {e} — divergence processor skipped")
+        if self._coinbase_source:
+            try:
+                spot = await self._coinbase_source.get_current_price()
+                if spot:
+                    metadata["spot_price"] = float(spot)
+                    logger.info(f"Coinbase spot price: ${float(spot):,.2f}")
+            except Exception as e:
+                logger.warning(f"Coinbase fetch failed: {e}")
 
         logger.info(
             f"Market context — deviation={deviation:.2%}, "
@@ -852,27 +930,29 @@ class IntegratedBTCStrategy(Strategy):
 
     async def _make_trading_decision(self, current_price: Decimal):
         """
-        Make trading decision using our 7-phase system.
+        Make trading decision using signal fusion.
 
-        Position size is always $1.00 — no variable sizing, no risk-engine
-        calculation needed. The risk engine is still used to check that we
-        don't already have too many open positions.
+        CHANGED FROM V1:
+        - Fusion engine DRIVES direction (no trend override)
+        - Requires min 2 signals to agree (no single-signal pass-through)
+        - Coin-flip zone skip still applies as sanity check
+        - Uses limit orders for 0% maker fee
+        - Tracks open positions for resolution
         """
-        # --- Mode check ---
         is_simulation = await self.check_simulation_mode()
         logger.info(f"Mode: {'SIMULATION' if is_simulation else 'LIVE TRADING'}")
 
-        # --- Minimum history guard ---
-        if len(self.price_history) < 20:
-            logger.warning(f"Not enough price history ({len(self.price_history)}/20)")
+        # CHANGED: Lower minimum history requirement (no synthetic data to pad it)
+        if len(self.price_history) < 5:
+            logger.warning(f"Not enough price history ({len(self.price_history)}/5) — waiting for real data")
             return
 
         logger.info(f"Current price: ${float(current_price):,.4f}")
 
-        # --- Phase 4a: Build real metadata for processors ---
+        # Phase 4a: Build real metadata for processors
         metadata = await self._fetch_market_context(current_price)
 
-        # --- Phase 4b: Run all three signal processors ---
+        # Phase 4b: Run all signal processors
         signals = self._process_signals(current_price, metadata)
 
         if not signals:
@@ -886,13 +966,22 @@ class IntegratedBTCStrategy(Strategy):
                 f"score={sig.score:.1f}, confidence={sig.confidence:.2%}"
             )
 
-        # --- Phase 4c: Fuse signals into one consensus ---
-        # min_score lowered to 40 because the TREND FILTER (price at min 11-13)
-        # is now the primary decision maker. Fusion is informational context,
-        # not the trade gate. The trend gate below is the real filter.
-        fused = self.fusion_engine.fuse_signals(signals, min_signals=1, min_score=40.0)
+        # =============================================================================
+        # CHANGED: Fusion engine drives direction. Require 2+ signals, score >= 55.
+        # This fixes the single-signal pass-through bug where consensus_score was
+        # always 100 with one signal (dominant == total_contrib).
+        # =============================================================================
+        fused = self.fusion_engine.fuse_signals(
+            signals,
+            min_signals=MIN_FUSION_SIGNALS,
+            min_score=MIN_FUSION_SCORE,
+        )
         if not fused:
-            logger.info("Fusion produced no actionable signal — no trade this interval")
+            logger.info(
+                f"Fusion produced no actionable signal "
+                f"(need {MIN_FUSION_SIGNALS}+ signals with score >= {MIN_FUSION_SCORE}) "
+                f"— no trade this interval"
+            )
             return
 
         logger.info(
@@ -900,48 +989,33 @@ class IntegratedBTCStrategy(Strategy):
             f"(score={fused.score:.1f}, confidence={fused.confidence:.2%})"
         )
 
-        # --- Phase 5: Position size is always exactly $1.00 ---
-        POSITION_SIZE_USD = Decimal("1.00")
-
-        # =========================================================================
-        # TREND FILTER — replaces signal-based direction at the late trade window
-        #
-        # At minute 13, the Polymarket price IS the market's verdict on BTC direction.
-        # We ignore what the signal processors say and simply follow the price:
-        #
-        #   price > 0.60 → market says UP with >60% confidence → buy YES
-        #   price < 0.40 → market says DOWN with >60% confidence → buy NO
-        #   price 0.40–0.60 → too close to call → SKIP (this is where we were losing)
-        #
-        # This directly addresses the observation that trades at 1.9–2.0+ shares
-        # (price near $0.50) almost always lose, while trades at 1.4 shares
-        # (price ~$0.71) mostly win.
-        # =========================================================================
-        TREND_UP_THRESHOLD   = 0.60   # price above this → buy YES (UP)
-        TREND_DOWN_THRESHOLD = 0.40   # price below this → buy NO (DOWN)
-
+        # =============================================================================
+        # CHANGED: Fusion direction drives the trade. No trend override.
+        # The coin-flip skip zone remains as a safety net only.
+        # At the early window (min 1-3), prices are usually near 0.50,
+        # so this gate is mainly relevant if we somehow trade late.
+        # =============================================================================
         price_float = float(current_price)
 
-        if price_float > TREND_UP_THRESHOLD:
-            direction = "long"
-            trend_confidence = price_float  # e.g. 0.72 = 72% confident UP
-            logger.info(
-                f" TREND: UP ({price_float:.2%} YES probability) → buying YES"
-            )
-        elif price_float < TREND_DOWN_THRESHOLD:
-            direction = "short"
-            trend_confidence = 1.0 - price_float  # e.g. 0.31 price = 69% confident DOWN
-            logger.info(
-                f" TREND: DOWN ({price_float:.2%} YES probability = {1-price_float:.2%} NO) → buying NO"
-            )
-        else:
-            logger.info(
-                f"⏭ TREND: NEUTRAL ({price_float:.2%}) — price too close to 0.50, SKIPPING trade "
-                f"(coin flip territory: {TREND_DOWN_THRESHOLD:.0%}–{TREND_UP_THRESHOLD:.0%})"
-            )
-            return
+        # Coin-flip safety: if price is deep in no-man's land AND fusion is weak, skip
+        if TREND_DOWN_THRESHOLD <= price_float <= TREND_UP_THRESHOLD:
+            if fused.confidence < 0.70:
+                logger.info(
+                    f"⏭ SKIP: price ${price_float:.4f} in neutral zone "
+                    f"({TREND_DOWN_THRESHOLD:.0%}–{TREND_UP_THRESHOLD:.0%}) "
+                    f"AND fusion confidence {fused.confidence:.0%} < 70% — coin flip territory"
+                )
+                return
 
-        # Risk engine: only check position-count / exposure limits (no sizing math)
+        # Direction from fusion engine
+        if "BULLISH" in str(fused.direction).upper():
+            direction = "long"
+            logger.info(f"📈 FUSION SAYS: BUY YES (bullish, score={fused.score:.1f})")
+        else:
+            direction = "short"
+            logger.info(f"📉 FUSION SAYS: BUY NO (bearish, score={fused.score:.1f})")
+
+        # Risk engine: check position-count / exposure limits
         is_valid, error = self.risk_engine.validate_new_position(
             size=POSITION_SIZE_USD,
             direction=direction,
@@ -951,35 +1025,31 @@ class IntegratedBTCStrategy(Strategy):
             logger.warning(f"Risk engine blocked trade: {error}")
             return
 
-        logger.info(f"Position size: $1.00 (fixed) | Direction: {direction.upper()}")
+        logger.info(f"Position size: ${POSITION_SIZE_USD} (fixed) | Direction: {direction.upper()}")
 
-        # --- Liquidity guard: don't place if market has no real depth ---
-        # The current bid/ask come from the last processed quote tick.
-        # If ask <= 0.02 or bid <= 0.02, the orderbook is essentially empty
-        # and a FAK (IOC market) order will be rejected immediately.
+        # Liquidity guard
         last_tick = getattr(self, '_last_bid_ask', None)
         if last_tick:
             last_bid, last_ask = last_tick
             MIN_LIQUIDITY = Decimal("0.02")
             if direction == "long" and last_ask <= MIN_LIQUIDITY:
-                logger.warning(
-                    f"⚠ No liquidity for BUY: ask=${float(last_ask):.4f} ≤ {float(MIN_LIQUIDITY):.2f} — skipping trade, will retry next tick"
-                )
-                self.last_trade_time = -1  # Allow retry next tick
+                logger.warning(f"⚠ No liquidity for BUY: ask=${float(last_ask):.4f} — skipping")
+                self.last_trade_time = -1
                 return
             if direction == "short" and last_bid <= MIN_LIQUIDITY:
-                logger.warning(
-                    f"⚠ No liquidity for SELL: bid=${float(last_bid):.4f} ≤ {float(MIN_LIQUIDITY):.2f} — skipping trade, will retry next tick"
-                )
-                self.last_trade_time = -1  # Allow retry next tick
+                logger.warning(f"⚠ No liquidity for SELL: bid=${float(last_bid):.4f} — skipping")
+                self.last_trade_time = -1
                 return
 
-        # --- Phase 5 / 6: Execute ---
+        # Execute
         if is_simulation:
             await self._record_paper_trade(fused, POSITION_SIZE_USD, current_price, direction)
         else:
-            await self._place_real_order(fused, POSITION_SIZE_USD, current_price, direction)
-            
+            if USE_LIMIT_ORDERS:
+                await self._place_limit_order(fused, POSITION_SIZE_USD, current_price, direction)
+            else:
+                await self._place_real_order(fused, POSITION_SIZE_USD, current_price, direction)
+
     async def _record_paper_trade(self, signal, position_size, current_price, direction):
         exit_delta = timedelta(minutes=1) if self.test_mode else timedelta(minutes=15)
         exit_time = datetime.now(timezone.utc) + exit_delta
@@ -1053,25 +1123,25 @@ class IntegratedBTCStrategy(Strategy):
             logger.error(f"Failed to save paper trades: {e}")
 
     # ------------------------------------------------------------------
-    # Real order (unchanged)
+    # NEW: Limit order placement (maker, 0% fee)
     # ------------------------------------------------------------------
 
-    async def _place_real_order(self, signal, position_size, current_price, direction):
+    async def _place_limit_order(self, signal, position_size, current_price, direction):
+        """
+        Place a LIMIT order instead of a MARKET order.
+
+        Maker orders on Polymarket have 0% fee (vs 10% taker fee).
+        We place slightly inside the spread to maximize fill probability
+        while avoiding the taker penalty.
+
+        For BUY YES: place limit at best_bid + offset (or best_ask - offset)
+        For BUY NO:  same logic on the NO token's book
+        """
         if not self.instrument_id:
             logger.error("No instrument available")
             return
 
         try:
-            # instrument is fetched below after determining YES vs NO token
-
-            logger.info("=" * 80)
-            logger.info("LIVE MODE - PLACING REAL ORDER!")
-            logger.info("=" * 80)
-
-            # On Polymarket, both UP and DOWN are BUY orders.
-            # Bullish = buy YES token (self._yes_instrument_id)
-            # Bearish = buy NO token  (self._no_instrument_id)
-            # There is NO sell — you always buy whichever side you want.
             side = OrderSide.BUY
 
             if direction == "long":
@@ -1080,10 +1150,128 @@ class IntegratedBTCStrategy(Strategy):
             else:
                 no_id = getattr(self, '_no_instrument_id', None)
                 if no_id is None:
-                    logger.warning(
-                        "NO token instrument not found for this market — "
-                        "cannot bet DOWN. Skipping trade."
-                    )
+                    logger.warning("NO token not found — cannot bet DOWN. Skipping.")
+                    return
+                trade_instrument_id = no_id
+                trade_label = "NO (DOWN)"
+
+            instrument = self.cache.instrument(trade_instrument_id)
+            if not instrument:
+                logger.error(f"Instrument not in cache: {trade_instrument_id}")
+                return
+
+            # Get current best bid/ask for the token we're buying
+            try:
+                token_quote = self.cache.quote_tick(trade_instrument_id)
+                if token_quote:
+                    token_bid = token_quote.bid_price.as_decimal()
+                    token_ask = token_quote.ask_price.as_decimal()
+                else:
+                    # Fall back to YES token price if NO has no quotes yet
+                    token_bid = current_price
+                    token_ask = current_price + Decimal("0.02")
+            except Exception:
+                token_bid = current_price
+                token_ask = current_price + Decimal("0.02")
+
+            # Place limit price just inside the spread (near the ask but not at it)
+            # This makes us a maker (0% fee) rather than taker (10% fee)
+            spread = token_ask - token_bid
+            if spread > LIMIT_ORDER_OFFSET * 2:
+                # Wide spread: place at ask - offset (aggressive maker)
+                limit_price = token_ask - LIMIT_ORDER_OFFSET
+            else:
+                # Tight spread: place at midpoint
+                limit_price = (token_bid + token_ask) / 2
+
+            # Clamp to valid range
+            limit_price = max(Decimal("0.01"), min(Decimal("0.99"), limit_price))
+
+            # Calculate token quantity from USD amount and limit price
+            token_qty = float(position_size / limit_price)
+            precision = instrument.size_precision
+            token_qty = round(token_qty, precision)
+            token_qty = max(token_qty, 5.0)  # Polymarket minimum for limit orders
+
+            logger.info("=" * 80)
+            logger.info(f"LIMIT ORDER (MAKER, 0% FEE)")
+            logger.info(f"  Buying {trade_label}: {token_qty:.2f} tokens @ ${float(limit_price):.4f}")
+            logger.info(f"  Book: bid=${float(token_bid):.4f} / ask=${float(token_ask):.4f}")
+            logger.info(f"  Spread: ${float(spread):.4f}")
+            logger.info("=" * 80)
+
+            qty = Quantity(token_qty, precision=precision)
+            price = Price(float(limit_price), precision=instrument.price_precision)
+            timestamp_ms = int(time.time() * 1000)
+            unique_id = f"BTC-15MIN-LMT-{timestamp_ms}"
+
+            # CHANGED: Use limit order instead of market
+            order = self.order_factory.limit(
+                instrument_id=trade_instrument_id,
+                order_side=side,
+                quantity=qty,
+                price=price,
+                client_order_id=ClientOrderId(unique_id),
+                time_in_force=TimeInForce.GTC,  # Good till cancelled (or market end)
+                post_only=True,  # Ensure maker-only (rejected if would cross spread)
+            )
+
+            self.submit_order(order)
+
+            logger.info(f"LIMIT ORDER SUBMITTED!")
+            logger.info(f"  Order ID: {unique_id}")
+            logger.info(f"  Direction: {trade_label}")
+            logger.info(f"  Limit Price: ${float(limit_price):.4f}")
+            logger.info(f"  Quantity: {token_qty:.2f}")
+            logger.info(f"  Estimated Cost: ~${float(position_size):.2f}")
+            logger.info(f"  Fee: 0% (maker)")
+            logger.info("=" * 80)
+
+            # Track position
+            current_market = self.all_btc_instruments[self.current_instrument_index]
+            self._open_positions.append(OpenPosition(
+                market_slug=current_market['slug'],
+                direction=direction,
+                entry_price=float(limit_price),
+                size_usd=float(position_size),
+                entry_time=datetime.now(timezone.utc),
+                market_end_time=current_market['end_time'],
+                instrument_id=trade_instrument_id,
+                order_id=unique_id,
+            ))
+
+            self._track_order_event("placed")
+
+        except Exception as e:
+            logger.error(f"Error placing limit order: {e}")
+            import traceback
+            traceback.print_exc()
+            self._track_order_event("rejected")
+
+    # ------------------------------------------------------------------
+    # Market order (kept as fallback, USE_LIMIT_ORDERS=false)
+    # ------------------------------------------------------------------
+
+    async def _place_real_order(self, signal, position_size, current_price, direction):
+        if not self.instrument_id:
+            logger.error("No instrument available")
+            return
+
+        try:
+            logger.info("=" * 80)
+            logger.info("LIVE MODE - PLACING MARKET ORDER (10% TAKER FEE!)")
+            logger.info("⚠️  Consider setting USE_LIMIT_ORDERS=true for 0% maker fee")
+            logger.info("=" * 80)
+
+            side = OrderSide.BUY
+
+            if direction == "long":
+                trade_instrument_id = getattr(self, '_yes_instrument_id', self.instrument_id)
+                trade_label = "YES (UP)"
+            else:
+                no_id = getattr(self, '_no_instrument_id', None)
+                if no_id is None:
+                    logger.warning("NO token not found — cannot bet DOWN. Skipping.")
                     return
                 trade_instrument_id = no_id
                 trade_label = "NO (DOWN)"
@@ -1099,9 +1287,6 @@ class IntegratedBTCStrategy(Strategy):
             max_usd_amount = float(position_size)
 
             precision = instrument.size_precision
-
-            # Always BUY — the market-order patch converts this to a USD amount.
-            # Pass dummy qty=5 (minimum) so Nautilus risk engine doesn't deny it.
             min_qty_val = float(getattr(instrument, 'min_quantity', None) or 5.0)
             token_qty = max(min_qty_val, 5.0)
             token_qty = round(token_qty, precision)
@@ -1112,7 +1297,7 @@ class IntegratedBTCStrategy(Strategy):
 
             qty = Quantity(token_qty, precision=precision)
             timestamp_ms = int(time.time() * 1000)
-            unique_id = f"BTC-15MIN-${max_usd_amount:.0f}-{timestamp_ms}"
+            unique_id = f"BTC-15MIN-MKT-{timestamp_ms}"
 
             order = self.order_factory.market(
                 instrument_id=trade_instrument_id,
@@ -1125,19 +1310,30 @@ class IntegratedBTCStrategy(Strategy):
 
             self.submit_order(order)
 
-            logger.info(f"REAL ORDER SUBMITTED!")
+            logger.info(f"MARKET ORDER SUBMITTED!")
             logger.info(f"  Order ID: {unique_id}")
             logger.info(f"  Direction: {trade_label}")
-            logger.info(f"  Side: BUY")
-            logger.info(f"  Token Quantity: {token_qty:.6f}")
             logger.info(f"  Estimated Cost: ~${max_usd_amount:.2f}")
-            logger.info(f"  Price: ${trade_price:.4f}")
+            logger.info(f"  Fee: ~10% (taker)")
             logger.info("=" * 80)
+
+            # Track position
+            current_market = self.all_btc_instruments[self.current_instrument_index]
+            self._open_positions.append(OpenPosition(
+                market_slug=current_market['slug'],
+                direction=direction,
+                entry_price=trade_price,
+                size_usd=max_usd_amount,
+                entry_time=datetime.now(timezone.utc),
+                market_end_time=current_market['end_time'],
+                instrument_id=trade_instrument_id,
+                order_id=unique_id,
+            ))
 
             self._track_order_event("placed")
 
         except Exception as e:
-            logger.error(f"Error placing real order: {e}")
+            logger.error(f"Error placing market order: {e}")
             import traceback
             traceback.print_exc()
             self._track_order_event("rejected")
@@ -1184,7 +1380,6 @@ class IntegratedBTCStrategy(Strategy):
             if divergence_signal:
                 signals.append(divergence_signal)
 
-        # --- Order Book Imbalance (real-time Polymarket CLOB depth) ---
         if processed_metadata.get('yes_token_id'):
             ob_signal = self.orderbook_processor.process(
                 current_price=current_price,
@@ -1194,7 +1389,6 @@ class IntegratedBTCStrategy(Strategy):
             if ob_signal:
                 signals.append(ob_signal)
 
-        # --- Tick Velocity (last 60s of Polymarket probability movement) ---
         if processed_metadata.get('tick_buffer'):
             tv_signal = self.tick_velocity_processor.process(
                 current_price=current_price,
@@ -1204,7 +1398,6 @@ class IntegratedBTCStrategy(Strategy):
             if tv_signal:
                 signals.append(tv_signal)
 
-        # --- Deribit Put/Call Ratio (institutional options sentiment) ---
         pcr_signal = self.deribit_pcr_processor.process(
             current_price=current_price,
             historical_prices=self.price_history,
@@ -1220,16 +1413,8 @@ class IntegratedBTCStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def _track_order_event(self, event_type: str) -> None:
-        """
-        Safely track an order event on the performance tracker.
-
-        PerformanceTracker does not expose `increment_order_counter`, so we
-        use whichever method is actually available, or fall back to a no-op.
-        Supported event_type values: "placed", "filled", "rejected".
-        """
         try:
             pt = self.performance_tracker
-            # Try the method that actually exists first
             if hasattr(pt, 'record_order_event'):
                 pt.record_order_event(event_type)
             elif hasattr(pt, 'increment_counter'):
@@ -1237,11 +1422,7 @@ class IntegratedBTCStrategy(Strategy):
             elif hasattr(pt, 'increment_order_counter'):
                 pt.increment_order_counter(event_type)
             else:
-                # No suitable method found – log and carry on
-                logger.debug(
-                    f"PerformanceTracker has no order-counter method; "
-                    f"ignoring event '{event_type}'"
-                )
+                logger.debug(f"PerformanceTracker has no order-counter method; ignoring event '{event_type}'")
         except Exception as e:
             logger.warning(f"Failed to track order event '{event_type}': {e}")
 
@@ -1254,6 +1435,14 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("=" * 80)
         self._track_order_event("filled")
 
+        # Update position entry price with actual fill
+        order_id = str(event.client_order_id)
+        for pos in self._open_positions:
+            if pos.order_id == order_id:
+                pos.entry_price = float(event.last_px)
+                logger.info(f"  ✓ Position entry updated to actual fill: ${pos.entry_price:.4f}")
+                break
+
     def on_order_denied(self, event):
         logger.error("=" * 80)
         logger.error(f"ORDER DENIED!")
@@ -1263,15 +1452,26 @@ class IntegratedBTCStrategy(Strategy):
         self._track_order_event("rejected")
 
     def on_order_rejected(self, event):
-        """Handle order rejection — reset trade timer so we can retry next tick."""
+        """
+        Handle order rejection.
+        CHANGED: Rate-limit retries to prevent FAK storms.
+        """
         reason = str(getattr(event, 'reason', ''))
         reason_lower = reason.lower()
         if 'no orders found' in reason_lower or 'fak' in reason_lower or 'no match' in reason_lower:
-            logger.warning(
-                f"⚠ FAK rejected (no liquidity) — resetting timer to retry next tick\n"
-                f"  Reason: {reason}"
-            )
-            self.last_trade_time = -1  # Allow retry on next quote tick
+            self._retry_count_this_window += 1
+            if self._retry_count_this_window <= MAX_RETRIES_PER_WINDOW:
+                logger.warning(
+                    f"⚠ FAK rejected (no liquidity) — retry {self._retry_count_this_window}/{MAX_RETRIES_PER_WINDOW}\n"
+                    f"  Reason: {reason}"
+                )
+                self.last_trade_time = -1  # Allow retry
+            else:
+                logger.warning(
+                    f"⚠ FAK rejected — max retries ({MAX_RETRIES_PER_WINDOW}) reached, giving up this window\n"
+                    f"  Reason: {reason}"
+                )
+                # Do NOT reset last_trade_time — skip this window
         else:
             logger.warning(f"Order rejected: {reason}")
 
@@ -1290,8 +1490,14 @@ class IntegratedBTCStrategy(Strategy):
             logger.error(f"Failed to start Grafana: {e}")
 
     def on_stop(self):
-        logger.info("Integrated BTC strategy stopped")
+        logger.info("Integrated BTC strategy V2 stopped")
         logger.info(f"Total paper trades recorded: {len(self.paper_trades)}")
+
+        # Resolve any remaining open positions
+        for pos in self._open_positions:
+            if not pos.resolved:
+                logger.info(f"Unresolved position: {pos.market_slug} {pos.direction} @ ${pos.entry_price:.4f}")
+
         if self.grafana_exporter:
             import asyncio
             try:
@@ -1305,20 +1511,17 @@ class IntegratedBTCStrategy(Strategy):
 # ---------------------------------------------------------------------------
 
 def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, test_mode: bool = False):
-    """Run the integrated BTC 15-min trading bot - LOADS ALL BTC MARKETS FOR THE DAY"""
-    
+    """Run the integrated BTC 15-min trading bot V2"""
+
     print("=" * 80)
-    print("INTEGRATED POLYMARKET BTC 15-MIN TRADING BOT")
-    print("Nautilus + 7-Phase System + Redis Control")
+    print("INTEGRATED POLYMARKET BTC 15-MIN TRADING BOT V2")
+    print("EARLY WINDOW + MAKER ORDERS + SIGNAL-DRIVEN")
     print("=" * 80)
 
     redis_client = init_redis()
 
     if redis_client:
         try:
-            # ALWAYS overwrite Redis with the current session mode.
-            # This prevents a stale value from a previous --live run
-            # silently overriding --test-mode or --simulation runs.
             mode_value = '1' if simulation else '0'
             redis_client.set('btc_trading:simulation_mode', mode_value)
             mode_label = 'SIMULATION' if simulation else 'LIVE'
@@ -1330,14 +1533,13 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
     print(f"  Initial Mode: {'SIMULATION' if simulation else 'LIVE TRADING'}")
     print(f"  Redis Control: {'Enabled' if redis_client else 'Disabled'}")
     print(f"  Grafana: {'Enabled' if enable_grafana else 'Disabled'}")
-    print(f"  Max Trade Size: ${os.getenv('MARKET_BUY_USD', '1.00')}")
-    print(f"  Quote stability gate: {QUOTE_STABILITY_REQUIRED} valid ticks")
+    print(f"  Trade Size: ${POSITION_SIZE_USD}")
+    print(f"  Order Type: {'LIMIT (maker, 0% fee)' if USE_LIMIT_ORDERS else 'MARKET (taker, 10% fee)'}")
+    print(f"  Trade Window: {TRADE_WINDOW_START_SEC}s–{TRADE_WINDOW_END_SEC}s ({TRADE_WINDOW_START_SEC/60:.0f}–{TRADE_WINDOW_END_SEC/60:.0f} min)")
+    print(f"  Fusion: min {MIN_FUSION_SIGNALS} signals, score >= {MIN_FUSION_SCORE}")
+    print(f"  Stability gate: {QUOTE_STABILITY_REQUIRED} valid ticks")
     print()
 
-    # =========================================================================
-    # Use event_slug_builder to load ONLY BTC 15-min markets via slug_builders.
-    # This avoids load_all=True which would fetch all 151k+ instruments.
-    # =========================================================================
     logger.info("=" * 80)
     logger.info("LOADING BTC 15-MIN MARKETS VIA EVENT SLUG BUILDER")
     logger.info("=" * 80)
@@ -1368,12 +1570,17 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         environment="live",
         trader_id="BTC-15MIN-INTEGRATED-001",
         logging=LoggingConfig(
-            log_level="INFO",
+            log_level="ERROR",
             log_directory="./logs/nautilus",
+            log_component_levels={
+                "IntegratedBTCStrategy": "INFO",
+            },
         ),
         data_engine=LiveDataEngineConfig(qsize=6000),
         exec_engine=LiveExecEngineConfig(qsize=6000),
-        risk_engine=LiveRiskEngineConfig(bypass=simulation),
+        # CHANGED: Don't bypass risk engine even in simulation
+        # (we want to validate order sizing regardless of mode)
+        risk_engine=LiveRiskEngineConfig(bypass=False),
         data_clients={POLYMARKET: poly_data_cfg},
         exec_clients={POLYMARKET: poly_exec_cfg},
     )
@@ -1394,7 +1601,7 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
 
     print()
     print("=" * 80)
-    print("BOT STARTING")
+    print("BOT V2 STARTING")
     print("=" * 80)
 
     try:
@@ -1408,7 +1615,7 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="Integrated BTC 15-Min Trading Bot")
+    parser = argparse.ArgumentParser(description="Integrated BTC 15-Min Trading Bot V2")
     parser.add_argument("--live", action="store_true",
                         help="Run in LIVE mode (real money at risk!). Default is simulation.")
     parser.add_argument("--no-grafana", action="store_true", help="Disable Grafana metrics")
@@ -1419,7 +1626,6 @@ def main():
     enable_grafana = not args.no_grafana
     test_mode = args.test_mode
 
-    # --test-mode ALWAYS forces simulation even if --live is also passed
     if args.test_mode:
         simulation = True
     else:
@@ -1428,6 +1634,7 @@ def main():
     if not simulation:
         logger.warning("=" * 80)
         logger.warning("LIVE TRADING MODE — REAL MONEY AT RISK!")
+        logger.warning(f"Order type: {'LIMIT (0% fee)' if USE_LIMIT_ORDERS else 'MARKET (10% fee)'}")
         logger.warning("=" * 80)
     else:
         logger.info("=" * 80)

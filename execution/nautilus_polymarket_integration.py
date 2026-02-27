@@ -203,7 +203,7 @@ class PolymarketBTCIntegration:
             environment="live",
             trader_id="BTC-15MIN-BOT-001",
             logging=LoggingConfig(
-                log_level="INFO",
+                log_level="ERROR",
                 log_directory="./logs/nautilus",
             ),
             data_engine=LiveDataEngineConfig(qsize=6000),
