@@ -34,6 +34,8 @@ class PolymarketClient:
         api_passphrase: Optional[str] = None,
         chain_id: int = 137,  # Polygon mainnet
         testnet: bool = False,
+        signature_type: Optional[int] = None,
+        funder: Optional[str] = None,
     ):
         """
         Initialize Polymarket client.
@@ -45,16 +47,20 @@ class PolymarketClient:
             api_passphrase: Polymarket API passphrase
             chain_id: 137 for Polygon mainnet, 80002 for Amoy testnet
             testnet: Use testnet mode
+            signature_type: Wallet signature type (0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE)
+            funder: Proxy wallet address for signature types 1/2
         """
         # Load from environment if not provided
         self.private_key = private_key or os.getenv("POLYMARKET_PK")
         self.api_key = api_key or os.getenv("POLYMARKET_API_KEY")
         self.api_secret = api_secret or os.getenv("POLYMARKET_API_SECRET")
         self.api_passphrase = api_passphrase or os.getenv("POLYMARKET_PASSPHRASE")
-        
+
         self.chain_id = chain_id
         self.testnet = testnet
-        
+        self.signature_type = signature_type if signature_type is not None else int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "2"))
+        self.funder = funder or os.getenv("POLYMARKET_FUNDER")
+
         # Client instance
         self.client: Optional[ClobClient] = None
         self._connected = False
@@ -97,8 +103,8 @@ class PolymarketClient:
                 host="https://clob.polymarket.com" if not self.testnet else "https://clob-testnet.polymarket.com",
                 key=self.private_key,
                 chain_id=self.chain_id,
-                signature_type=1,  # EOA signature
-                funder=os.getenv("POLYMARKET_FUNDER"),  # Optional funder address
+                signature_type=self.signature_type,
+                funder=self.funder,
             )
             
             # Set API credentials for authenticated endpoints

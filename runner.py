@@ -61,6 +61,13 @@ def init_redis():
         return None
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, test_mode: bool = False):
     """Run the integrated BTC 15-min trading bot — LOADS ALL BTC MARKETS FOR THE DAY"""
     # Lazy import to avoid circular dependency at module load
@@ -123,12 +130,16 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         use_gamma_markets=True,
     )
 
+    signature_type = _env_int("POLYMARKET_SIGNATURE_TYPE", 2)
+    funder = os.getenv("POLYMARKET_FUNDER")
+
     poly_data_cfg = PolymarketDataClientConfig(
         private_key=os.getenv("POLYMARKET_PK"),
         api_key=os.getenv("POLYMARKET_API_KEY"),
         api_secret=os.getenv("POLYMARKET_API_SECRET"),
         passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
-        signature_type=1,
+        signature_type=signature_type,
+        funder=funder,
         instrument_provider=instrument_cfg,
     )
 
@@ -137,7 +148,8 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         api_key=os.getenv("POLYMARKET_API_KEY"),
         api_secret=os.getenv("POLYMARKET_API_SECRET"),
         passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
-        signature_type=1,
+        signature_type=signature_type,
+        funder=funder,
         instrument_provider=instrument_cfg,
     )
 
