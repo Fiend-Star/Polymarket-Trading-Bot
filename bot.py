@@ -1174,15 +1174,13 @@ class IntegratedBTCStrategy(Strategy):
                 token_bid = current_price
                 token_ask = current_price + Decimal("0.02")
 
-            # Place limit price just inside the spread (near the ask but not at it)
-            # This makes us a maker (0% fee) rather than taker (10% fee)
+            # CHANGED: Place at best bid to GUARANTEE maker status.
+            # Placing inside the spread (bid < price < ask) still gets matched
+            # as taker because Nautilus adapter ignores post_only.
+            # At the bid, our order can only rest in the book = true maker (0% fee).
+            # Tradeoff: lower fill rate, but when it fills, zero fees.
             spread = token_ask - token_bid
-            if spread > LIMIT_ORDER_OFFSET * 2:
-                # Wide spread: place at ask - offset (aggressive maker)
-                limit_price = token_ask - LIMIT_ORDER_OFFSET
-            else:
-                # Tight spread: place at midpoint
-                limit_price = (token_bid + token_ask) / 2
+            limit_price = token_bid  # Join the best bid queue
 
             # Clamp to valid range
             limit_price = max(Decimal("0.01"), min(Decimal("0.99"), limit_price))
@@ -1212,8 +1210,9 @@ class IntegratedBTCStrategy(Strategy):
                 quantity=qty,
                 price=price,
                 client_order_id=ClientOrderId(unique_id),
-                time_in_force=TimeInForce.GTC,  # Good till cancelled (or market end)
-                post_only=True,  # Ensure maker-only (rejected if would cross spread)
+                time_in_force=TimeInForce.GTC,  # Rests in book until filled or market ends
+                # CHANGED: Removed post_only=True — adapter ignores it and fills as taker.
+                # Instead we guarantee maker by pricing at the bid (see above).
             )
 
             self.submit_order(order)
