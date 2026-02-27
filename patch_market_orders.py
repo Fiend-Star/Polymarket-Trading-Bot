@@ -46,9 +46,8 @@ async def _patched_submit_market_order(self, command, instrument):
     order = command.order
 
     if order.side == OrderSide.BUY:
-        usd_amount = float(os.getenv("MARKET_BUY_USD", str(_DEFAULT_USD_AMOUNT)))
-        self._log.info(f"[PATCH] BUY market → ${usd_amount:.2f} USD (qty {float(order.quantity):.6f} ignored)", LogColor.MAGENTA)
-        amount = usd_amount
+        self._log.info(f"[PATCH] BUY market → ${_DEFAULT_USD_AMOUNT:.2f} USD (qty {float(order.quantity):.6f} ignored)", LogColor.MAGENTA)
+        amount = _DEFAULT_USD_AMOUNT
     else:
         if order.is_quote_quantity:
             self._deny_market_order_quantity(
