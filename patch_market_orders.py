@@ -14,6 +14,7 @@ import os
 logger = logging.getLogger(__name__)
 
 _patch_applied = False
+_DEFAULT_USD_AMOUNT = float(os.getenv("MARKET_BUY_USD", "1.0"))
 
 
 async def _sign_and_submit_market_order(self, order, amount, instrument, modules):
@@ -45,7 +46,7 @@ async def _patched_submit_market_order(self, command, instrument):
     order = command.order
 
     if order.side == OrderSide.BUY:
-        usd_amount = float(os.getenv("MARKET_BUY_USD", "1.0"))
+        usd_amount = float(os.getenv("MARKET_BUY_USD", str(_DEFAULT_USD_AMOUNT)))
         self._log.info(f"[PATCH] BUY market → ${usd_amount:.2f} USD (qty {float(order.quantity):.6f} ignored)", LogColor.MAGENTA)
         amount = usd_amount
     else:
@@ -70,8 +71,7 @@ def apply_market_order_patch():
         logger.info("Market order patch already applied"); return True
     try:
         from nautilus_trader.adapters.polymarket.execution import PolymarketExecutionClient
-        usd = float(os.getenv("MARKET_BUY_USD", "1.0"))
-        logger.info(f"Market BUY USD amount: ${usd:.2f}")
+        logger.info(f"Market BUY USD amount: ${_DEFAULT_USD_AMOUNT:.2f}")
         PolymarketExecutionClient._submit_market_order = _patched_submit_market_order
         _patch_applied = True
         logger.info("Market order patch applied — BUY orders use $MARKET_BUY_USD")
@@ -82,4 +82,3 @@ def apply_market_order_patch():
         logger.error(f"Failed to apply market order patch: {e}")
         import traceback; traceback.print_exc()
         return False
-
