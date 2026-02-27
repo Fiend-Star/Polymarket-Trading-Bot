@@ -16,8 +16,8 @@ from nautilus_trader.adapters.polymarket.factories import (
     PolymarketLiveDataClientFactory,
     PolymarketLiveExecClientFactory,
 )
+from nautilus_trader.adapters.polymarket.providers import PolymarketInstrumentProviderConfig
 from nautilus_trader.config import (
-    InstrumentProviderConfig,
     LiveDataEngineConfig,
     LiveExecEngineConfig,
     LiveRiskEngineConfig,
@@ -176,9 +176,8 @@ class PolymarketBTCIntegration:
         btc_markets = get_next_btc_15m_markets(count=2)  # Current + next market
         
         # Instrument provider config - use Gamma Markets API for faster filtering
-        instrument_cfg = InstrumentProviderConfig(
+        instrument_cfg = PolymarketInstrumentProviderConfig(
             load_all=False,  # Only load specific markets
-            use_gamma_markets=True,  # CRITICAL: Use Gamma API for slug filtering
             filters={
                 "active": True,
                 "closed": False,
@@ -195,7 +194,7 @@ class PolymarketBTCIntegration:
             api_key=os.getenv("POLYMARKET_API_KEY"),
             api_secret=os.getenv("POLYMARKET_API_SECRET"),
             passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
-            instrument_provider=instrument_cfg,
+            instrument_config=instrument_cfg,
         )
         
         # Polymarket execution client config
@@ -204,7 +203,7 @@ class PolymarketBTCIntegration:
             api_key=os.getenv("POLYMARKET_API_KEY"),
             api_secret=os.getenv("POLYMARKET_API_SECRET"),
             passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
-            instrument_provider=instrument_cfg,
+            instrument_config=instrument_cfg,
         )
         
         # Trading node config

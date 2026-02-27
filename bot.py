@@ -30,7 +30,6 @@ except ImportError as e:
 
 # Now import Nautilus
 from nautilus_trader.config import (
-    InstrumentProviderConfig,
     LiveDataEngineConfig,
     LiveExecEngineConfig,
     LiveRiskEngineConfig,
@@ -43,6 +42,7 @@ from nautilus_trader.adapters.polymarket import (
     PolymarketDataClientConfig,
     PolymarketExecClientConfig,
 )
+from nautilus_trader.adapters.polymarket.providers import PolymarketInstrumentProviderConfig
 from nautilus_trader.adapters.polymarket.factories import (
     PolymarketLiveDataClientFactory,
     PolymarketLiveExecClientFactory,
@@ -1362,10 +1362,9 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
     logger.info(f"  First: {btc_slugs[0]}  Last: {btc_slugs[-1]}")
     logger.info("=" * 80)
 
-    instrument_cfg = InstrumentProviderConfig(
+    instrument_cfg = PolymarketInstrumentProviderConfig(
         load_all=True,
         filters=filters,
-        use_gamma_markets=True,
     )
 
     poly_data_cfg = PolymarketDataClientConfig(
@@ -1374,7 +1373,7 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         api_secret=os.getenv("POLYMARKET_API_SECRET"),
         passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
         signature_type=1,
-        instrument_provider=instrument_cfg,
+        instrument_config=instrument_cfg,
     )
 
     poly_exec_cfg = PolymarketExecClientConfig(
@@ -1383,7 +1382,7 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         api_secret=os.getenv("POLYMARKET_API_SECRET"),
         passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
         signature_type=1,
-        instrument_provider=instrument_cfg,
+        instrument_config=instrument_cfg,
     )
 
     config = TradingNodeConfig(
