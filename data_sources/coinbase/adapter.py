@@ -40,7 +40,8 @@ class CoinbaseDataSource:
         # Cache
         self._last_price: Optional[Decimal] = None
         self._last_update: Optional[datetime] = None
-        
+        self._last_logged_price: Optional[Decimal] = None
+
         logger.info(f"Initialized Coinbase data source for {product_id}")
     
     async def connect(self) -> bool:
@@ -94,7 +95,9 @@ class CoinbaseDataSource:
             self._last_price = price
             self._last_update = datetime.now()
             
-            logger.debug(f"Coinbase BTC price: ${price:,.2f}")
+            if price != self._last_logged_price:
+                logger.debug(f"Coinbase BTC price: ${price:,.2f}")
+                self._last_logged_price = price
             return price
             
         except Exception as e:

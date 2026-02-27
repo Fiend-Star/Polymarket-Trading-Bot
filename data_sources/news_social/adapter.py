@@ -31,7 +31,8 @@ class NewsSocialDataSource:
         # Cache
         self._last_sentiment: Optional[Dict[str, Any]] = None
         self._last_news: List[Dict[str, Any]] = []
-        
+        self._last_logged_fg_value: Optional[int] = None
+
         logger.info("Initialized News/Social data source")
     
     async def connect(self) -> bool:
@@ -87,7 +88,9 @@ class NewsSocialDataSource:
             
             self._last_sentiment = sentiment
             
-            logger.debug(f"Fear & Greed Index: {sentiment['value']} ({sentiment['classification']})")
+            if sentiment['value'] != self._last_logged_fg_value:
+                logger.debug(f"Fear & Greed Index: {sentiment['value']} ({sentiment['classification']})")
+                self._last_logged_fg_value = sentiment['value']
             return sentiment
             
         except Exception as e:
