@@ -53,7 +53,7 @@ class CoinbaseDataSource:
         try:
             self.session = httpx.AsyncClient(
                 base_url=self.base_url,
-                timeout=30.0,
+                timeout=httpx.Timeout(5.0, connect=3.0),
                 headers={
                     "User-Agent": "PolymarketBot/1.0",
                     "Accept": "application/json",

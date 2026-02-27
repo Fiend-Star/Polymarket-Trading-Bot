@@ -2,6 +2,7 @@
 News and Social Media Data Source
 Aggregates sentiment and news related to BTC
 """
+import os
 import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
@@ -23,16 +24,22 @@ class NewsSocialDataSource:
     def __init__(self):
         """Initialize news/social data source."""
         self.session: Optional[httpx.AsyncClient] = None
-        
-        # API endpoints (free tier alternatives)
+
+        # API endpoints
         self.news_api_url = "https://cryptopanic.com/api/v1/posts/"
         self.sentiment_api_url = "https://api.alternative.me/fng/"  # Fear & Greed
-        
+
+        # CryptoPanic key from env (set CRYPTOPANIC_API_KEY in .env)
+        self._cryptopanic_key = os.getenv("CRYPTOPANIC_API_KEY", "")
+
         # Cache
         self._last_sentiment: Optional[Dict[str, Any]] = None
         self._last_news: List[Dict[str, Any]] = []
-        
-        logger.info("Initialized News/Social data source")
+        self._sentiment_cache: Optional[float] = None
+        self._sentiment_cache_time: Optional[datetime] = None
+        self._sentiment_cache_ttl = 900  # 15 minutes — matches arb interval
+
+        logger.info(f"Initialized News/Social data source (CryptoPanic key: {'set' if self._cryptopanic_key else 'NOT SET'})")
     
     async def connect(self) -> bool:
         """
@@ -114,14 +121,16 @@ class NewsSocialDataSource:
             List of news articles
         """
         try:
-            # Note: CryptoPanic free tier requires API key
-            # This is a placeholder - you'll need to sign up at cryptopanic.com
             params = {
-                "auth_token": "YOUR_CRYPTOPANIC_API_KEY",  # Get from cryptopanic.com
+                "auth_token": self._cryptopanic_key,
                 "filter": filter_,
                 "currencies": currencies,
                 "public": "true",
             }
+
+            if not self._cryptopanic_key:
+                logger.debug("CRYPTOPANIC_API_KEY not set — skipping news fetch")
+                return self._last_news
             
             response = await self.session.get(self.news_api_url, params=params)
             
@@ -153,40 +162,44 @@ class NewsSocialDataSource:
     
     async def get_sentiment_score(self) -> Optional[float]:
         """
-        Calculate aggregate sentiment score (0-100).
-        
-        Combines Fear & Greed Index with news sentiment.
-        
-        Returns:
-            Sentiment score (0=extreme fear, 100=extreme greed)
+        Aggregate sentiment score (0-100).
+
+        Combines Fear & Greed Index (70%) with CryptoPanic news sentiment (30%).
+        Cached for 15 minutes to match the arb interval.
         """
+        # Check cache
+        now = datetime.now()
+        if (self._sentiment_cache is not None and
+                self._sentiment_cache_time is not None and
+                (now - self._sentiment_cache_time).total_seconds() < self._sentiment_cache_ttl):
+            return self._sentiment_cache
+
         try:
-            # Get Fear & Greed Index
             fg_data = await self.get_fear_greed_index()
             if not fg_data:
-                return None
-            
+                return self._sentiment_cache  # return stale cache if available
+
             fg_score = fg_data["value"]
-            
-            # Try to get news sentiment
-            news = await self.get_crypto_news(limit=10)
-            
+
+            # Try CryptoPanic news if key is configured
+            news = await self.get_crypto_news(limit=10) if self._cryptopanic_key else []
+
             if news:
-                # Calculate news sentiment
                 positive_count = sum(1 for n in news if n.get("sentiment") == "positive")
                 news_score = (positive_count / len(news)) * 100
-                
-                # Weighted average (70% Fear & Greed, 30% News)
                 total_score = (fg_score * 0.7) + (news_score * 0.3)
             else:
-                total_score = fg_score
-            
-            logger.info(f"Aggregate sentiment score: {total_score:.1f}")
+                total_score = float(fg_score)
+
+            self._sentiment_cache = total_score
+            self._sentiment_cache_time = now
+
+            logger.info(f"Sentiment score: {total_score:.1f} (cached for {self._sentiment_cache_ttl}s)")
             return total_score
-            
+
         except Exception as e:
             logger.error(f"Error calculating sentiment score: {e}")
-            return None
+            return self._sentiment_cache
     
     async def get_trending_topics(self) -> List[str]:
         """
