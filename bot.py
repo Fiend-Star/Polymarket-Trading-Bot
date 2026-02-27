@@ -6,9 +6,8 @@ from datetime import datetime, timezone, timedelta
 import math
 from decimal import Decimal
 import time
-from dataclasses import dataclass
-from typing import List, Optional, Dict
 import random
+from typing import List, Optional, Dict
 
 # Add project to path
 project_root = Path(__file__).parent
@@ -55,7 +54,6 @@ from nautilus_trader.model.data import QuoteTick
 
 from dotenv import load_dotenv
 from loguru import logger
-import redis
 
 # Import our phases
 from core.strategy_brain.signal_processors.spike_detector import SpikeDetectionProcessor
@@ -79,54 +77,17 @@ else:
 
 
 # =============================================================================
-# CONSTANTS
+# CONFIG — all tuning constants from config.py (overridable via .env)
 # =============================================================================
-QUOTE_STABILITY_REQUIRED = 3      # Need only 3 valid ticks to be stable (faster startup)
-QUOTE_MIN_SPREAD = 0.001          # Both bid AND ask must be at least this
-MARKET_INTERVAL_SECONDS = 900     # 15-minute markets
+import config as cfg
+
+QUOTE_STABILITY_REQUIRED = cfg.QUOTE_STABILITY_REQUIRED
+QUOTE_MIN_SPREAD = cfg.QUOTE_MIN_SPREAD
+MARKET_INTERVAL_SECONDS = cfg.MARKET_INTERVAL_SECONDS
 
 
-@dataclass
-class PaperTrade:
-    """Track paper/simulation trades"""
-    timestamp: datetime
-    direction: str
-    size_usd: float
-    price: float
-    signal_score: float
-    signal_confidence: float
-    outcome: str = "PENDING"
-
-    def to_dict(self):
-        return {
-            'timestamp': self.timestamp.isoformat(),
-            'direction': self.direction,
-            'size_usd': self.size_usd,
-            'price': self.price,
-            'signal_score': self.signal_score,
-            'signal_confidence': self.signal_confidence,
-            'outcome': self.outcome,
-        }
-
-
-def init_redis():
-    """Initialize Redis connection for simulation mode control."""
-    try:
-        redis_client = redis.Redis(
-            host=os.getenv('REDIS_HOST', 'localhost'),
-            port=int(os.getenv('REDIS_PORT', 6379)),
-            db=int(os.getenv('REDIS_DB', 2)),
-            decode_responses=True,
-            socket_connect_timeout=5,
-            socket_keepalive=True
-        )
-        redis_client.ping()
-        logger.info("Redis connection established")
-        return redis_client
-    except Exception as e:
-        logger.warning(f"Redis connection failed: {e}")
-        logger.warning("Simulation mode will be static (from .env)")
-        return None
+from models import PaperTrade
+from paper_trading import record_paper_trade, save_paper_trades
 
 
 class IntegratedBTCStrategy(Strategy):
@@ -141,7 +102,10 @@ class IntegratedBTCStrategy(Strategy):
         super().__init__()
 
         self.bot_start_time = datetime.now(timezone.utc)
-        self.restart_after_minutes = 90
+        self.restart_after_minutes = cfg.RESTART_AFTER_MINUTES
+
+        # Persistent event loop for trading decisions (avoids creating/closing per trade)
+        self._decision_loop = asyncio.new_event_loop()
 
         # Nautilus
         self.instrument_id = None
@@ -167,50 +131,46 @@ class IntegratedBTCStrategy(Strategy):
 
         # Tick buffer: rolling 90s of ticks for TickVelocityProcessor
         from collections import deque
-        self._tick_buffer: deque = deque(maxlen=500)  # ~500 ticks = well over 90s
+        self._tick_buffer: deque = deque(maxlen=cfg.TICK_BUFFER_SIZE)
 
         # YES token id for the current market (set in _load_all_btc_instruments)
         self._yes_token_id: Optional[str] = None
 
-        # Phase 4: Signal Processors
+        # Phase 4: Signal Processors (params from config.py)
         self.spike_detector = SpikeDetectionProcessor(
-            spike_threshold=0.05,       # FIXED: was 0.15 (too high for probabilities)
-            lookback_periods=20,
+            spike_threshold=cfg.SPIKE_THRESHOLD,
+            lookback_periods=cfg.SPIKE_LOOKBACK,
         )
         self.sentiment_processor = SentimentProcessor(
-            extreme_fear_threshold=25,
-            extreme_greed_threshold=75,
+            extreme_fear_threshold=cfg.SENTIMENT_FEAR_THRESHOLD,
+            extreme_greed_threshold=cfg.SENTIMENT_GREED_THRESHOLD,
         )
         self.divergence_processor = PriceDivergenceProcessor(
-            divergence_threshold=0.05,
+            divergence_threshold=cfg.DIVERGENCE_THRESHOLD,
         )
         self.orderbook_processor = OrderBookImbalanceProcessor(
-            imbalance_threshold=0.30,   # 30% skew to signal
-            min_book_volume=50.0,       # ignore illiquid books
+            imbalance_threshold=cfg.ORDERBOOK_IMBALANCE_THRESHOLD,
+            min_book_volume=cfg.ORDERBOOK_MIN_VOLUME,
         )
         self.tick_velocity_processor = TickVelocityProcessor(
-            velocity_threshold_60s=0.015,  # 1.5% move in 60s
-            velocity_threshold_30s=0.010,  # 1.0% move in 30s
+            velocity_threshold_60s=cfg.TICK_VELOCITY_60S,
+            velocity_threshold_30s=cfg.TICK_VELOCITY_30S,
         )
         self.deribit_pcr_processor = DeribitPCRProcessor(
-            bullish_pcr_threshold=1.20,
-            bearish_pcr_threshold=0.70,
-            max_days_to_expiry=2,
-            cache_seconds=300,          # refresh every 5 min
+            bullish_pcr_threshold=cfg.DERIBIT_BULLISH_PCR,
+            bearish_pcr_threshold=cfg.DERIBIT_BEARISH_PCR,
+            max_days_to_expiry=cfg.DERIBIT_MAX_DTE,
+            cache_seconds=cfg.DERIBIT_CACHE_SECONDS,
         )
 
-        # Phase 4: Signal Fusion — update weights for 6 processors
+        # Phase 4: Signal Fusion — weights from config.py
         self.fusion_engine = get_fusion_engine()
-        # Rebalanced weights (must sum ≤ 1.0; higher = more influence)
-        self.fusion_engine.set_weight("OrderBookImbalance", 0.30)  # best real-time signal
-        self.fusion_engine.set_weight("TickVelocity",       0.25)  # fast poly momentum
-        self.fusion_engine.set_weight("PriceDivergence",    0.18)  # spot momentum
-        self.fusion_engine.set_weight("SpikeDetection",     0.12)  # mean reversion
-        self.fusion_engine.set_weight("DeribitPCR",         0.10)  # institutional sentiment
-        self.fusion_engine.set_weight("SentimentAnalysis",  0.05)  # daily F&G (weak)
+        for name, weight in cfg.SIGNAL_WEIGHTS.items():
+            self.fusion_engine.set_weight(name, weight)
 
         # Phase 5: Risk Management
         self.risk_engine = get_risk_engine()
+        self._last_reset_date = datetime.now(timezone.utc).date()  # S8: daily stats reset tracker
 
         # Phase 6: Performance Tracking
         self.performance_tracker = get_performance_tracker()
@@ -224,12 +184,13 @@ class IntegratedBTCStrategy(Strategy):
         else:
             self.grafana_exporter = None
 
-        # Price history
-        self.price_history = []
-        self.max_history = 100
+        # Price history (deque auto-evicts oldest when full — O(1) vs list.pop(0) O(n))
+        from collections import deque as _deque
+        self.price_history: _deque = _deque(maxlen=cfg.MAX_PRICE_HISTORY)
 
         # Paper trading tracker
         self.paper_trades: List[PaperTrade] = []
+        self._trade_count: int = 0  # Total trades for learning engine trigger
 
         self.test_mode = test_mode
 
@@ -283,8 +244,13 @@ class IntegratedBTCStrategy(Strategy):
     # Redis
     # ------------------------------------------------------------------
 
-    async def check_simulation_mode(self) -> bool:
-        """Check Redis for current simulation mode."""
+    def check_simulation_mode(self) -> bool:
+        """
+        Check Redis for current simulation mode.
+
+        Uses synchronous redis.Redis operations (fast single-key read).
+        Safe to call from both sync and async contexts.
+        """
         if not self.redis_client:
             return self.current_simulation_mode
         try:
@@ -629,6 +595,14 @@ class IntegratedBTCStrategy(Strategy):
                 return
 
             now = datetime.now(timezone.utc)
+
+            # S8: Reset daily risk stats at UTC midnight
+            today = now.date()
+            if today != self._last_reset_date:
+                self.risk_engine.reset_daily_stats()
+                self._last_reset_date = today
+                logger.info(f"Daily stats reset for {today}")
+
             bid = tick.bid_price
             ask = tick.ask_price
 
@@ -641,24 +615,23 @@ class IntegratedBTCStrategy(Strategy):
             except:
                 return
 
-            # Always store price history
+            # Always store price history — as FLOAT to avoid Decimal↔float churn
             mid_price = (bid_decimal + ask_decimal) / 2
-            self.price_history.append(mid_price)
-            if len(self.price_history) > self.max_history:
-                self.price_history.pop(0)
-            
+            mid_float = float(mid_price)
+            self.price_history.append(mid_float)  # deque(maxlen) auto-evicts oldest
+
             # Store latest bid/ask for liquidity check before order placement
             self._last_bid_ask = (bid_decimal, ask_decimal)
 
             # Tick buffer for TickVelocityProcessor (rolling 90s window)
-            self._tick_buffer.append({'ts': now, 'price': mid_price})
+            self._tick_buffer.append({'ts': now, 'price': mid_float})
 
             # Stability gate
             if not self._market_stable:
                 self._stable_tick_count += 1
-                if self._stable_tick_count >= 1:
+                if self._stable_tick_count >= QUOTE_STABILITY_REQUIRED:
                     self._market_stable = True
-                    logger.info(f"✓ Market STABLE immediately")
+                    logger.info(f"✓ Market STABLE after {self._stable_tick_count} ticks")
                 else:
                     return
 
@@ -727,22 +700,18 @@ class IntegratedBTCStrategy(Strategy):
             #   2.0+ shares = price $0.50 → pure coin flip, SKIP
             # =========================================================================
             seconds_into_sub_interval = elapsed_secs % MARKET_INTERVAL_SECONDS
-            TRADE_WINDOW_START = 780   # 13 minutes in
-            TRADE_WINDOW_END   = 840   # 14 minutes in (60s window)
 
-            if TRADE_WINDOW_START <= seconds_into_sub_interval < TRADE_WINDOW_END and trade_key != self.last_trade_time:
+            if cfg.TRADE_WINDOW_START <= seconds_into_sub_interval < cfg.TRADE_WINDOW_END and trade_key != self.last_trade_time:
                 self.last_trade_time = trade_key
 
-                logger.info("=" * 80)
-                logger.info(f" LATE-WINDOW TRADE: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
-                logger.info(f"   Market: {current_market['slug']}")
-                logger.info(f"   Sub-interval #{sub_interval} ({seconds_into_sub_interval:.1f}s in = {seconds_into_sub_interval/60:.1f} min)")
-                logger.info(f"   Price: ${float(mid_price):,.4f} | Bid: ${float(bid_decimal):,.4f} | Ask: ${float(ask_decimal):,.4f}")
-                logger.info(f"   Trend strength: {'STRONG ✓' if float(mid_price) > 0.60 or float(mid_price) < 0.40 else 'WEAK — may skip'}")
-                logger.info(f"   Price history: {len(self.price_history)} points")
-                logger.info("=" * 80)
+                logger.info(
+                    f"═ TRADE WINDOW | {current_market['slug']} | "
+                    f"${mid_float:,.4f} | "
+                    f"{'STRONG' if mid_float > cfg.TREND_UP_THRESHOLD or mid_float < cfg.TREND_DOWN_THRESHOLD else 'WEAK'} | "
+                    f"{len(self.price_history)} pts"
+                )
 
-                self.run_in_executor(lambda: self._make_trading_decision_sync(float(mid_price)))
+                self.run_in_executor(lambda mp=mid_float: self._make_trading_decision_sync(mp))
 
         except Exception as e:
             logger.error(f"Error processing quote tick: {e}")
@@ -751,104 +720,132 @@ class IntegratedBTCStrategy(Strategy):
     # Trading decision (unchanged)
     # ------------------------------------------------------------------
 
-    def _make_trading_decision_sync(self, current_price):
-        from decimal import Decimal
-        price_decimal = Decimal(str(current_price))
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(self._make_trading_decision(price_decimal))
-        finally:
-            loop.close()
-    
+
     def _make_trading_decision_sync(self, current_price):
         """Synchronous wrapper for trading decision (called from executor)."""
         # Convert float back to Decimal for processing
         from decimal import Decimal
         price_decimal = Decimal(str(current_price))
-        
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(self._make_trading_decision(price_decimal))
-        finally:
-            loop.close()
+
+        # Reuse persistent event loop instead of creating/closing a new one per trade
+        self._decision_loop.run_until_complete(self._make_trading_decision(price_decimal))
             
     async def _fetch_market_context(self, current_price: Decimal) -> dict:
         """
-        Fetch REAL external data to populate signal processor metadata.
+        Fetch external data + compute local stats for signal processors.
 
-        Returns a dict with:
-          - sentiment_score (float 0-100): live Fear & Greed index, or None
-          - spot_price (float): live BTC-USD from Coinbase, or None
-          - deviation (float): polymarket price vs SMA-20 (always computed)
-          - momentum (float): 5-period rate of change (always computed)
-          - volatility (float): price std-dev over last 20 ticks (always computed)
+        All external HTTP calls (sentiment, spot, orderbook, Deribit) run in
+        parallel via asyncio.gather to minimize latency.
         """
         current_price_float = float(current_price)
 
-        # --- Always-available stats from local price_history ---
-        recent_prices = [float(p) for p in self.price_history[-20:]]
-        sma_20 = sum(recent_prices) / len(recent_prices)
-        deviation = (current_price_float - sma_20) / sma_20
+        # --- Local stats from price_history (already stored as float) ---
+        recent_prices = list(self.price_history)[-20:]  # float values
+        n_recent = len(recent_prices)
+        sma_20 = sum(recent_prices) / n_recent
+        deviation = (current_price_float - sma_20) / sma_20 if sma_20 else 0.0
         momentum = (
-            (current_price_float - float(self.price_history[-5])) / float(self.price_history[-5])
+            (current_price_float - self.price_history[-5]) / self.price_history[-5]
             if len(self.price_history) >= 5 else 0.0
         )
-        variance = sum((p - sma_20) ** 2 for p in recent_prices) / len(recent_prices)
+        variance = sum((p - sma_20) ** 2 for p in recent_prices) / n_recent
         volatility = math.sqrt(variance)
 
         metadata = {
             "deviation": deviation,
             "momentum": momentum,
             "volatility": volatility,
-            # Tick buffer for TickVelocityProcessor
-            "tick_buffer": list(self._tick_buffer),
-            # YES token id for OrderBookImbalanceProcessor
+            # Pass deque DIRECTLY — no list() copy (processors only read)
+            "tick_buffer": self._tick_buffer,
             "yes_token_id": self._yes_token_id,
         }
 
-        # --- Real sentiment: Fear & Greed Index via NewsSocialDataSource ---
-        try:
-            from data_sources.news_social.adapter import NewsSocialDataSource
-            news_source = NewsSocialDataSource()
-            await news_source.connect()
-            fg = await news_source.get_fear_greed_index()
-            await news_source.disconnect()
-            if fg and "value" in fg:
-                metadata["sentiment_score"] = float(fg["value"])
-                metadata["sentiment_classification"] = fg.get("classification", "")
-                logger.info(
-                    f"Fear & Greed: {metadata['sentiment_score']:.0f} "
-                    f"({metadata['sentiment_classification']})"
-                )
-            else:
-                logger.warning("Fear & Greed fetch returned no data — sentiment processor skipped")
-        except Exception as e:
-            logger.warning(f"Could not fetch Fear & Greed index: {e} — sentiment processor skipped")
+        # --- Parallel external fetches ----------------------------------------
+        fg, spot, ob_book, pcr_data = await asyncio.gather(
+            self._fetch_sentiment(),
+            self._fetch_spot(),
+            self._fetch_orderbook(),
+            self._fetch_deribit_pcr(),
+        )
 
-        # --- Real spot price: Coinbase BTC-USD REST API ---
-        try:
-            from data_sources.coinbase.adapter import CoinbaseDataSource
-            coinbase = CoinbaseDataSource()
-            await coinbase.connect()
-            spot = await coinbase.get_current_price()
-            await coinbase.disconnect()
-            if spot:
-                metadata["spot_price"] = float(spot)
-                logger.info(f"Coinbase spot price: ${float(spot):,.2f}")
-            else:
-                logger.warning("Coinbase price fetch returned None — divergence processor skipped")
-        except Exception as e:
-            logger.warning(f"Could not fetch Coinbase spot price: {e} — divergence processor skipped")
+        if fg and "value" in fg:
+            metadata["sentiment_score"] = float(fg["value"])
+            metadata["sentiment_classification"] = fg.get("classification", "")
+
+        if spot:
+            metadata["spot_price"] = float(spot)
+
+        if ob_book:
+            metadata["prefetched_orderbook"] = ob_book
+
+        if pcr_data:
+            metadata["prefetched_pcr"] = pcr_data
 
         logger.info(
-            f"Market context — deviation={deviation:.2%}, "
-            f"momentum={momentum:.2%}, volatility={volatility:.4f}, "
-            f"sentiment={'%.0f' % metadata['sentiment_score'] if 'sentiment_score' in metadata else 'N/A'}, "
-            f"spot=${'%.2f' % metadata['spot_price'] if 'spot_price' in metadata else 'N/A'}"
+            f"Context: dev={deviation:.2%} mom={momentum:.2%} vol={volatility:.4f} "
+            f"sent={'%.0f' % metadata.get('sentiment_score', -1) if 'sentiment_score' in metadata else 'N/A'} "
+            f"ob={'yes' if ob_book else 'no'} pcr={'yes' if pcr_data else 'no'}"
         )
         return metadata
+
+    # --- External fetch helpers (class methods, not inner functions) -----------
+
+    async def _fetch_sentiment(self):
+        """Fetch Fear & Greed index."""
+        try:
+            from data_sources.news_social.adapter import get_news_social_source
+            news_source = get_news_social_source()
+            if not news_source.session:
+                await news_source.connect()
+            return await news_source.get_fear_greed_index()
+        except Exception as e:
+            logger.debug(f"Sentiment fetch failed: {e}")
+            return None
+
+    async def _fetch_spot(self):
+        """Fetch Coinbase BTC spot price."""
+        try:
+            from data_sources.coinbase.adapter import get_coinbase_source
+            coinbase = get_coinbase_source()
+            if not coinbase.session:
+                await coinbase.connect()
+            return await coinbase.get_current_price()
+        except Exception as e:
+            logger.debug(f"Spot price fetch failed: {e}")
+            return None
+
+    async def _fetch_orderbook(self):
+        """Pre-fetch Polymarket CLOB orderbook (runs async, not blocking signal loop)."""
+        try:
+            token_id = self._yes_token_id
+            if not token_id:
+                return None
+            return self.orderbook_processor.fetch_order_book(token_id)
+        except Exception as e:
+            logger.debug(f"Orderbook pre-fetch failed: {e}")
+            return None
+
+    async def _fetch_deribit_pcr(self):
+        """Pre-fetch Deribit PCR (cached internally for 5 min)."""
+        try:
+            from datetime import timezone as _tz
+            proc = self.deribit_pcr_processor
+            now = datetime.now(_tz.utc)
+            cache_valid = (
+                proc._cached_result is not None and
+                proc._cache_time is not None and
+                (now - proc._cache_time).total_seconds() < proc.cache_seconds
+            )
+            if cache_valid:
+                return proc._cached_result
+            pcr_data = proc._fetch_pcr()
+            if pcr_data:
+                proc._cached_result = pcr_data
+                proc._cache_time = now
+            return pcr_data
+        except Exception as e:
+            logger.debug(f"Deribit PCR pre-fetch failed: {e}")
+            return None
 
     async def _make_trading_decision(self, current_price: Decimal):
         """
@@ -859,7 +856,7 @@ class IntegratedBTCStrategy(Strategy):
         don't already have too many open positions.
         """
         # --- Mode check ---
-        is_simulation = await self.check_simulation_mode()
+        is_simulation = self.check_simulation_mode()
         logger.info(f"Mode: {'SIMULATION' if is_simulation else 'LIVE TRADING'}")
 
         # --- Minimum history guard ---
@@ -890,7 +887,7 @@ class IntegratedBTCStrategy(Strategy):
         # min_score lowered to 40 because the TREND FILTER (price at min 11-13)
         # is now the primary decision maker. Fusion is informational context,
         # not the trade gate. The trend gate below is the real filter.
-        fused = self.fusion_engine.fuse_signals(signals, min_signals=1, min_score=40.0)
+        fused = self.fusion_engine.fuse_signals(signals, min_signals=cfg.FUSION_MIN_SIGNALS, min_score=cfg.FUSION_MIN_SCORE)
         if not fused:
             logger.info("Fusion produced no actionable signal — no trade this interval")
             return
@@ -900,8 +897,8 @@ class IntegratedBTCStrategy(Strategy):
             f"(score={fused.score:.1f}, confidence={fused.confidence:.2%})"
         )
 
-        # --- Phase 5: Position size is always exactly $1.00 ---
-        POSITION_SIZE_USD = Decimal("1.00")
+        # --- Phase 5: Position size from config ---
+        POSITION_SIZE_USD = cfg.POSITION_SIZE_USD
 
         # =========================================================================
         # TREND FILTER — replaces signal-based direction at the late trade window
@@ -917,29 +914,42 @@ class IntegratedBTCStrategy(Strategy):
         # (price near $0.50) almost always lose, while trades at 1.4 shares
         # (price ~$0.71) mostly win.
         # =========================================================================
-        TREND_UP_THRESHOLD   = 0.60   # price above this → buy YES (UP)
-        TREND_DOWN_THRESHOLD = 0.40   # price below this → buy NO (DOWN)
-
         price_float = float(current_price)
 
-        if price_float > TREND_UP_THRESHOLD:
+        if price_float > cfg.TREND_UP_THRESHOLD:
             direction = "long"
-            trend_confidence = price_float  # e.g. 0.72 = 72% confident UP
-            logger.info(
-                f" TREND: UP ({price_float:.2%} YES probability) → buying YES"
-            )
-        elif price_float < TREND_DOWN_THRESHOLD:
+            trend_confidence = price_float
+            logger.info(f"TREND: UP ({price_float:.2%}) → buying YES")
+        elif price_float < cfg.TREND_DOWN_THRESHOLD:
             direction = "short"
-            trend_confidence = 1.0 - price_float  # e.g. 0.31 price = 69% confident DOWN
-            logger.info(
-                f" TREND: DOWN ({price_float:.2%} YES probability = {1-price_float:.2%} NO) → buying NO"
-            )
+            trend_confidence = 1.0 - price_float
+            logger.info(f"TREND: DOWN ({price_float:.2%}) → buying NO")
         else:
             logger.info(
-                f"⏭ TREND: NEUTRAL ({price_float:.2%}) — price too close to 0.50, SKIPPING trade "
-                f"(coin flip territory: {TREND_DOWN_THRESHOLD:.0%}–{TREND_UP_THRESHOLD:.0%})"
+                f"⏭ TREND: NEUTRAL ({price_float:.2%}) — skipping "
+                f"({cfg.TREND_DOWN_THRESHOLD:.0%}–{cfg.TREND_UP_THRESHOLD:.0%})"
             )
             return
+
+        # --- S1: Signal Agreement Filter ---
+        # Check if the fused signal direction agrees with the trend.
+        # If signals say BEARISH but trend says long → signals disagree → skip.
+        from core.strategy_brain.signal_processors.base_processor import SignalDirection
+        trend_signal_dir = SignalDirection.BULLISH if direction == "long" else SignalDirection.BEARISH
+        signals_agree = (fused.direction is trend_signal_dir)
+
+        if not signals_agree:
+            if getattr(cfg, 'REQUIRE_SIGNAL_AGREEMENT', True):
+                logger.info(
+                    f"⏭ Signal disagreement: trend={direction} but "
+                    f"fused={fused.direction.value} — skipping trade"
+                )
+                return
+            else:
+                logger.warning(
+                    f"Signal disagreement: trend={direction} but "
+                    f"fused={fused.direction.value} — proceeding (agreement not required)"
+                )
 
         # Risk engine: only check position-count / exposure limits (no sizing math)
         is_valid, error = self.risk_engine.validate_new_position(
@@ -981,76 +991,12 @@ class IntegratedBTCStrategy(Strategy):
             await self._place_real_order(fused, POSITION_SIZE_USD, current_price, direction)
             
     async def _record_paper_trade(self, signal, position_size, current_price, direction):
-        exit_delta = timedelta(minutes=1) if self.test_mode else timedelta(minutes=15)
-        exit_time = datetime.now(timezone.utc) + exit_delta
-
-        if "BULLISH" in str(signal.direction):
-            movement = random.uniform(-0.02, 0.08)
-        else:
-            movement = random.uniform(-0.08, 0.02)
-
-        exit_price = current_price * (Decimal("1.0") + Decimal(str(movement)))
-        exit_price = max(Decimal("0.01"), min(Decimal("0.99"), exit_price))
-
-        if direction == "long":
-            pnl = position_size * (exit_price - current_price) / current_price
-        else:
-            pnl = position_size * (current_price - exit_price) / current_price
-
-        outcome = "WIN" if pnl > 0 else "LOSS"
-        paper_trade = PaperTrade(
-            timestamp=datetime.now(timezone.utc),
-            direction=direction.upper(),
-            size_usd=float(position_size),
-            price=float(current_price),
-            signal_score=signal.score,
-            signal_confidence=signal.confidence,
-            outcome=outcome,
-        )
-        self.paper_trades.append(paper_trade)
-
-        self.performance_tracker.record_trade(
-            trade_id=f"paper_{int(datetime.now().timestamp())}",
-            direction=direction,
-            entry_price=current_price,
-            exit_price=exit_price,
-            size=position_size,
-            entry_time=datetime.now(timezone.utc),
-            exit_time=exit_time,
-            signal_score=signal.score,
-            signal_confidence=signal.confidence,
-            metadata={
-                "simulated": True,
-                "num_signals": signal.num_signals if hasattr(signal, 'num_signals') else 1,
-                "fusion_score": signal.score,
-            }
-        )
-
-        if hasattr(self, 'grafana_exporter') and self.grafana_exporter:
-            self.grafana_exporter.increment_trade_counter(won=(pnl > 0))
-            self.grafana_exporter.record_trade_duration(exit_delta.total_seconds())
-
-        logger.info("=" * 80)
-        logger.info("[SIMULATION] PAPER TRADE RECORDED")
-        logger.info(f"  Direction: {direction.upper()}")
-        logger.info(f"  Size: ${float(position_size):.2f}")
-        logger.info(f"  Entry Price: ${float(current_price):,.4f}")
-        logger.info(f"  Simulated Exit: ${float(exit_price):,.4f}")
-        logger.info(f"  Simulated P&L: ${float(pnl):+.2f} ({movement*100:+.2f}%)")
-        logger.info(f"  Outcome: {outcome}")
-        logger.info(f"  Total Paper Trades: {len(self.paper_trades)}")
-        logger.info("=" * 80)
-
-        self._save_paper_trades()
+        """Delegate to paper_trading module."""
+        await record_paper_trade(self, signal, position_size, current_price, direction)
 
     def _save_paper_trades(self):
-        import json
-        try:
-            trades_data = [t.to_dict() for t in self.paper_trades]
-            with open('paper_trades.json', 'w') as f:
-                json.dump(trades_data, f, indent=2)
-        except Exception as e:
-            logger.error(f"Failed to save paper trades: {e}")
+        """Delegate to paper_trading module."""
+        save_paper_trades(self)
 
     # ------------------------------------------------------------------
     # Real order (unchanged)
@@ -1147,73 +1093,154 @@ class IntegratedBTCStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def _process_signals(self, current_price, metadata=None):
+        """Run all signal processors. metadata is passed through as-is (no Decimal conversion)."""
         signals = []
         if metadata is None:
             metadata = {}
 
-        processed_metadata = {}
-        for key, value in metadata.items():
-            if isinstance(value, float):
-                processed_metadata[key] = Decimal(str(value))
-            else:
-                processed_metadata[key] = value
+        # price_history is already float; processors handle float internally.
+        # No float→Decimal(str(float)) conversion needed.
+        hist = self.price_history
 
         spike_signal = self.spike_detector.process(
             current_price=current_price,
-            historical_prices=self.price_history,
-            metadata=processed_metadata,
+            historical_prices=hist,
+            metadata=metadata,
         )
         if spike_signal:
             signals.append(spike_signal)
 
-        if 'sentiment_score' in processed_metadata:
+        if 'sentiment_score' in metadata:
             sentiment_signal = self.sentiment_processor.process(
                 current_price=current_price,
-                historical_prices=self.price_history,
-                metadata=processed_metadata,
+                historical_prices=hist,
+                metadata=metadata,
             )
             if sentiment_signal:
                 signals.append(sentiment_signal)
 
-        if 'spot_price' in processed_metadata:
+        if 'spot_price' in metadata:
             divergence_signal = self.divergence_processor.process(
                 current_price=current_price,
-                historical_prices=self.price_history,
-                metadata=processed_metadata,
+                historical_prices=hist,
+                metadata=metadata,
             )
             if divergence_signal:
                 signals.append(divergence_signal)
 
-        # --- Order Book Imbalance (real-time Polymarket CLOB depth) ---
-        if processed_metadata.get('yes_token_id'):
+        # --- Order Book Imbalance ---
+        # Use pre-fetched book data if available (no blocking HTTP in signal loop)
+        prefetched_book = metadata.get('prefetched_orderbook')
+        if prefetched_book and metadata.get('yes_token_id'):
+            ob_signal = self._process_prefetched_orderbook(
+                current_price, prefetched_book, metadata
+            )
+            if ob_signal:
+                signals.append(ob_signal)
+        elif metadata.get('yes_token_id'):
+            # Fallback: let processor fetch (blocking)
             ob_signal = self.orderbook_processor.process(
                 current_price=current_price,
-                historical_prices=self.price_history,
-                metadata=processed_metadata,
+                historical_prices=hist,
+                metadata=metadata,
             )
             if ob_signal:
                 signals.append(ob_signal)
 
-        # --- Tick Velocity (last 60s of Polymarket probability movement) ---
-        if processed_metadata.get('tick_buffer'):
+        # --- Tick Velocity ---
+        if metadata.get('tick_buffer'):
             tv_signal = self.tick_velocity_processor.process(
                 current_price=current_price,
-                historical_prices=self.price_history,
-                metadata=processed_metadata,
+                historical_prices=hist,
+                metadata=metadata,
             )
             if tv_signal:
                 signals.append(tv_signal)
 
-        # --- Deribit Put/Call Ratio (institutional options sentiment) ---
-        pcr_signal = self.deribit_pcr_processor.process(
-            current_price=current_price,
-            historical_prices=self.price_history,
-            metadata=processed_metadata,
-        )
-        if pcr_signal:
-            signals.append(pcr_signal)
+        # --- Deribit PCR ---
+        # Use pre-fetched PCR data if available
+        prefetched_pcr = metadata.get('prefetched_pcr')
+        if prefetched_pcr:
+            pcr_signal = self.deribit_pcr_processor._generate_signal(
+                current_price, prefetched_pcr
+            )
+            if pcr_signal:
+                signals.append(pcr_signal)
+        else:
+            pcr_signal = self.deribit_pcr_processor.process(
+                current_price=current_price,
+                historical_prices=hist,
+                metadata=metadata,
+            )
+            if pcr_signal:
+                signals.append(pcr_signal)
 
         return signals
+
+    def _process_prefetched_orderbook(self, current_price, book, metadata):
+        """Process a pre-fetched orderbook dict without HTTP call."""
+        try:
+            proc = self.orderbook_processor
+            bids = book.get('bids', [])
+            asks = book.get('asks', [])
+
+            bid_volume = proc._parse_levels(bids)
+            ask_volume = proc._parse_levels(asks)
+            total_volume = bid_volume + ask_volume
+
+            if total_volume < proc.min_book_volume:
+                return None
+
+            imbalance = (bid_volume - ask_volume) / total_volume
+
+            if abs(imbalance) < proc.imbalance_threshold:
+                return None
+
+            from core.strategy_brain.signal_processors.base_processor import (
+                TradingSignal, SignalType, SignalDirection, SignalStrength,
+            )
+
+            direction = SignalDirection.BULLISH if imbalance > 0 else SignalDirection.BEARISH
+            abs_imb = abs(imbalance)
+
+            if abs_imb >= 0.70:
+                strength = SignalStrength.VERY_STRONG
+            elif abs_imb >= 0.50:
+                strength = SignalStrength.STRONG
+            elif abs_imb >= 0.35:
+                strength = SignalStrength.MODERATE
+            else:
+                strength = SignalStrength.WEAK
+
+            confidence = min(0.85, 0.55 + abs_imb * 0.40)
+            bid_wall = proc._detect_wall(bids, total_volume)
+            ask_wall = proc._detect_wall(asks, total_volume)
+            wall_side = bid_wall if direction == SignalDirection.BULLISH else ask_wall
+            if wall_side:
+                confidence = min(0.90, confidence + 0.05)
+
+            if confidence < proc.min_confidence:
+                return None
+
+            signal = TradingSignal(
+                timestamp=datetime.now(),
+                source=proc.name,
+                signal_type=SignalType.VOLUME_SURGE,
+                direction=direction,
+                strength=strength,
+                confidence=confidence,
+                current_price=current_price,
+                metadata={
+                    'imbalance': round(imbalance, 4),
+                    'bid_volume_usd': round(bid_volume, 2),
+                    'ask_volume_usd': round(ask_volume, 2),
+                }
+            )
+            proc._record_signal(signal)
+            return signal
+        except Exception as e:
+            logger.warning(f"Prefetched orderbook processing error: {e}")
+            return None
 
     # ------------------------------------------------------------------
     # Order events
@@ -1301,7 +1328,7 @@ class IntegratedBTCStrategy(Strategy):
                 pass
 
 # ---------------------------------------------------------------------------
-# Runner
+# Backward-compatible entry point (prefer runner.py)
 # ---------------------------------------------------------------------------
 
 def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, test_mode: bool = False):
@@ -1439,4 +1466,5 @@ def main():
 
 
 if __name__ == "__main__":
+    from runner import main
     main()

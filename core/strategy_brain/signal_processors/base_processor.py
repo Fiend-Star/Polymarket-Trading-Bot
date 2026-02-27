@@ -61,16 +61,14 @@ class TradingSignal:
     def __post_init__(self):
         if self.metadata is None:
             self.metadata = {}
-    
+        # Cache score once — avoids recomputation on every access
+        strength_weight = self.strength.value * 0.25  # /4.0 → 0-1
+        self._score = (strength_weight * 0.5 + self.confidence * 0.5) * 100
+
     @property
     def score(self) -> float:
-        """
-        Calculate signal score (0-100).
-        
-        Combines strength and confidence.
-        """
-        strength_weight = self.strength.value / 4.0  # Normalize to 0-1
-        return (strength_weight * 0.5 + self.confidence * 0.5) * 100
+        """Signal score (0-100). Cached at creation time."""
+        return self._score
 
 
 class BaseSignalProcessor(ABC):
