@@ -250,8 +250,16 @@ def load_csv_candles(csv_path: str) -> List[Candle]:
 
 
 # =============================================================================
-# Historical funding rate (Binance Futures — free, no auth)
+# Historical funding rate — shared classifier from funding_rate_filter (DRY)
 # =============================================================================
+from funding_rate_filter import (
+    classify_funding,
+    FUNDING_EXTREME_THRESHOLD,
+    FUNDING_HIGH_THRESHOLD,
+    FUNDING_MAX_BIAS,
+    BINANCE_FUNDING_RATE_URL,
+)
+
 @dataclass
 class FundingSnapshot:
     timestamp: datetime
@@ -259,28 +267,6 @@ class FundingSnapshot:
     rate_pct: float       # e.g. 0.01
     classification: str   # EXTREME_POSITIVE, HIGH_POSITIVE, NEUTRAL, etc.
     mean_reversion_bias: float  # ±0.02 max
-
-
-FUNDING_EXTREME_THRESHOLD = 0.0005   # 0.05%/8h
-FUNDING_HIGH_THRESHOLD    = 0.0002   # 0.02%/8h
-FUNDING_MAX_BIAS          = 0.02     # ±2%
-
-
-def classify_funding(rate: float) -> Tuple[str, float]:
-    """Classify funding rate into regime and compute mean-reversion bias."""
-    rate_pct = rate * 100
-    if rate >= FUNDING_EXTREME_THRESHOLD:
-        return "EXTREME_POSITIVE", -FUNDING_MAX_BIAS
-    elif rate >= FUNDING_HIGH_THRESHOLD:
-        scale = (rate - FUNDING_HIGH_THRESHOLD) / (FUNDING_EXTREME_THRESHOLD - FUNDING_HIGH_THRESHOLD)
-        return "HIGH_POSITIVE", -(0.005 + scale * 0.015)
-    elif rate <= -FUNDING_EXTREME_THRESHOLD:
-        return "EXTREME_NEGATIVE", FUNDING_MAX_BIAS
-    elif rate <= -FUNDING_HIGH_THRESHOLD:
-        scale = (-rate - FUNDING_HIGH_THRESHOLD) / (FUNDING_EXTREME_THRESHOLD - FUNDING_HIGH_THRESHOLD)
-        return "HIGH_NEGATIVE", (0.005 + scale * 0.015)
-    else:
-        return "NEUTRAL", 0.0
 
 
 def _parse_funding_entry(entry) -> FundingSnapshot:
@@ -295,7 +281,7 @@ def _parse_funding_entry(entry) -> FundingSnapshot:
 
 def fetch_funding_rates(start_dt: datetime, end_dt: datetime) -> List[FundingSnapshot]:
     """Fetch historical BTCUSDT funding rates from Binance Futures (every 8h)."""
-    url = "https://fapi.binance.com/fapi/v1/fundingRate"
+    url = BINANCE_FUNDING_RATE_URL
     snapshots: List[FundingSnapshot] = []
     start_ms = int(start_dt.timestamp() * 1000)
     end_ms = int(end_dt.timestamp() * 1000)

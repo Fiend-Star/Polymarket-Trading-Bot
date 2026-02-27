@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 import math
 from decimal import Decimal
 import time
-from dataclasses import dataclass, field
 from typing import List, Optional, Dict
 from types import SimpleNamespace
 import threading
@@ -49,7 +48,7 @@ from nautilus_trader.adapters.polymarket.factories import (
     PolymarketLiveExecClientFactory,
 )
 from nautilus_trader.trading.strategy import Strategy
-from nautilus_trader.model.identifiers import InstrumentId, ClientOrderId
+from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.objects import Quantity, Price
 from nautilus_trader.model.data import QuoteTick
@@ -58,6 +57,18 @@ from dotenv import load_dotenv
 from loguru import logger
 import redis
 
+# SOLID: Typed config replaces scattered os.getenv() calls
+from config import get_config
+
+# SOLID: Service container replaces direct singleton imports
+from container import get_container, ServiceContainer
+
+# SOLID: SRP-extracted collaborators
+from market_manager import MarketManager
+from data_source_manager import DataSourceManager
+from position_tracker import PositionTracker
+from order_dispatcher import OrderDispatcher, PaperTrade
+
 # Signal processors (kept as confirmation signals in V3)
 from core.strategy_brain.signal_processors.spike_detector import SpikeDetectionProcessor
 from core.strategy_brain.signal_processors.sentiment_processor import SentimentProcessor
@@ -65,16 +76,9 @@ from core.strategy_brain.signal_processors.divergence_processor import PriceDive
 from core.strategy_brain.signal_processors.orderbook_processor import OrderBookImbalanceProcessor
 from core.strategy_brain.signal_processors.tick_velocity_processor import TickVelocityProcessor
 from core.strategy_brain.signal_processors.deribit_pcr_processor import DeribitPCRProcessor
-from core.strategy_brain.fusion_engine.signal_fusion import get_fusion_engine
-from execution.risk_engine import get_risk_engine
-from monitoring.performance_tracker import get_performance_tracker
-from monitoring.grafana_exporter import get_grafana_exporter
-from feedback.learning_engine import get_learning_engine
 
 # V3: Quantitative pricing model
-from binary_pricer import get_binary_pricer, BinaryOptionPricer
-from vol_estimator import get_vol_estimator
-from mispricing_detector import get_mispricing_detector
+from binary_pricer import BinaryOptionPricer
 
 # V3.1: RTDS Chainlink settlement oracle + Binance sub-second prices
 from rtds_connector import RTDSConnector
@@ -90,80 +94,38 @@ else:
     logger.warning("Market order patch failed - orders may be rejected")
 
 # =============================================================================
-# CONSTANTS
+# CONFIG — single source of truth (see config.py)
 # =============================================================================
-QUOTE_STABILITY_REQUIRED = 3
-QUOTE_MIN_SPREAD = 0.001
-MARKET_INTERVAL_SECONDS = 900
+_CFG = get_config()
 
-# Config from .env
-TRADE_WINDOW_START_SEC = int(os.getenv("TRADE_WINDOW_START", "60"))
-TRADE_WINDOW_END_SEC = int(os.getenv("TRADE_WINDOW_END", "180"))
-POSITION_SIZE_USD = Decimal(os.getenv("MARKET_BUY_USD", "1.00"))
-USE_LIMIT_ORDERS = os.getenv("USE_LIMIT_ORDERS", "true").lower() == "true"
-LIMIT_ORDER_OFFSET = Decimal(os.getenv("LIMIT_ORDER_OFFSET", "0.01"))
-MIN_FUSION_SIGNALS = int(os.getenv("MIN_FUSION_SIGNALS", "2"))
-MIN_FUSION_SCORE = float(os.getenv("MIN_FUSION_SCORE", "55.0"))
-TREND_UP_THRESHOLD = float(os.getenv("TREND_UP_THRESHOLD", "0.60"))
-TREND_DOWN_THRESHOLD = float(os.getenv("TREND_DOWN_THRESHOLD", "0.40"))
-MAX_RETRIES_PER_WINDOW = int(os.getenv("MAX_RETRIES_PER_WINDOW", "3"))
-
-# V3 Config
-MIN_EDGE_CENTS = float(os.getenv("MIN_EDGE_CENTS", "0.02"))
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.30"))
-CUT_LOSS_PCT = float(os.getenv("CUT_LOSS_PCT", "-0.50"))
-VOL_METHOD = os.getenv("VOL_METHOD", "ewma")
-DEFAULT_VOL = float(os.getenv("DEFAULT_VOL", "0.65"))
-
-# V3.1: RTDS + Funding Rate Config
-USE_RTDS = os.getenv("USE_RTDS", "true").lower() == "true"
-RTDS_LATE_WINDOW_SEC = float(os.getenv("RTDS_LATE_WINDOW_SEC", "15"))
-RTDS_LATE_WINDOW_MIN_BPS = float(os.getenv("RTDS_LATE_WINDOW_MIN_BPS", "3.0"))
-RTDS_DIVERGENCE_THRESHOLD_BPS = float(os.getenv("RTDS_DIVERGENCE_THRESHOLD_BPS", "5.0"))
-USE_FUNDING_FILTER = os.getenv("USE_FUNDING_FILTER", "true").lower() == "true"
-LATE_WINDOW_ENABLED = os.getenv("LATE_WINDOW_ENABLED", "true").lower() == "true"
+# Backward-compat aliases so downstream code reads the same names
+QUOTE_STABILITY_REQUIRED = _CFG.trading.quote_stability_required
+QUOTE_MIN_SPREAD = _CFG.trading.quote_min_spread
+MARKET_INTERVAL_SECONDS = _CFG.trading.market_interval_seconds
+TRADE_WINDOW_START_SEC = _CFG.trading.trade_window_start_sec
+TRADE_WINDOW_END_SEC = _CFG.trading.trade_window_end_sec
+POSITION_SIZE_USD = _CFG.trading.position_size_usd
+USE_LIMIT_ORDERS = _CFG.trading.use_limit_orders
+LIMIT_ORDER_OFFSET = _CFG.trading.limit_order_offset
+MAX_RETRIES_PER_WINDOW = _CFG.trading.max_retries_per_window
+MIN_FUSION_SIGNALS = _CFG.fusion.min_fusion_signals
+MIN_FUSION_SCORE = _CFG.fusion.min_fusion_score
+TREND_UP_THRESHOLD = _CFG.fusion.trend_up_threshold
+TREND_DOWN_THRESHOLD = _CFG.fusion.trend_down_threshold
+MIN_EDGE_CENTS = _CFG.quant.min_edge_cents
+TAKE_PROFIT_PCT = _CFG.quant.take_profit_pct
+CUT_LOSS_PCT = _CFG.quant.cut_loss_pct
+VOL_METHOD = _CFG.quant.vol_method
+DEFAULT_VOL = _CFG.quant.default_vol
+USE_RTDS = _CFG.rtds.use_rtds
+RTDS_LATE_WINDOW_SEC = _CFG.rtds.late_window_sec
+RTDS_LATE_WINDOW_MIN_BPS = _CFG.rtds.late_window_min_bps
+RTDS_DIVERGENCE_THRESHOLD_BPS = _CFG.rtds.divergence_threshold_bps
+USE_FUNDING_FILTER = _CFG.rtds.use_funding_filter
+LATE_WINDOW_ENABLED = _CFG.rtds.late_window_enabled
 
 
-# =============================================================================
-# Data classes
-# =============================================================================
-
-@dataclass
-class PaperTrade:
-    timestamp: datetime
-    direction: str
-    size_usd: float
-    price: float
-    signal_score: float
-    signal_confidence: float
-    outcome: str = "PENDING"
-
-    def to_dict(self):
-        return {
-            'timestamp': self.timestamp.isoformat(),
-            'direction': self.direction,
-            'size_usd': self.size_usd,
-            'price': self.price,
-            'signal_score': self.signal_score,
-            'signal_confidence': self.signal_confidence,
-            'outcome': self.outcome,
-        }
-
-
-@dataclass
-class OpenPosition:
-    """Track a live position until market resolves."""
-    market_slug: str
-    direction: str  # "long" (bought YES) or "short" (bought NO)
-    entry_price: float  # Price we PAID for the token
-    size_usd: float
-    entry_time: datetime
-    market_end_time: datetime
-    instrument_id: object
-    order_id: str
-    resolved: bool = False
-    exit_price: Optional[float] = None
-    pnl: Optional[float] = None
+# Data classes moved to order_dispatcher.py (PaperTrade) and position_tracker.py (OpenPosition)
 
 
 # =============================================================================
@@ -171,11 +133,10 @@ class OpenPosition:
 # =============================================================================
 
 def init_redis():
+    rc = _CFG.redis
     try:
         redis_client = redis.Redis(
-            host=os.getenv('REDIS_HOST', 'localhost'),
-            port=int(os.getenv('REDIS_PORT', 6379)),
-            db=int(os.getenv('REDIS_DB', 2)),
+            host=rc.host, port=rc.port, db=rc.db,
             decode_responses=True,
             socket_connect_timeout=5,
             socket_keepalive=True
@@ -223,36 +184,33 @@ class IntegratedBTCStrategy(Strategy):
     - Retry rate limiting
     """
 
-    def __init__(self, redis_client=None, enable_grafana=True, test_mode=False):
+    def __init__(self, redis_client=None, enable_grafana=True, test_mode=False,
+                 container: Optional[ServiceContainer] = None):
         super().__init__()
-
         self.bot_start_time = datetime.now(timezone.utc)
-        self.restart_after_minutes = 90
+        self.restart_after_minutes = _CFG.restart_after_minutes
         self.redis_client = redis_client
         self.current_simulation_mode = False
         self.test_mode = test_mode
-
+        self._svc = container or get_container()
         self._init_market_state()
         self._init_quant_modules()
         self._init_rtds_and_funding()
         self._init_signal_processors()
         self._init_risk_and_monitoring(enable_grafana)
+        if test_mode: logger.info("TEST MODE ACTIVE")
+        self._log_startup_config()
 
-        if test_mode:
-            logger.info("TEST MODE ACTIVE")
-
+    def _log_startup_config(self):
+        """Log strategy configuration on startup."""
         logger.info(
-            f"Strategy V3.1 | {TRADE_WINDOW_START_SEC}s–{TRADE_WINDOW_END_SEC}s window | "
-            f"{'LIMIT' if USE_LIMIT_ORDERS else 'MARKET'} orders | ${POSITION_SIZE_USD} size | "
-            f"edge≥${MIN_EDGE_CENTS:.2f} | TP {TAKE_PROFIT_PCT:.0%} / SL {CUT_LOSS_PCT:.0%} | "
-            f"vol={VOL_METHOD} {DEFAULT_VOL:.0%} | fusion≥{MIN_FUSION_SIGNALS}sig/{MIN_FUSION_SCORE}pts"
-        )
+            f"Strategy V3.1 | {TRADE_WINDOW_START_SEC}s–{TRADE_WINDOW_END_SEC}s | "
+            f"{'LIMIT' if USE_LIMIT_ORDERS else 'MKT'} ${POSITION_SIZE_USD} | "
+            f"edge≥${MIN_EDGE_CENTS:.2f} | vol={VOL_METHOD}")
         if USE_RTDS:
-            logger.info(
-                f"  RTDS: Chainlink + Binance | Late-window: "
-                f"{'T-{:.0f}s'.format(RTDS_LATE_WINDOW_SEC) if LATE_WINDOW_ENABLED else 'off'} | "
-                f"Funding: {'on' if USE_FUNDING_FILTER else 'off'}"
-            )
+            logger.info(f"  RTDS | Late: "
+                        f"{'T-{:.0f}s'.format(RTDS_LATE_WINDOW_SEC) if LATE_WINDOW_ENABLED else 'off'} | "
+                        f"Funding: {'on' if USE_FUNDING_FILTER else 'off'}")
 
     def _init_market_state(self):
         """Initialize market tracking and quote stability state."""
@@ -277,40 +235,27 @@ class IntegratedBTCStrategy(Strategy):
         self._yes_token_id: Optional[str] = None
         self._yes_instrument_id = None
         self._no_instrument_id = None
-        self._open_positions: List[OpenPosition] = []
 
     def _init_cache_and_history(self):
-        """Initialize data source cache and price history."""
-        self._cached_spot_price: Optional[float] = None
-        self._cached_sentiment: Optional[float] = None
-        self._cached_sentiment_class: Optional[str] = None
-        self._cache_lock = threading.Lock()
-        self._news_source = None
-        self._coinbase_source = None
-        self._data_sources_initialized = False
+        """Initialize data source manager and price history."""
+        # DataSourceManager will be fully wired in _init_rtds_and_funding
+        self._data_mgr: Optional[DataSourceManager] = None
         self.price_history = []
         self.max_history = 100
         self.paper_trades: List[PaperTrade] = []
 
     def _init_quant_modules(self):
-        """Initialize V3 quantitative pricing model components."""
-        self.binary_pricer = get_binary_pricer()
-        self.vol_estimator = get_vol_estimator()
-        self.mispricing_detector = get_mispricing_detector(
-            maker_fee=0.00, taker_fee=0.10,
-            min_edge_cents=MIN_EDGE_CENTS,
-            min_edge_after_fees=0.005,
-            take_profit_pct=TAKE_PROFIT_PCT,
-            cut_loss_pct=CUT_LOSS_PCT,
-            vol_method=VOL_METHOD,
-        )
+        """Initialize V3 quantitative pricing model via service container (DIP)."""
+        self.binary_pricer = self._svc.pricer
+        self.vol_estimator = self._svc.vol_estimator
+        self.mispricing_detector = self._svc.mispricing_detector
         self._btc_strike_price: Optional[float] = None
         self._strike_recorded = False
         self._active_entry: Optional[dict] = None
         self._late_window_traded = False
 
     def _init_rtds_and_funding(self):
-        """Initialize RTDS Chainlink oracle and funding rate filter."""
+        """Initialize RTDS oracle, funding filter, and DataSourceManager (SRP)."""
         if USE_RTDS:
             self.rtds = RTDSConnector(
                 vol_estimator=self.vol_estimator,
@@ -326,29 +271,30 @@ class IntegratedBTCStrategy(Strategy):
         else:
             self.funding_filter = None
 
+        # SRP: DataSourceManager owns all external data connections and caching
+        self._data_mgr = DataSourceManager(
+            vol_estimator=self.vol_estimator,
+            rtds=self.rtds,
+            funding_filter=self.funding_filter,
+        )
+
     def _init_signal_processors(self):
         """Initialize V3 signal processors for confirmation role."""
+        fc = _CFG.fusion
         self.spike_detector = SpikeDetectionProcessor(
-            spike_threshold=float(os.getenv("SPIKE_THRESHOLD", "0.05")),
-            lookback_periods=20,
-        )
+            spike_threshold=fc.spike_threshold, lookback_periods=20)
         self.sentiment_processor = SentimentProcessor(
-            extreme_fear_threshold=25, extreme_greed_threshold=75,
-        )
+            extreme_fear_threshold=25, extreme_greed_threshold=75)
         self.divergence_processor = PriceDivergenceProcessor(
-            divergence_threshold=float(os.getenv("DIVERGENCE_THRESHOLD", "0.05")),
-        )
+            divergence_threshold=fc.divergence_threshold)
         self.orderbook_processor = OrderBookImbalanceProcessor(
-            imbalance_threshold=0.30, min_book_volume=50.0,
-        )
+            imbalance_threshold=0.30, min_book_volume=50.0)
         self.tick_velocity_processor = TickVelocityProcessor(
-            velocity_threshold_60s=0.015, velocity_threshold_30s=0.010,
-        )
+            velocity_threshold_60s=0.015, velocity_threshold_30s=0.010)
         self.deribit_pcr_processor = DeribitPCRProcessor(
             bullish_pcr_threshold=1.20, bearish_pcr_threshold=0.70,
-            max_days_to_expiry=2, cache_seconds=300,
-        )
-        self.fusion_engine = get_fusion_engine()
+            max_days_to_expiry=2, cache_seconds=300)
+        self.fusion_engine = self._svc.fusion_engine
         self.fusion_engine.set_weight("OrderBookImbalance", 0.30)
         self.fusion_engine.set_weight("TickVelocity", 0.25)
         self.fusion_engine.set_weight("PriceDivergence", 0.18)
@@ -357,15 +303,24 @@ class IntegratedBTCStrategy(Strategy):
         self.fusion_engine.set_weight("SentimentAnalysis", 0.05)
 
     def _init_risk_and_monitoring(self, enable_grafana):
-        """Initialize risk engine, performance tracker, and Grafana."""
-        self.risk_engine = get_risk_engine()
-        self.performance_tracker = get_performance_tracker()
-        self.learning_engine = get_learning_engine()
+        """Initialize risk engine, performance tracker, and Grafana via container (DIP)."""
+        self.risk_engine = self._svc.risk_engine
+        self.performance_tracker = self._svc.performance_tracker
+        self.learning_engine = self._svc.learning_engine
 
         if enable_grafana:
+            from monitoring.grafana_exporter import get_grafana_exporter
             self.grafana_exporter = get_grafana_exporter()
+            self._svc.grafana_exporter = self.grafana_exporter
         else:
             self.grafana_exporter = None
+
+        # SRP: PositionTracker owns position lifecycle + P&L resolution
+        self._pos_tracker = PositionTracker(
+            cache_ref=self.cache,
+            performance=self.performance_tracker,
+            metrics=self.grafana_exporter,
+        )
 
 
     # ------------------------------------------------------------------
@@ -398,161 +353,27 @@ class IntegratedBTCStrategy(Strategy):
         self._stable_tick_count = 0
 
     # ------------------------------------------------------------------
-    # V3 FIX: Data sources run in timer loop, cache results thread-safely
+    # V3 FIX: Data sources delegated to DataSourceManager (SRP)
     # ------------------------------------------------------------------
 
     async def _init_data_sources(self):
-        """Initialize persistent connections to external data sources."""
-        if self._data_sources_initialized:
-            return
-
-        try:
-            from data_sources.news_social.adapter import NewsSocialDataSource
-            self._news_source = NewsSocialDataSource()
-            await self._news_source.connect()
-            logger.info("✓ Persistent news/social data source connected")
-        except Exception as e:
-            logger.warning(f"Could not connect news source: {e}")
-            self._news_source = None
-
-        try:
-            from data_sources.coinbase.adapter import CoinbaseDataSource
-            self._coinbase_source = CoinbaseDataSource()
-            await self._coinbase_source.connect()
-            logger.info("✓ Persistent Coinbase data source connected")
-        except Exception as e:
-            logger.warning(f"Could not connect Coinbase source: {e}")
-            self._coinbase_source = None
-
-        self._data_sources_initialized = True
+        """Delegate to DataSourceManager."""
+        await self._data_mgr.init_sources()
 
     async def _preseed_vol_estimator(self):
-        """Fetch recent Coinbase 1-min candles to warm up vol estimator on startup."""
-        import aiohttp
-        url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
-        params = {"granularity": 60}
-
-        try:
-            candles = await self._fetch_coinbase_candles(url, params)
-            if not candles:
-                return
-            candles.sort(key=lambda c: c[0])
-            self._feed_candles_to_vol_estimator(candles)
-        except Exception as e:
-            logger.warning(f"Vol estimator pre-seed failed: {e} — will use default vol until enough ticks")
-
-    async def _fetch_coinbase_candles(self, url, params):
-        """Fetch candles from Coinbase public API."""
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    logger.warning(f"Coinbase candles API returned {resp.status}")
-                    return None
-                candles = await resp.json()
-        if not candles or not isinstance(candles, list):
-            logger.warning("No candle data returned from Coinbase")
-            return None
-        return candles
-
-    def _feed_candles_to_vol_estimator(self, candles):
-        """Feed candle data into vol estimator and cache initial spot."""
-        fed = 0
-        for candle in candles:
-            try:
-                ts, low, high, open_p, close, volume = candle
-                self.vol_estimator.add_price(float(close), float(ts))
-                fed += 1
-            except (ValueError, IndexError, TypeError):
-                continue
-
-        vol = self.vol_estimator.get_vol(VOL_METHOD)
-        logger.info(
-            f"✓ Vol estimator pre-seeded: {fed} candles → "
-            f"RV={vol.annualized_vol:.1%} ({vol.method}), confidence={vol.confidence:.0%}"
-        )
-
-        if candles:
-            latest_price = float(candles[-1][4])
-            with self._cache_lock:
-                if self._cached_spot_price is None:
-                    self._cached_spot_price = latest_price
-                    logger.info(f"✓ Initial BTC spot from candles: ${latest_price:,.2f}")
+        """Delegate vol pre-seeding to DataSourceManager."""
+        await self._data_mgr.preseed_vol(VOL_METHOD)
 
     async def _teardown_data_sources(self):
-        if self._news_source:
-            try:
-                await self._news_source.disconnect()
-            except Exception:
-                pass
-        if self._coinbase_source:
-            try:
-                await self._coinbase_source.disconnect()
-            except Exception:
-                pass
-        self._data_sources_initialized = False
+        await self._data_mgr.teardown()
 
     async def _refresh_cached_data(self):
-        """Fetch BTC spot + sentiment, cache thread-safely."""
-        spot = await self._fetch_spot_price()
-        sentiment, sentiment_class = await self._fetch_sentiment()
-
-        if self.funding_filter and self.funding_filter.should_update():
-            try:
-                self.funding_filter.update_sync()
-            except Exception as e:
-                logger.debug(f"Funding rate update failed: {e}")
-
-        with self._cache_lock:
-            if spot is not None:
-                self._cached_spot_price = spot
-            if sentiment is not None:
-                self._cached_sentiment = sentiment
-                self._cached_sentiment_class = sentiment_class
-
-    async def _fetch_spot_price(self):
-        """Fetch BTC spot from RTDS Chainlink or Coinbase fallback."""
-        if self.rtds and self.rtds.chainlink_btc_price > 0 and self.rtds.chainlink_age_ms < 30000:
-            spot = self.rtds.chainlink_btc_price
-            if self.rtds.binance_btc_price > 0:
-                div = self.rtds.get_divergence()
-                if div.is_significant:
-                    logger.info(
-                        f"⚡ Price divergence: Binance=${div.binance_price:,.2f} vs "
-                        f"Chainlink=${div.chainlink_price:,.2f} ({div.divergence_bps:+.1f}bps) → {div.direction}"
-                    )
-            return spot
-        elif self._coinbase_source:
-            try:
-                coinbase_spot = await self._coinbase_source.get_current_price()
-                if coinbase_spot:
-                    spot = float(coinbase_spot)
-                    self.vol_estimator.add_price(spot)
-                    return spot
-            except Exception as e:
-                logger.debug(f"Coinbase refresh failed: {e}")
-        return None
-
-    async def _fetch_sentiment(self):
-        """Fetch Fear & Greed index from news source."""
-        if not self._news_source:
-            return None, None
-        try:
-            fg = await self._news_source.get_fear_greed_index()
-            if fg and "value" in fg:
-                return float(fg["value"]), fg.get("classification", "")
-        except Exception as e:
-            logger.debug(f"Sentiment refresh failed: {e}")
-        return None, None
+        """Delegate to DataSourceManager."""
+        await self._data_mgr.refresh()
 
     def _get_cached_data(self) -> dict:
-        """Read cached market data (thread-safe). Called from trading decision."""
-        with self._cache_lock:
-            return {
-                "spot_price": self._cached_spot_price,
-                "sentiment_score": self._cached_sentiment,
-                "sentiment_classification": self._cached_sentiment_class,
-            }
+        """Read cached market data (thread-safe)."""
+        return self._data_mgr.get_cached()
 
     # ------------------------------------------------------------------
     # Redis
@@ -793,79 +614,20 @@ class IntegratedBTCStrategy(Strategy):
 
 
     # ------------------------------------------------------------------
-    # V3 FIX: Position resolution (ALL positions are BUYS)
+    # Position resolution — delegated to PositionTracker (SRP)
     # ------------------------------------------------------------------
 
     def _resolve_positions_for_market(self, market_index: int):
-        """When a market ends, check the final price to determine P&L."""
+        """Delegate position resolution to PositionTracker."""
         if market_index < 0 or market_index >= len(self.all_btc_instruments):
             return
-
-        market = self.all_btc_instruments[market_index]
-        slug = market['slug']
-
-        for pos in self._open_positions:
-            if pos.market_slug == slug and not pos.resolved:
-                self._resolve_single_position(pos, slug)
-
-    def _resolve_single_position(self, pos, slug):
-        """Resolve a single open position at market end."""
-        final_price = self._get_final_price(pos)
-
-        if final_price is None:
-            logger.warning(f"Could not resolve position for {slug} — no final price")
-            return
-
-        pnl = pos.size_usd * (final_price - pos.entry_price) / pos.entry_price
-        pos.resolved = True
-        pos.exit_price = final_price
-        pos.pnl = pnl
-
-        outcome = "WIN" if pnl > 0 else "LOSS"
-        is_paper = pos.order_id.startswith("paper_")
-        token_type = "YES" if pos.direction == "long" else "NO"
-        tag = "[PAPER] " if is_paper else ""
-
-        logger.info(f"📊 {tag}POSITION RESOLVED: {slug} bought {token_type}")
-        logger.info(f"   Entry: ${pos.entry_price:.4f} → Exit: ${final_price:.4f}")
-        logger.info(f"   P&L: ${pnl:+.4f} ({outcome})")
-
-        self._record_resolved_trade(pos, final_price, slug, is_paper, outcome)
-
-        if hasattr(self, 'grafana_exporter') and self.grafana_exporter:
-            self.grafana_exporter.increment_trade_counter(won=(pnl > 0))
-
-        if is_paper:
-            self._update_paper_trade_outcome(pos, outcome)
-
-    def _get_final_price(self, pos):
-        """Get the final mid-price for a position's instrument."""
-        try:
-            quote = self.cache.quote_tick(pos.instrument_id)
-            if quote:
-                return float((quote.bid_price.as_decimal() + quote.ask_price.as_decimal()) / 2)
-        except Exception:
-            pass
-        return None
-
-    def _record_resolved_trade(self, pos, final_price, slug, is_paper, outcome):
-        """Record resolved trade in performance tracker."""
-        self.performance_tracker.record_trade(
-            trade_id=pos.order_id,
-            direction="long",
-            entry_price=Decimal(str(pos.entry_price)),
-            exit_price=Decimal(str(final_price)),
-            size=Decimal(str(pos.size_usd)),
-            entry_time=pos.entry_time,
-            exit_time=datetime.now(timezone.utc),
-            signal_score=0, signal_confidence=0,
-            metadata={
-                "resolved": True, "market": slug, "paper": is_paper,
-                "original_direction": pos.direction,
-                "token": "YES" if pos.direction == "long" else "NO",
-                "pnl_computed": round(pos.pnl, 4),
-            }
-        )
+        slug = self.all_btc_instruments[market_index]['slug']
+        self._pos_tracker.resolve_market(slug)
+        # Update paper trade outcomes
+        for pos in self._pos_tracker.positions:
+            if pos.market_slug == slug and pos.resolved and pos.order_id.startswith("paper_"):
+                outcome = "WIN" if pos.pnl and pos.pnl > 0 else "LOSS"
+                self._update_paper_trade_outcome(pos, outcome)
 
     def _update_paper_trade_outcome(self, pos, outcome):
         """Update matching paper_trade entry with resolved outcome."""
@@ -902,8 +664,9 @@ class IntegratedBTCStrategy(Strategy):
 
     def _record_strike_if_needed(self):
         """Record BTC strike price on first cached spot."""
-        if not self._strike_recorded and self._cached_spot_price:
-            self._btc_strike_price = self._cached_spot_price
+        spot = self._data_mgr.cached_spot
+        if not self._strike_recorded and spot:
+            self._btc_strike_price = spot
             self._strike_recorded = True
             logger.info(f"📌 BTC Strike recorded: ${self._btc_strike_price:,.2f}")
 
@@ -1381,7 +1144,7 @@ class IntegratedBTCStrategy(Strategy):
     # ------------------------------------------------------------------
 
     async def _record_paper_trade(self, signal, position_size, current_price, direction):
-        """Track paper trades as real positions for resolution at market end."""
+        """Track paper trades via PositionTracker for resolution at market end."""
         if (self.current_instrument_index < 0 or
                 self.current_instrument_index >= len(self.all_btc_instruments)):
             logger.warning("No active market — cannot record paper trade")
@@ -1398,13 +1161,12 @@ class IntegratedBTCStrategy(Strategy):
             trade_instrument_id = getattr(self, '_no_instrument_id', None) or self.instrument_id
             token_label = "NO (DOWN)"
 
-        self._open_positions.append(OpenPosition(
+        # Delegate to PositionTracker (SRP)
+        self._pos_tracker.add(
             market_slug=current_market['slug'], direction=direction,
             entry_price=float(current_price), size_usd=float(position_size),
-            entry_time=datetime.now(timezone.utc),
             market_end_time=current_market['end_time'],
-            instrument_id=trade_instrument_id, order_id=order_id,
-        ))
+            instrument_id=trade_instrument_id, order_id=order_id)
 
         self._add_paper_trade_record(signal, position_size, current_price, direction)
         self._log_paper_trade(direction, token_label, position_size, current_price, current_market, order_id)
@@ -1566,14 +1328,13 @@ class IntegratedBTCStrategy(Strategy):
             self._track_order_event("rejected")
 
     def _track_open_position(self, direction, entry_price, size_usd, instrument_id, order_id):
-        """Record a new open position for market resolution."""
+        """Delegate position tracking to PositionTracker (SRP)."""
         current_market = self.all_btc_instruments[self.current_instrument_index]
-        self._open_positions.append(OpenPosition(
+        self._pos_tracker.add(
             market_slug=current_market['slug'], direction=direction,
             entry_price=entry_price, size_usd=size_usd,
-            entry_time=datetime.now(timezone.utc),
             market_end_time=current_market['end_time'],
-            instrument_id=instrument_id, order_id=order_id))
+            instrument_id=instrument_id, order_id=order_id)
         self._track_order_event("placed")
 
     def _submit_market_order(self, trade_instrument_id, trade_label, instrument,
@@ -1620,16 +1381,13 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("=" * 80)
         self._track_order_event("filled")
 
-        # Update position entry price with actual fill
+        # Update position entry price with actual fill via PositionTracker
         order_id = str(event.client_order_id)
-        for pos in self._open_positions:
-            if pos.order_id == order_id:
-                pos.entry_price = float(event.last_px)
-                logger.info(f"  ✓ Position entry updated to actual fill: ${pos.entry_price:.4f}")
-                # Also update active entry for exit monitoring
-                if self._active_entry:
-                    self._active_entry["entry_price"] = pos.entry_price
-                break
+        updated = self._pos_tracker.update_entry_price(order_id, float(event.last_px))
+        if updated:
+            logger.info(f"  ✓ Position entry updated to actual fill: ${updated.entry_price:.4f}")
+            if self._active_entry:
+                self._active_entry["entry_price"] = updated.entry_price
 
     def on_order_denied(self, event):
         logger.error("=" * 80)
@@ -1674,9 +1432,8 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("Integrated BTC strategy V3.1 stopped")
         logger.info(f"Total paper trades: {len(self.paper_trades)}")
 
-        for pos in self._open_positions:
-            if not pos.resolved:
-                logger.info(f"Unresolved position: {pos.market_slug} {pos.direction} @ ${pos.entry_price:.4f}")
+        for pos in self._pos_tracker.unresolved():
+            logger.info(f"Unresolved position: {pos.market_slug} {pos.direction} @ ${pos.entry_price:.4f}")
 
         self._log_stop_stats()
         self._cleanup_connections()
@@ -1717,26 +1474,27 @@ class IntegratedBTCStrategy(Strategy):
 # ===========================================================================
 
 def _build_polymarket_configs():
-    """Build Polymarket data and exec client configs."""
+    """Build Polymarket data and exec client configs from typed config."""
+    creds = _CFG.creds
     instrument_cfg = PolymarketInstrumentProviderConfig(
         event_slug_builder="slug_builders:build_btc_15min_slugs",
     )
 
     data_cfg = PolymarketDataClientConfig(
-        private_key=os.getenv("POLYMARKET_PK"),
-        api_key=os.getenv("POLYMARKET_API_KEY"),
-        api_secret=os.getenv("POLYMARKET_API_SECRET"),
-        passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
-        signature_type=1,
+        private_key=creds.private_key,
+        api_key=creds.api_key,
+        api_secret=creds.api_secret,
+        passphrase=creds.passphrase,
+        signature_type=creds.signature_type,
         instrument_config=instrument_cfg,
     )
 
     exec_cfg = PolymarketExecClientConfig(
-        private_key=os.getenv("POLYMARKET_PK"),
-        api_key=os.getenv("POLYMARKET_API_KEY"),
-        api_secret=os.getenv("POLYMARKET_API_SECRET"),
-        passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
-        signature_type=1,
+        private_key=creds.private_key,
+        api_key=creds.api_key,
+        api_secret=creds.api_secret,
+        passphrase=creds.passphrase,
+        signature_type=creds.signature_type,
         instrument_config=instrument_cfg,
     )
     return data_cfg, exec_cfg
@@ -1776,6 +1534,8 @@ def _build_and_run_node(strategy):
     """Build and run the Nautilus trading node."""
     poly_data_cfg, poly_exec_cfg = _build_polymarket_configs()
     config = _build_trading_node_config(poly_data_cfg, poly_exec_cfg)
+
+
     print("\nBuilding Nautilus node...")
     node = TradingNode(config=config)
     node.add_data_client_factory(POLYMARKET, PolymarketLiveDataClientFactory)
@@ -1783,7 +1543,9 @@ def _build_and_run_node(strategy):
     node.trader.add_strategy(strategy)
     node.build()
     logger.info("Nautilus node built successfully")
+
     print()
+
     try:
         node.run()
     except KeyboardInterrupt:

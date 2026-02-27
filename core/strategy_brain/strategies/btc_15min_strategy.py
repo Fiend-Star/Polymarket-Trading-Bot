@@ -33,12 +33,12 @@ class BTCStrategy15Min:
     5. Manage positions
     """
     
-    def _init_processors(self):
-        """Initialize signal processors and fusion engine."""
+    def _init_processors(self, fusion_engine=None):
+        """Initialize signal processors and fusion engine (DIP: accepts injection)."""
         self.spike_detector = SpikeDetectionProcessor(spike_threshold=0.15, lookback_periods=20)
         self.sentiment_processor = SentimentProcessor(extreme_fear_threshold=25, extreme_greed_threshold=75)
         self.divergence_processor = PriceDivergenceProcessor(divergence_threshold=0.05)
-        self.fusion_engine = get_fusion_engine()
+        self.fusion_engine = fusion_engine or get_fusion_engine()
 
     def _init_state(self):
         """Initialize price history, position tracking, and statistics."""
@@ -54,13 +54,13 @@ class BTCStrategy15Min:
 
     def __init__(self, max_position_size: Decimal = Decimal("10.0"),
                  stop_loss_pct: float = 0.30, take_profit_pct: float = 0.20,
-                 max_positions: int = 2):
+                 max_positions: int = 2, fusion_engine=None):
         """Initialize 15-minute BTC strategy."""
         self.max_position_size = max_position_size
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
         self.max_positions = max_positions
-        self._init_processors()
+        self._init_processors(fusion_engine=fusion_engine)
         self._init_state()
         logger.info(f"15-Min Strategy: max=${max_position_size}, "
                     f"SL={stop_loss_pct:.0%}, TP={take_profit_pct:.0%}")
@@ -135,16 +135,16 @@ class BTCStrategy15Min:
         else:
             # Wait until next 15-min mark
             wait_minutes = 15 - minutes_past
-        
+
         next_time = now + timedelta(minutes=wait_minutes)
         next_time = next_time.replace(second=0, microsecond=0)
-        
+
         wait_seconds = (next_time - now).total_seconds()
-        
+
         logger.info(f"Waiting {wait_seconds:.0f}s until next decision ({next_time.strftime('%H:%M')})")
-        
+
         await asyncio.sleep(wait_seconds)
-    
+
     async def _make_decision(self) -> None:
         """Make trading decision based on fused signals."""
         logger.info("=" * 60 + " MAKING DECISION " + "=" * 60)
@@ -163,7 +163,7 @@ class BTCStrategy15Min:
             logger.warning(f"Max positions ({self.max_positions})"); return
         await self._execute_trade(fused)
         self._last_decision_time = datetime.now()
-    
+
     def _run_processor(self, processor, metadata, require_spot=False):
         """Run a single signal processor. Returns signal or None."""
         if require_spot and not self._spot_price_consensus:

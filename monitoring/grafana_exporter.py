@@ -95,36 +95,16 @@ class MetricsHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"Not Found")
 
     def do_POST(self):
-        """Handle POST requests - forward to GET for metrics, handle API queries."""
+        """Handle POST requests — route same as GET."""
         parsed = urllib.parse.urlparse(self.path)
-        
-        # Handle Grafana API probes
         if parsed.path.startswith('/api/v1/'):
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            
-            # For label queries, return empty list
-            if 'labels' in parsed.path:
-                self.wfile.write(b'{"status":"success","data":[]}')
-            # For query requests, return empty result
-            elif 'query' in parsed.path:
-                self.wfile.write(b'{"status":"success","data":{"resultType":"vector","result":[]}}')
-            # Default response
-            else:
-                self.wfile.write(b'{"status":"success"}')
-            return
-        
-        # For metrics endpoint, treat POST like GET
-        if parsed.path == '/metrics':
-            return self.do_GET()
-        
-        # Handle CORS preflight
-        self.send_response(404)
-        self.end_headers()
-        self.wfile.write(b"Not Found")
-    
+            self._serve_api(parsed.path)
+        elif parsed.path == '/metrics':
+            self.do_GET()
+        else:
+            self.send_response(404); self.end_headers()
+            self.wfile.write(b"Not Found")
+
     def do_OPTIONS(self):
         """Handle OPTIONS requests for CORS preflight."""
         self.send_response(200)
@@ -133,7 +113,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Headers', 'Accept, Content-Type')
         self.send_header('Access-Control-Max-Age', '86400')  # 24 hours
         self.end_headers()
-    
+
     def log_message(self, format, *args):
         """Override to avoid excessive logging."""
         try:
@@ -151,41 +131,25 @@ class MetricsHandler(BaseHTTPRequestHandler):
 class GrafanaMetricsExporter:
     """
     Exports metrics to Prometheus/Grafana.
-    
+
     Exposes metrics on HTTP endpoint for Grafana to scrape.
     Now handles Grafana's API probes correctly.
     """
-    
-    def __init__(
-        self,
-        port: int = 8000,
-        update_interval: int = 5,  # seconds
-    ):
-        """
-        Initialize metrics exporter.
-        
-        Args:
-            port: HTTP port for metrics endpoint
-            update_interval: How often to update metrics (seconds)
-        """
+
+    def __init__(self, port: int = 8000, update_interval: int = 5,
+                 performance_tracker=None, risk_engine=None, execution_engine=None):
+        """Initialize exporter with optional injected dependencies (DIP)."""
         self.port = port
         self.update_interval = update_interval
-        
-        # Components
-        self.performance = get_performance_tracker()
-        self.risk = get_risk_engine()
-        self.execution = get_execution_engine()
-        
-        # Prometheus metrics
+        self.performance = performance_tracker or get_performance_tracker()
+        self.risk = risk_engine or get_risk_engine()
+        self.execution = execution_engine or get_execution_engine()
         self._setup_metrics()
-        
-        # Server state
         self._is_running = False
         self._server = None
         self._thread = None
-        
-        logger.info(f"Initialized Grafana Metrics Exporter (port {port})")
-    
+        logger.info(f"Grafana Metrics Exporter (port {port})")
+
     def _setup_metrics(self) -> None:
         """Setup Prometheus metrics."""
         self._setup_gauges()

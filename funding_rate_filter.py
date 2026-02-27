@@ -47,12 +47,44 @@ except ImportError:
 
 
 # =============================================================================
-# Constants
+# Constants (shared with backtest_v3.py)
 # =============================================================================
 BINANCE_MARK_PRICE_URL = "https://fapi.binance.com/fapi/v1/premiumIndex"
 BINANCE_FUNDING_RATE_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
 UPDATE_INTERVAL_SEC = 300  # Poll every 5 minutes
 CACHE_TTL_SEC = 300
+
+FUNDING_EXTREME_THRESHOLD = 0.0005   # 0.05% per 8h
+FUNDING_HIGH_THRESHOLD    = 0.0002   # 0.02% per 8h
+FUNDING_MAX_BIAS          = 0.02     # Max probability adjustment ±2%
+
+
+# =============================================================================
+# Standalone classifier (SRP: shared by live filter AND backtest)
+# =============================================================================
+
+def classify_funding(rate: float, extreme: float = FUNDING_EXTREME_THRESHOLD,
+                     high: float = FUNDING_HIGH_THRESHOLD,
+                     max_bias: float = FUNDING_MAX_BIAS) -> tuple:
+    """
+    Classify a funding rate into regime + compute mean-reversion bias.
+
+    Returns:
+        (classification: str, mean_reversion_bias: float)
+
+    Used by both FundingRateFilter (live) and backtest_v3 (historical).
+    """
+    if rate > extreme:
+        return "EXTREME_POSITIVE", -max_bias
+    elif rate > high:
+        scale = (rate - high) / (extreme - high)
+        return "HIGH_POSITIVE", -(0.005 + scale * 0.015)
+    elif rate < -extreme:
+        return "EXTREME_NEGATIVE", +max_bias
+    elif rate < -high:
+        scale = (-rate - high) / (extreme - high)
+        return "HIGH_NEGATIVE", (0.005 + scale * 0.015)
+    return "NEUTRAL", 0.0
 
 
 # =============================================================================
@@ -233,21 +265,9 @@ class FundingRateFilter:
 
 
     def _classify(self, rate: float) -> tuple:
-        """Classify funding rate into regime + compute mean-reversion bias."""
-        if rate > self.extreme_threshold:
-            # Crowded long → expect reversal DOWN
-            return "EXTREME_POSITIVE", -self.max_bias
-        elif rate > self.high_threshold:
-            scale = (rate - self.high_threshold) / (self.extreme_threshold - self.high_threshold)
-            return "HIGH_POSITIVE", -self.max_bias * 0.5 * scale
-        elif rate < -self.extreme_threshold:
-            # Crowded short → expect reversal UP
-            return "EXTREME_NEGATIVE", +self.max_bias
-        elif rate < -self.high_threshold:
-            scale = (abs(rate) - self.high_threshold) / (self.extreme_threshold - self.high_threshold)
-            return "HIGH_NEGATIVE", +self.max_bias * 0.5 * scale
-        else:
-            return "NEUTRAL", 0.0
+        """Delegate to shared classify_funding() with instance thresholds."""
+        return classify_funding(rate, self.extreme_threshold,
+                                self.high_threshold, self.max_bias)
 
     def should_update(self) -> bool:
         """Check if it's time to re-fetch."""

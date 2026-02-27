@@ -1,6 +1,12 @@
 """
-Execution Engine
-Manages order placement, fills, and position lifecycle
+Execution Engine — Backward-compatible facade.
+
+SRP SPLIT (see execution/order_manager.py and execution/position_manager.py):
+  - OrderManager:        order construction, ID generation, submission
+  - ExecPositionManager: position lifecycle, SL/TP monitoring, closure
+
+This file retains the original ExecutionEngine class for backward compatibility.
+New code should import OrderManager + ExecPositionManager directly.
 """
 import asyncio
 from decimal import Decimal
@@ -89,7 +95,13 @@ class ExecutionEngine:
     """
     
     def __init__(self, risk_engine: Optional[RiskEngine] = None, dry_run: bool = True):
-        """Initialize execution engine."""
+        """
+        Initialize execution engine.
+
+        Args:
+            risk_engine: Injected IRiskEngine (falls back to singleton for backward compat)
+            dry_run: True for paper trading, False for live
+        """
         self.risk_engine = risk_engine or get_risk_engine()
         self.dry_run = dry_run
         self._orders: Dict[str, Order] = {}
@@ -241,6 +253,7 @@ class ExecutionEngine:
         logger.info(f"Position closed: {position_id} P&L: ${pnl:+.2f} ({reason})")
         if self.on_position_closed:
             await self.on_position_closed(position)
+
         return pnl
 
     async def update_positions(self, current_price: Decimal) -> None:

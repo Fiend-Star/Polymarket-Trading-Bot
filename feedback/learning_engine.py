@@ -43,36 +43,17 @@ class LearningEngine:
     - Improves over time
     """
     
-    def __init__(
-        self,
-        learning_rate: float = 0.1,
-        min_trades_for_learning: int = 10,
-    ):
-        """
-        Initialize learning engine.
-        
-        Args:
-            learning_rate: How quickly to adjust weights (0-1)
-            min_trades_for_learning: Minimum trades before adjusting
-        """
+    def __init__(self, learning_rate: float = 0.1, min_trades_for_learning: int = 10,
+                 performance_tracker=None, fusion_engine=None):
+        """Initialize learning engine with optional injected dependencies (DIP)."""
         self.learning_rate = learning_rate
         self.min_trades = min_trades_for_learning
-        
-        # Components
-        self.performance = get_performance_tracker()
-        self.fusion = get_fusion_engine()
-        
-        # Signal performance tracking
+        self.performance = performance_tracker or get_performance_tracker()
+        self.fusion = fusion_engine or get_fusion_engine()
         self._signal_performance: Dict[str, SignalPerformance] = {}
-        
-        # Learning history
         self._weight_adjustments: List[Dict[str, Any]] = []
-        
-        logger.info(
-            f"Initialized Learning Engine "
-            f"(learning_rate={learning_rate}, min_trades={min_trades_for_learning})"
-        )
-    
+        logger.info(f"Learning Engine (lr={learning_rate}, min_trades={min_trades_for_learning})")
+
     def _group_trades_by_source(self, lookback_days):
         """Group recent trades by signal source."""
         cutoff = datetime.now() - timedelta(days=lookback_days)

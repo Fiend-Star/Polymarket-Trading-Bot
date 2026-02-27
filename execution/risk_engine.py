@@ -1,6 +1,11 @@
 """
 Risk Engine
-Manages position sizing, risk limits, and portfolio constraints
+Manages position sizing, risk limits, and portfolio constraints.
+
+SRP: RiskEngine validates risk limits and tracks positions.
+     RiskAlertEmitter handles alert creation and notification (separate concern).
+
+DIP: Consumers should depend on IRiskEngine protocol (see interfaces.py).
 """
 from decimal import Decimal
 from datetime import datetime
@@ -44,6 +49,35 @@ class PositionRisk:
     metadata: Dict[str, Any]
 
 
+# ── SRP-extracted: Alert Emitter ─────────────────────────────────────────────
+
+class RiskAlertEmitter:
+    """
+    SRP: Sole responsibility is creating, storing, and querying risk alerts.
+    Separated from RiskEngine so risk validation logic is independent of
+    notification/monitoring infrastructure.
+    """
+
+    def __init__(self):
+        self._alerts: List[Dict[str, Any]] = []
+
+    def emit(self, alert_type: str, message: str, risk_level: RiskLevel):
+        """Create and store a risk alert."""
+        self._alerts.append({
+            "timestamp": datetime.now(), "type": alert_type,
+            "message": message, "risk_level": risk_level.value})
+        logger.warning(f"[{risk_level.value.upper()}] {alert_type}: {message}")
+
+    def recent_count(self, seconds: int = 3600) -> int:
+        """Count alerts within the last `seconds`."""
+        now = datetime.now()
+        return sum(1 for a in self._alerts if (now - a["timestamp"]).seconds < seconds)
+
+    @property
+    def all_alerts(self) -> List[Dict[str, Any]]:
+        return list(self._alerts)
+
+
 class RiskEngine:
     """
     Risk management engine.
@@ -55,8 +89,9 @@ class RiskEngine:
     - Loss limits
     """
     
-    def __init__(self, limits: Optional[RiskLimits] = None):
-        """Initialize risk engine with limits."""
+    def __init__(self, limits: Optional[RiskLimits] = None,
+                 alert_emitter: Optional[RiskAlertEmitter] = None):
+        """Initialize risk engine with limits and optional alert emitter (DIP)."""
         self.limits = limits or RiskLimits(
             max_position_size=Decimal("1.0"), max_total_exposure=Decimal("10.0"),
             max_positions=5, max_drawdown_pct=0.15,
@@ -65,7 +100,7 @@ class RiskEngine:
         self._daily_pnl = Decimal("0")
         self._daily_trades = 0
         self._peak_balance = self._current_balance = Decimal("1000.0")
-        self._alerts: List[Dict[str, Any]] = []
+        self._alerts = alert_emitter or RiskAlertEmitter()
         logger.info(f"Risk Engine: max_pos=${self.limits.max_position_size}, "
                     f"max_exp=${self.limits.max_total_exposure}")
 
@@ -85,7 +120,7 @@ class RiskEngine:
         if dd > self.limits.max_drawdown_pct:
             return False, f"Drawdown {dd:.1%} exceeds max {self.limits.max_drawdown_pct:.1%}"
         return True, None
-    
+
     def calculate_position_size(self, signal_confidence: float, signal_score: float,
                                 current_price: Decimal, risk_percent: float = 0.02) -> Decimal:
         """Calculate position size capped at $1.00."""
@@ -185,18 +220,9 @@ class RiskEngine:
             return current_price <= position.take_profit
     
     def _create_alert(self, alert_type: str, message: str, risk_level: RiskLevel) -> None:
-        """Create a risk alert."""
-        alert = {
-            "timestamp": datetime.now(),
-            "type": alert_type,
-            "message": message,
-            "risk_level": risk_level.value,
-        }
-        
-        self._alerts.append(alert)
-        
-        logger.warning(f"[{risk_level.value.upper()}] {alert_type}: {message}")
-    
+        """Delegate alert creation to RiskAlertEmitter (SRP)."""
+        self._alerts.emit(alert_type, message, risk_level)
+
     def get_total_exposure(self) -> Decimal:
         """Get total current exposure across all positions."""
         return sum(pos.current_size for pos in self._positions.values())
@@ -241,7 +267,7 @@ class RiskEngine:
                 "trades": self._daily_trades,
                 "pnl": float(self._daily_pnl),
             },
-            "alerts": len([a for a in self._alerts if (datetime.now() - a["timestamp"]).seconds < 3600]),
+            "alerts": self._alerts.recent_count(3600),
         }
     
     def reset_daily_stats(self) -> None:
