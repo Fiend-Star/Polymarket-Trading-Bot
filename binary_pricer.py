@@ -84,6 +84,7 @@ class BinaryOptionPrice:
     mean_reversion_adj: float = 0.0
     candle_effect_adj: float = 0.0
     seasonality_adj: float = 0.0
+    skew_adj: float = 0.0
 
     def __repr__(self):
         return (
@@ -168,6 +169,10 @@ class BinaryOptionPricer:
         recent_return_sigma: Optional[float] = None,
         # V2: Overlay toggle
         apply_overlays: bool = True,
+        # V3: Skew-adjusted binary correction (dσ/dK)
+        vol_skew: Optional[float] = None,
+        # V3: Funding rate regime bias
+        funding_bias: float = 0.0,
     ) -> BinaryOptionPrice:
         """
         Price a binary call (YES) and put (NO) using jump-diffusion + overlays.
@@ -197,6 +202,7 @@ class BinaryOptionPricer:
         mr_adj = 0.0
         candle_adj = 0.0
         season_adj = 0.0
+        skew_adj_val = 0.0
 
         # --- Step 3: Statistical overlays ---
         if apply_overlays:
@@ -206,10 +212,25 @@ class BinaryOptionPricer:
                 )
             candle_adj = self._candle_effect_adj(time_remaining_min)
             season_adj = self._seasonality_adj()
+
+            # V3: Skew-adjusted binary correction
+            # Binary_adjusted = N(d2) - Vega × dσ/dK
+            # BTC has persistent negative vol skew (OTM puts > OTM calls)
+            if vol_skew is not None and greeks["vega"] != 0:
+                skew_adj_val = -greeks["vega"] * vol_skew
+                # Clamp to reasonable range
+                skew_adj_val = max(-0.03, min(0.03, skew_adj_val))
+
             method = "adjusted"
 
+        # --- Step 4: Funding rate regime bias ---
+        # From FundingRateFilter: crowded longs → negative bias, crowded shorts → positive
+        funding_adj = max(-0.02, min(0.02, funding_bias))
+
         # --- Combine ---
-        yes_fv = max(0.01, min(0.99, yes_base + mr_adj + candle_adj + season_adj))
+        yes_fv = max(0.01, min(0.99,
+            yes_base + mr_adj + candle_adj + season_adj + skew_adj_val + funding_adj
+        ))
         no_fv = max(0.01, min(0.99, 1.0 - yes_fv))
 
         return BinaryOptionPrice(
@@ -232,6 +253,7 @@ class BinaryOptionPricer:
             mean_reversion_adj=mr_adj,
             candle_effect_adj=candle_adj,
             seasonality_adj=season_adj,
+            skew_adj=skew_adj_val,
         )
 
     # ==================================================================
@@ -394,6 +416,53 @@ class BinaryOptionPricer:
             bias *= 1.2
 
         return bias * self.SEASONALITY_SCALE
+
+    # ==================================================================
+    # V3: Vol skew estimation
+    # ==================================================================
+
+    @staticmethod
+    def estimate_btc_vol_skew(
+        spot: float,
+        strike: float,
+        vol: float,
+        time_remaining_min: float,
+    ) -> float:
+        """
+        Estimate dσ/dK (vol skew slope) for BTC at short horizons.
+
+        BTC has a persistent negative vol skew:
+        - OTM puts are more expensive than OTM calls (crash risk premium)
+        - The skew steepens at shorter horizons (0DTE effect)
+        - Research: BTC skew ~-0.1 to -0.3 per 1% moneyness at daily horizons
+
+        For 15-min binary options, the relevant metric is how vol changes
+        as strike moves relative to spot. A higher strike (OTM call) should
+        have lower IV; a lower strike (OTM put) should have higher IV.
+
+        Returns dσ/dK (change in vol per unit change in strike price).
+        Negative = typical BTC skew (OTM puts more expensive).
+        """
+        if spot <= 0 or strike <= 0 or vol <= 0:
+            return 0.0
+
+        moneyness = spot / strike  # >1 means ITM call, <1 means OTM call
+
+        # Base skew slope: -0.15 per 1% moneyness at daily horizon
+        # Steeper at shorter horizons (scale by sqrt(T_daily / T_actual))
+        T_daily = 1.0 / (365.25 * 24 * 60)  # 1 day in years
+        T_actual = max(time_remaining_min, 0.1) / (365.25 * 24 * 60)
+        time_scale = min(3.0, math.sqrt(T_daily / T_actual))
+
+        # BTC base skew: approximately -2.0 per unit moneyness at daily
+        # This means for a 1% OTM call (moneyness 0.99), IV drops ~2%
+        base_skew_per_strike = -2.0 * vol / spot  # Convert to per-dollar
+
+        # Scale by time horizon
+        skew = base_skew_per_strike * time_scale
+
+        # Clamp to prevent extreme adjustments
+        return max(-0.001, min(0.001, skew))
 
     # ==================================================================
     # Intrinsic price (edge case)
