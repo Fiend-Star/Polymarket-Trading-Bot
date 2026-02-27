@@ -93,34 +93,58 @@ def apply_gamma_markets_patch():
         logger.info("✓ Patched gamma_markets.build_markets_query (array parameter handling)")
         
         # ===== PATCH 2: Replace load_all_async to force Gamma API usage =====
-        
+        # Save a reference to the ORIGINAL native load_all_async before patching
+        _original_load_all_async = providers.PolymarketInstrumentProvider.load_all_async
+
         async def patched_load_all_async(self, filters: dict | None = None) -> None:
             """
-            FORCE using Gamma API for all market loading when use_gamma_markets=True.
-            This completely bypasses the broken CLOB API implementation.
+            Patched load_all_async that supports event_slug_builder for MARKET slugs
+            via the Gamma API (not the event API).
+
+            If event_slug_builder is configured, call it to get market slugs,
+            then use the Gamma Markets API with slug filtering.
             """
-            # Log what we're doing
+            from nautilus_trader.adapters.polymarket.providers import PolymarketInstrumentProviderConfig
+            from nautilus_trader.common.config import resolve_path
+
+            # If event_slug_builder is set, use it to build market slug filters
+            if (
+                isinstance(self._config, PolymarketInstrumentProviderConfig)
+                and self._config.event_slug_builder
+            ):
+                slug_builder = resolve_path(self._config.event_slug_builder)
+                market_slugs = slug_builder()
+                self._log.info(f"Slug builder returned {len(market_slugs)} market slugs")
+                if market_slugs:
+                    self._log.info(f"  First: {market_slugs[0]}")
+                    self._log.info(f"  Last:  {market_slugs[-1]}")
+
+                # Build filters for Gamma Markets API with slug filtering
+                slug_filters = {
+                    "active": True,
+                    "closed": False,
+                    "archived": False,
+                    "slug": list(market_slugs),
+                    "limit": 100,
+                }
+                await self._load_all_using_gamma_markets(slug_filters)
+                return
+
+            # Otherwise, use our patched Gamma API logic
             self._log.info("=" * 80)
             self._log.info("LOADING MARKETS VIA GAMMA API (PATCHED)")
             
             if filters:
                 self._log.info(f"Filters: {filters}")
-                
-                # Log time filters specifically
-                if filters.get("end_date_min"):
-                    self._log.info(f"  end_date_min: {filters['end_date_min']}")
-                if filters.get("end_date_max"):
-                    self._log.info(f"  end_date_max: {filters['end_date_max']}")
             else:
                 self._log.info("No filters applied")
             
             self._log.info("=" * 80)
             
-            # Always use Gamma API when use_gamma_markets=True
-            if self._config.use_gamma_markets:
+            # Use Gamma API if available, otherwise fall back to CLOB
+            if getattr(self._config, 'use_gamma_markets', False):
                 await self._load_all_using_gamma_markets(filters)
             else:
-                # Fall back to original method
                 self._log.warning("Falling back to CLOB API (slow, may ignore filters)")
                 await self._load_markets([], filters)
         

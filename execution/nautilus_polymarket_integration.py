@@ -172,22 +172,14 @@ class PolymarketBTCIntegration:
     def _create_nautilus_config(self) -> TradingNodeConfig:
         """Create Nautilus trading node configuration."""
         
-        # Get current and next BTC 15-min market slugs
-        btc_markets = get_next_btc_15m_markets(count=2)  # Current + next market
-        
-        # Instrument provider config - use Gamma Markets API for faster filtering
+        # Use event_slug_builder to load ONLY BTC 15-min markets
+        # This avoids load_all=True which fetches all 151k+ instruments
         instrument_cfg = PolymarketInstrumentProviderConfig(
-            load_all=False,  # Only load specific markets
-            filters={
-                "active": True,
-                "closed": False,
-                "archived": False,
-                "slug": btc_markets,  # Load current 15-min BTC market(s)
-            }
+            event_slug_builder="slug_builders:build_btc_15min_slugs",
         )
         
-        logger.info(f"Loading BTC 15-min markets: {btc_markets}")
-        
+        logger.info("Loading BTC 15-min markets via event_slug_builder")
+
         # Polymarket data client config
         poly_data_cfg = PolymarketDataClientConfig(
             private_key=os.getenv("POLYMARKET_PK"),

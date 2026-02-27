@@ -1334,37 +1334,16 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
     print(f"  Quote stability gate: {QUOTE_STABILITY_REQUIRED} valid ticks")
     print()
 
-    now = datetime.now(timezone.utc)
-    
     # =========================================================================
-    # Slug timestamps ARE standard Unix timestamps (no offset) aligned to
-    # 15-min boundaries. Generate slugs for current + next 24 hours.
+    # Use event_slug_builder to load ONLY BTC 15-min markets via slug_builders.
+    # This avoids load_all=True which would fetch all 151k+ instruments.
     # =========================================================================
-    now = datetime.now(timezone.utc)
-    unix_interval_start = (int(now.timestamp()) // 900) * 900  # current 15-min boundary
-
-    btc_slugs = []
-    for i in range(-1, 97):  # include 1 prior interval (in case we're just after boundary)
-        timestamp = unix_interval_start + (i * 900)
-        btc_slugs.append(f"btc-updown-15m-{timestamp}")
-
-    filters = {
-        "active": True,
-        "closed": False,
-        "archived": False,
-        "slug": tuple(btc_slugs),
-        "limit": 100,
-    }
-
     logger.info("=" * 80)
-    logger.info("LOADING BTC 15-MIN MARKETS BY SLUG")
-    logger.info(f"  Interval start: {unix_interval_start} | Count: {len(btc_slugs)}")
-    logger.info(f"  First: {btc_slugs[0]}  Last: {btc_slugs[-1]}")
+    logger.info("LOADING BTC 15-MIN MARKETS VIA EVENT SLUG BUILDER")
     logger.info("=" * 80)
 
     instrument_cfg = PolymarketInstrumentProviderConfig(
-        load_all=True,
-        filters=filters,
+        event_slug_builder="slug_builders:build_btc_15min_slugs",
     )
 
     poly_data_cfg = PolymarketDataClientConfig(
