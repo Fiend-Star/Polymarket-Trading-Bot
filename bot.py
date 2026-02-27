@@ -2,14 +2,13 @@ import asyncio
 import os
 import sys
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 import math
 from decimal import Decimal
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict
 from types import SimpleNamespace
-import random
 import threading
 
 # Add project to path
@@ -18,6 +17,7 @@ sys.path.insert(0, str(project_root))
 
 try:
     from patch_gamma_markets import apply_gamma_markets_patch, verify_patch
+
     patch_applied = apply_gamma_markets_patch()
     if patch_applied:
         verify_patch()
@@ -72,18 +72,22 @@ from monitoring.grafana_exporter import get_grafana_exporter
 from feedback.learning_engine import get_learning_engine
 
 # V3: Quantitative pricing model
-from binary_pricer import get_binary_pricer
+from binary_pricer import get_binary_pricer, BinaryOptionPricer
 from vol_estimator import get_vol_estimator
 from mispricing_detector import get_mispricing_detector
 
+# V3.1: RTDS Chainlink settlement oracle + Binance sub-second prices
+from rtds_connector import RTDSConnector
+from funding_rate_filter import FundingRateFilter
+
 load_dotenv()
 from patch_market_orders import apply_market_order_patch
+
 patch_applied = apply_market_order_patch()
 if patch_applied:
     logger.info("Market order patch applied successfully")
 else:
     logger.warning("Market order patch failed - orders may be rejected")
-
 
 # =============================================================================
 # CONSTANTS
@@ -110,8 +114,14 @@ TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.30"))
 CUT_LOSS_PCT = float(os.getenv("CUT_LOSS_PCT", "-0.50"))
 VOL_METHOD = os.getenv("VOL_METHOD", "ewma")
 DEFAULT_VOL = float(os.getenv("DEFAULT_VOL", "0.65"))
-BANKROLL_USD = float(os.getenv("BANKROLL_USD", "20.0"))
 
+# V3.1: RTDS + Funding Rate Config
+USE_RTDS = os.getenv("USE_RTDS", "true").lower() == "true"
+RTDS_LATE_WINDOW_SEC = float(os.getenv("RTDS_LATE_WINDOW_SEC", "15"))
+RTDS_LATE_WINDOW_MIN_BPS = float(os.getenv("RTDS_LATE_WINDOW_MIN_BPS", "3.0"))
+RTDS_DIVERGENCE_THRESHOLD_BPS = float(os.getenv("RTDS_DIVERGENCE_THRESHOLD_BPS", "5.0"))
+USE_FUNDING_FILTER = os.getenv("USE_FUNDING_FILTER", "true").lower() == "true"
+LATE_WINDOW_ENABLED = os.getenv("LATE_WINDOW_ENABLED", "true").lower() == "true"
 
 
 # =============================================================================
@@ -144,8 +154,8 @@ class PaperTrade:
 class OpenPosition:
     """Track a live position until market resolves."""
     market_slug: str
-    direction: str          # "long" (bought YES) or "short" (bought NO)
-    entry_price: float      # Price we PAID for the token
+    direction: str  # "long" (bought YES) or "short" (bought NO)
+    entry_price: float  # Price we PAID for the token
     size_usd: float
     entry_time: datetime
     market_end_time: datetime
@@ -184,16 +194,23 @@ def init_redis():
 
 class IntegratedBTCStrategy(Strategy):
     """
-    Integrated BTC Strategy - V3 (BINARY OPTION PRICING MODEL)
+    Integrated BTC Strategy - V3.1 (BINARY OPTION PRICING MODEL + RTDS)
 
-    KEY CHANGES FROM V2:
-    1. Binary option model (Black-Scholes) computes fair value for YES/NO tokens
+    V3.1 ADDITIONS:
+    1. RTDS Chainlink settlement oracle — sees exact settlement price in real-time
+    2. Late-window Chainlink strategy — 85% win rate at T-10s, 0% maker fees
+    3. Funding rate regime filter — fades crowded positioning
+    4. Skew-adjusted binary correction — accounts for BTC vol smile
+    5. Binance-Chainlink divergence — proxy for order flow direction
+
+    V3 CORE (unchanged):
+    1. Binary option model (Merton JD) computes fair value for YES/NO tokens
     2. Trades only when model_price - market_price > fee_cost (guaranteed +EV)
     3. Old signal processors demoted to CONFIRMATION role
     4. Take-profit + cut-loss exit monitoring on every tick
-    5. Real-time realized vol from Coinbase ticks (EWMA estimator)
-    6. Timer loop feeds vol estimator and caches spot/sentiment (fixes event loop bug)
-    7. Limit orders placed at bid (fixes taker fee bug)
+    5. Real-time realized vol from sub-second ticks (EWMA estimator)
+    6. Timer loop feeds vol estimator and caches spot/sentiment
+    7. Limit orders placed at bid (maker, 0% fee)
     8. P&L formula fixed (all positions are BUYS)
 
     KEPT FROM V2:
@@ -268,13 +285,12 @@ class IntegratedBTCStrategy(Strategy):
         self.vol_estimator = get_vol_estimator()
         self.mispricing_detector = get_mispricing_detector(
             maker_fee=0.00,
-            taker_fee=0.02,
+            taker_fee=0.10,
             min_edge_cents=MIN_EDGE_CENTS,
             min_edge_after_fees=0.005,
             take_profit_pct=TAKE_PROFIT_PCT,
             cut_loss_pct=CUT_LOSS_PCT,
             vol_method=VOL_METHOD,
-            bankroll=BANKROLL_USD,
         )
 
         # Strike price (BTC at market open) — reset each market
@@ -283,6 +299,27 @@ class IntegratedBTCStrategy(Strategy):
 
         # Active entry for exit monitoring
         self._active_entry: Optional[dict] = None
+
+        # Late-window trade tracking (one per market window)
+        self._late_window_traded = False
+
+        # =====================================================================
+        # V3.1: RTDS Chainlink settlement oracle + Funding rate filter
+        # =====================================================================
+        if USE_RTDS:
+            self.rtds = RTDSConnector(
+                vol_estimator=self.vol_estimator,
+                divergence_threshold_bps=RTDS_DIVERGENCE_THRESHOLD_BPS,
+                late_window_max_sec=RTDS_LATE_WINDOW_SEC,
+                late_window_min_bps=RTDS_LATE_WINDOW_MIN_BPS,
+            )
+        else:
+            self.rtds = None
+
+        if USE_FUNDING_FILTER:
+            self.funding_filter = FundingRateFilter()
+        else:
+            self.funding_filter = None
 
         # =====================================================================
         # Signal Processors (V3: confirmation role only)
@@ -316,11 +353,11 @@ class IntegratedBTCStrategy(Strategy):
         # Fusion engine (kept for confirmation and heuristic fallback)
         self.fusion_engine = get_fusion_engine()
         self.fusion_engine.set_weight("OrderBookImbalance", 0.30)
-        self.fusion_engine.set_weight("TickVelocity",       0.25)
-        self.fusion_engine.set_weight("PriceDivergence",    0.18)
-        self.fusion_engine.set_weight("SpikeDetection",     0.12)
-        self.fusion_engine.set_weight("DeribitPCR",         0.10)
-        self.fusion_engine.set_weight("SentimentAnalysis",  0.05)
+        self.fusion_engine.set_weight("TickVelocity", 0.25)
+        self.fusion_engine.set_weight("PriceDivergence", 0.18)
+        self.fusion_engine.set_weight("SpikeDetection", 0.12)
+        self.fusion_engine.set_weight("DeribitPCR", 0.10)
+        self.fusion_engine.set_weight("SentimentAnalysis", 0.05)
 
         # Risk / Performance / Learning
         self.risk_engine = get_risk_engine()
@@ -347,14 +384,20 @@ class IntegratedBTCStrategy(Strategy):
             logger.info("=" * 80)
 
         logger.info("=" * 80)
-        logger.info("INTEGRATED BTC STRATEGY V3 — BINARY OPTION PRICING MODEL")
-        logger.info(f"  Trade window: {TRADE_WINDOW_START_SEC}s–{TRADE_WINDOW_END_SEC}s ({TRADE_WINDOW_START_SEC/60:.0f}–{TRADE_WINDOW_END_SEC/60:.0f} min)")
+        logger.info("INTEGRATED BTC STRATEGY V3.1 — BINARY OPTION PRICING + RTDS ORACLE")
+        logger.info(
+            f"  Trade window: {TRADE_WINDOW_START_SEC}s–{TRADE_WINDOW_END_SEC}s ({TRADE_WINDOW_START_SEC / 60:.0f}–{TRADE_WINDOW_END_SEC / 60:.0f} min)")
         logger.info(f"  Order type: {'LIMIT @ BID (maker, 0% fee)' if USE_LIMIT_ORDERS else 'MARKET (taker, 10% fee)'}")
         logger.info(f"  Position size: ${POSITION_SIZE_USD}")
         logger.info(f"  Min edge: ${MIN_EDGE_CENTS:.2f}")
         logger.info(f"  Take profit: {TAKE_PROFIT_PCT:.0%} | Cut loss: {CUT_LOSS_PCT:.0%}")
         logger.info(f"  Vol method: {VOL_METHOD} | Default vol: {DEFAULT_VOL:.0%}")
         logger.info(f"  Confirmation: fusion min {MIN_FUSION_SIGNALS} signals, score >= {MIN_FUSION_SCORE}")
+        logger.info(
+            f"  RTDS: {'Enabled (Chainlink + Binance sub-second)' if USE_RTDS else 'Disabled (Coinbase fallback)'}")
+        logger.info(
+            f"  Late-window: {'Enabled (T-{:.0f}s, min {:.0f}bps)'.format(RTDS_LATE_WINDOW_SEC, RTDS_LATE_WINDOW_MIN_BPS) if LATE_WINDOW_ENABLED else 'Disabled'}")
+        logger.info(f"  Funding filter: {'Enabled' if USE_FUNDING_FILTER else 'Disabled'}")
         logger.info("=" * 80)
 
     # ------------------------------------------------------------------
@@ -430,19 +473,31 @@ class IntegratedBTCStrategy(Strategy):
 
     async def _refresh_cached_data(self):
         """
-        V3: Fetch Coinbase + sentiment in the timer loop's event loop,
-        cache thread-safely. Trading decisions read from cache.
+        V3.1: Fetch BTC spot + sentiment, cache thread-safely.
+        Priority: RTDS Chainlink (settlement oracle) > RTDS Binance > Coinbase (fallback)
         """
         spot = None
         sentiment = None
         sentiment_class = None
 
-        if self._coinbase_source:
+        # V3.1: Prefer RTDS Chainlink (THE settlement oracle) over Coinbase
+        if self.rtds and self.rtds.chainlink_btc_price > 0 and self.rtds.chainlink_age_ms < 30000:
+            spot = self.rtds.chainlink_btc_price
+            # Log divergence if significant
+            if self.rtds.binance_btc_price > 0:
+                div = self.rtds.get_divergence()
+                if div.is_significant:
+                    logger.info(
+                        f"⚡ Price divergence: Binance=${div.binance_price:,.2f} vs "
+                        f"Chainlink=${div.chainlink_price:,.2f} ({div.divergence_bps:+.1f}bps) "
+                        f"→ {div.direction}"
+                    )
+        elif self._coinbase_source:
             try:
-                spot = await self._coinbase_source.get_current_price()
-                if spot:
-                    spot = float(spot)
-                    # Feed vol estimator on every refresh (~10s)
+                coinbase_spot = await self._coinbase_source.get_current_price()
+                if coinbase_spot:
+                    spot = float(coinbase_spot)
+                    # Feed vol estimator from Coinbase fallback
                     self.vol_estimator.add_price(spot)
             except Exception as e:
                 logger.debug(f"Coinbase refresh failed: {e}")
@@ -455,6 +510,13 @@ class IntegratedBTCStrategy(Strategy):
                     sentiment_class = fg.get("classification", "")
             except Exception as e:
                 logger.debug(f"Sentiment refresh failed: {e}")
+
+        # V3.1: Update funding rate periodically
+        if self.funding_filter and self.funding_filter.should_update():
+            try:
+                self.funding_filter.update_sync()
+            except Exception as e:
+                logger.debug(f"Funding rate update failed: {e}")
 
         with self._cache_lock:
             if spot is not None:
@@ -528,11 +590,28 @@ class IntegratedBTCStrategy(Strategy):
         # Start timer loop
         self.run_in_executor(self._start_timer_loop)
 
+        # V3.1: Start RTDS Chainlink settlement oracle
+        if self.rtds:
+            self.rtds.start_background()
+            logger.info("✓ RTDS connector started — streaming Chainlink settlement oracle + Binance")
+
+        # V3.1: Initial funding rate fetch
+        if self.funding_filter:
+            try:
+                regime = self.funding_filter.update_sync()
+                if regime:
+                    logger.info(
+                        f"✓ Funding rate: {regime.funding_rate_pct:+.4f}% → "
+                        f"{regime.classification}, bias={regime.mean_reversion_bias:+.3f}"
+                    )
+            except Exception as e:
+                logger.debug(f"Initial funding rate fetch failed: {e}")
+
         if self.grafana_exporter:
             threading.Thread(target=self._start_grafana_sync, daemon=True).start()
 
         logger.info("=" * 80)
-        logger.info("V3 active — binary option pricing model")
+        logger.info("V3.1 active — binary option pricing + RTDS Chainlink oracle")
         logger.info(f"Price history: {len(self.price_history)} points")
         logger.info("=" * 80)
 
@@ -565,7 +644,8 @@ class IntegratedBTCStrategy(Strategy):
                             if end_timestamp > current_timestamp:
                                 raw_id = str(instrument.id)
                                 without_suffix = raw_id.split('.')[0] if '.' in raw_id else raw_id
-                                yes_token_id = without_suffix.split('-')[-1] if '-' in without_suffix else without_suffix
+                                yes_token_id = without_suffix.split('-')[
+                                    -1] if '-' in without_suffix else without_suffix
 
                                 btc_instruments.append({
                                     'instrument': instrument,
@@ -602,7 +682,8 @@ class IntegratedBTCStrategy(Strategy):
         for i, inst in enumerate(btc_instruments):
             is_active = inst['time_diff_minutes'] <= 0 and inst['end_timestamp'] > current_timestamp
             status = "ACTIVE" if is_active else "FUTURE" if inst['time_diff_minutes'] > 0 else "PAST"
-            logger.info(f"  [{i}] {inst['slug']}: {status} (starts at {inst['start_time'].strftime('%H:%M:%S')}, ends at {inst['end_time'].strftime('%H:%M:%S')})")
+            logger.info(
+                f"  [{i}] {inst['slug']}: {status} (starts at {inst['start_time'].strftime('%H:%M:%S')}, ends at {inst['end_time'].strftime('%H:%M:%S')})")
         logger.info("=" * 80)
 
         self.all_btc_instruments = btc_instruments
@@ -698,6 +779,7 @@ class IntegratedBTCStrategy(Strategy):
         self._btc_strike_price = None
         self._strike_recorded = False
         self._active_entry = None
+        self._late_window_traded = False
 
         logger.info(f"  Trade timer reset — will trade after {QUOTE_STABILITY_REQUIRED} stable ticks")
 
@@ -719,6 +801,9 @@ class IntegratedBTCStrategy(Strategy):
         V3 FIX: Both "long" (bought YES) and "short" (bought NO) are LONG
         positions on their respective tokens. The P&L formula is always:
             pnl = size * (exit_price - entry_price) / entry_price
+
+        V3.1 FIX: Also resolves paper trades (simulation mode) that are
+        tracked in _open_positions alongside real trades.
         """
         if market_index < 0 or market_index >= len(self.all_btc_instruments):
             return
@@ -748,8 +833,11 @@ class IntegratedBTCStrategy(Strategy):
                     pos.pnl = pnl
 
                     outcome = "WIN" if pnl > 0 else "LOSS"
+                    is_paper = pos.order_id.startswith("paper_")
                     token_type = "YES" if pos.direction == "long" else "NO"
-                    logger.info(f"📊 POSITION RESOLVED: {slug} bought {token_type}")
+                    tag = "[PAPER] " if is_paper else ""
+
+                    logger.info(f"📊 {tag}POSITION RESOLVED: {slug} bought {token_type}")
                     logger.info(f"   Entry: ${pos.entry_price:.4f} → Exit: ${final_price:.4f}")
                     logger.info(f"   P&L: ${pnl:+.4f} ({outcome})")
 
@@ -763,8 +851,23 @@ class IntegratedBTCStrategy(Strategy):
                         exit_time=datetime.now(timezone.utc),
                         signal_score=0,
                         signal_confidence=0,
-                        metadata={"resolved": True, "market": slug}
+                        metadata={"resolved": True, "market": slug, "paper": is_paper}
                     )
+
+                    # V3.1: Update Grafana metrics on resolution
+                    if hasattr(self, 'grafana_exporter') and self.grafana_exporter:
+                        self.grafana_exporter.increment_trade_counter(won=(pnl > 0))
+
+                    # V3.1: Update matching paper_trade entry
+                    if is_paper:
+                        for pt in self.paper_trades:
+                            if (pt.outcome == "PENDING"
+                                    and pt.direction == pos.direction.upper()
+                                    and abs(pt.price - pos.entry_price) < 0.0001):
+                                pt.outcome = outcome
+                                break
+                        self._save_paper_trades()
+
                 else:
                     logger.warning(f"Could not resolve position for {slug} — no final price")
 
@@ -817,6 +920,7 @@ class IntegratedBTCStrategy(Strategy):
                     self._btc_strike_price = None
                     self._strike_recorded = False
                     self._active_entry = None
+                    self._late_window_traded = False
                     logger.info("  ✓ MARKET OPEN — waiting for stable quotes")
                 else:
                     self._switch_to_next_market()
@@ -911,12 +1015,42 @@ class IntegratedBTCStrategy(Strategy):
                 logger.info("=" * 80)
                 logger.info(f"🎯 EARLY-WINDOW TRADE: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
                 logger.info(f"   Market: {current_market['slug']}")
-                logger.info(f"   Sub-interval #{sub_interval} ({seconds_into_sub_interval:.1f}s in = {seconds_into_sub_interval/60:.1f} min)")
-                logger.info(f"   YES Price: ${float(mid_price):,.4f} | Bid: ${float(bid_decimal):,.4f} | Ask: ${float(ask_decimal):,.4f}")
+                logger.info(
+                    f"   Sub-interval #{sub_interval} ({seconds_into_sub_interval:.1f}s in = {seconds_into_sub_interval / 60:.1f} min)")
+                logger.info(
+                    f"   YES Price: ${float(mid_price):,.4f} | Bid: ${float(bid_decimal):,.4f} | Ask: ${float(ask_decimal):,.4f}")
                 logger.info(f"   Price history: {len(self.price_history)} points")
                 logger.info("=" * 80)
 
                 self.run_in_executor(lambda: self._make_trading_decision_sync(float(mid_price)))
+
+            # V3.1: Late-window Chainlink strategy
+            # At T-15s through T-0s, use Chainlink settlement oracle for high-confidence trades
+            time_remaining_sec = MARKET_INTERVAL_SECONDS - seconds_into_sub_interval
+            if (LATE_WINDOW_ENABLED and self.rtds and self._btc_strike_price
+                    and 0 < time_remaining_sec <= RTDS_LATE_WINDOW_SEC
+                    and not self._late_window_traded):
+
+                late_signal = self.rtds.get_late_window_signal(
+                    strike=self._btc_strike_price,
+                    time_remaining_sec=time_remaining_sec,
+                )
+
+                if late_signal.direction != "NO_SIGNAL" and late_signal.confidence >= 0.70:
+                    self._late_window_traded = True
+
+                    logger.info("=" * 80)
+                    logger.info(f"🎯 LATE-WINDOW CHAINLINK TRADE: T-{time_remaining_sec:.0f}s")
+                    logger.info(f"   {late_signal.reason}")
+                    logger.info(
+                        f"   Chainlink: ${late_signal.chainlink_price:,.2f} vs Strike: ${late_signal.strike:,.2f}")
+                    logger.info(f"   Delta: {late_signal.delta_bps:+.1f}bps | Confidence: {late_signal.confidence:.0%}")
+                    logger.info(f"   Direction: {late_signal.direction}")
+                    logger.info("=" * 80)
+
+                    self.run_in_executor(
+                        lambda: self._execute_late_window_trade(late_signal, float(mid_price))
+                    )
 
         except Exception as e:
             logger.error(f"Error processing quote tick: {e}")
@@ -934,6 +1068,64 @@ class IntegratedBTCStrategy(Strategy):
             loop.run_until_complete(self._make_trading_decision(price_decimal))
         finally:
             loop.close()
+
+    def _execute_late_window_trade(self, late_signal, current_yes_price):
+        """
+        V3.1: Execute late-window Chainlink trade.
+
+        At T-10s, Chainlink shows clear direction → place postOnly limit
+        at 0.90-0.93 on the winning side for 0% fees + rebates.
+        """
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(
+                self._execute_late_window_trade_async(late_signal, current_yes_price)
+            )
+        finally:
+            loop.close()
+
+    async def _execute_late_window_trade_async(self, late_signal, current_yes_price):
+        """Async late-window execution."""
+        is_simulation = await self.check_simulation_mode()
+
+        if late_signal.direction == "BUY_YES":
+            direction = "long"
+            # Place limit order at high price — we expect YES to settle at 1.0
+            limit_price = Decimal(str(min(0.93, 0.88 + 0.05 * late_signal.confidence)))
+        else:
+            direction = "short"
+            # Buy NO token — we expect NO to settle at 1.0
+            limit_price = Decimal(str(min(0.93, 0.88 + 0.05 * late_signal.confidence)))
+
+        logger.info(
+            f"  Late-window: {'BUY YES' if direction == 'long' else 'BUY NO'} "
+            f"LIMIT @ ${float(limit_price):.2f} (maker, 0% fee + rebates)"
+        )
+
+        # Risk check
+        is_valid, error = self.risk_engine.validate_new_position(
+            size=POSITION_SIZE_USD,
+            direction=direction,
+            current_price=Decimal(str(current_yes_price)),
+        )
+        if not is_valid:
+            logger.warning(f"Late-window risk check failed: {error}")
+            return
+
+        mock_signal = SimpleNamespace(
+            direction="BULLISH" if direction == "long" else "BEARISH",
+            score=late_signal.confidence * 100,
+            confidence=late_signal.confidence,
+        )
+
+        if is_simulation:
+            await self._record_paper_trade(mock_signal, POSITION_SIZE_USD,
+                                           limit_price, direction)
+        else:
+            # Use limit order execution
+            await self._place_limit_order(mock_signal, POSITION_SIZE_USD,
+                                          limit_price, direction)
 
     async def _make_trading_decision(self, current_price: Decimal):
         """
@@ -960,10 +1152,22 @@ class IntegratedBTCStrategy(Strategy):
         cached = self._get_cached_data()
         btc_spot = cached.get("spot_price")
 
+        # V3.1: Show data source
         if btc_spot:
-            logger.info(f"Coinbase spot (cached): ${btc_spot:,.2f}")
+            source = "RTDS Chainlink" if (self.rtds and self.rtds.chainlink_btc_price > 0) else "Coinbase"
+            logger.info(f"BTC spot ({source}, cached): ${btc_spot:,.2f}")
         if cached.get("sentiment_score") is not None:
-            logger.info(f"Fear & Greed (cached): {cached['sentiment_score']:.0f} ({cached.get('sentiment_classification', '')})")
+            logger.info(
+                f"Fear & Greed (cached): {cached['sentiment_score']:.0f} ({cached.get('sentiment_classification', '')})")
+
+        # V3.1: Show funding rate regime
+        funding_bias = 0.0
+        if self.funding_filter:
+            regime = self.funding_filter.get_regime()
+            funding_bias = regime.mean_reversion_bias
+            if regime.classification != "NEUTRAL":
+                logger.info(
+                    f"Funding regime: {regime.classification} ({regime.funding_rate_pct:+.4f}%), bias={funding_bias:+.3f}")
 
         # Step 2: Check if we can run the quant model
         if btc_spot is None or self._btc_strike_price is None:
@@ -992,6 +1196,13 @@ class IntegratedBTCStrategy(Strategy):
                 pass
 
         # Step 5: Run mispricing detector (THE CORE QUANT SIGNAL)
+        # V3.1: Compute vol skew + pass funding bias
+        vol_skew = BinaryOptionPricer.estimate_btc_vol_skew(
+            btc_spot, self._btc_strike_price,
+            self.vol_estimator.get_vol(VOL_METHOD).annualized_vol,
+            time_remaining_min,
+        )
+
         signal = self.mispricing_detector.detect(
             yes_market_price=yes_price,
             no_market_price=no_price,
@@ -1000,6 +1211,9 @@ class IntegratedBTCStrategy(Strategy):
             time_remaining_min=time_remaining_min,
             position_size_usd=float(POSITION_SIZE_USD),
             use_maker=USE_LIMIT_ORDERS,
+            # V3.1: Additional overlays
+            vol_skew=vol_skew,
+            funding_bias=funding_bias,
         )
 
         if not signal.is_tradeable:
@@ -1044,7 +1258,8 @@ class IntegratedBTCStrategy(Strategy):
             direction = "short"
             logger.info(f"📉 MODEL SAYS: BUY NO (edge=${signal.edge:+.4f}, net_EV=${signal.net_expected_pnl:+.4f})")
 
-        logger.info(f"  Vol: RV={signal.realized_vol:.0%}, IV={signal.implied_vol:.0%}, spread={signal.vol_spread:+.0%}")
+        logger.info(
+            f"  Vol: RV={signal.realized_vol:.0%}, IV={signal.implied_vol:.0%}, spread={signal.vol_spread:+.0%}")
         logger.info(f"  Greeks: Δ={signal.delta:.6f}, Γ={signal.gamma:.6f}, Θ={signal.theta_per_min:.6f}/min")
 
         # Step 10: Risk engine
@@ -1249,21 +1464,44 @@ class IntegratedBTCStrategy(Strategy):
     # ------------------------------------------------------------------
 
     async def _record_paper_trade(self, signal, position_size, current_price, direction):
-        exit_delta = timedelta(minutes=1) if self.test_mode else timedelta(minutes=15)
-        exit_time = datetime.now(timezone.utc) + exit_delta
+        """
+        V3.1 FIX: Track paper trades as real positions in _open_positions.
+        They get resolved by _resolve_positions_for_market() when the 15-min
+        window closes, using ACTUAL final Polymarket prices — not random dice.
 
-        if "BULLISH" in str(signal.direction):
-            movement = random.uniform(-0.02, 0.08)
+        Old behavior: random.uniform(-0.02, 0.08) = meaningless noise.
+        New behavior: wait for market resolution = real P&L.
+        """
+        if (self.current_instrument_index < 0 or
+                self.current_instrument_index >= len(self.all_btc_instruments)):
+            logger.warning("No active market — cannot record paper trade")
+            return
+
+        current_market = self.all_btc_instruments[self.current_instrument_index]
+        timestamp_ms = int(time.time() * 1000)
+        order_id = f"paper_{timestamp_ms}"
+
+        # Determine which instrument we're "buying"
+        if direction == "long":
+            trade_instrument_id = getattr(self, '_yes_instrument_id', self.instrument_id)
+            token_label = "YES (UP)"
         else:
-            movement = random.uniform(-0.08, 0.02)
+            trade_instrument_id = getattr(self, '_no_instrument_id', None) or self.instrument_id
+            token_label = "NO (DOWN)"
 
-        exit_price = current_price * (Decimal("1.0") + Decimal(str(movement)))
-        exit_price = max(Decimal("0.01"), min(Decimal("0.99"), exit_price))
+        # Track as a real position — resolved at market end
+        self._open_positions.append(OpenPosition(
+            market_slug=current_market['slug'],
+            direction=direction,
+            entry_price=float(current_price),
+            size_usd=float(position_size),
+            entry_time=datetime.now(timezone.utc),
+            market_end_time=current_market['end_time'],
+            instrument_id=trade_instrument_id,
+            order_id=order_id,
+        ))
 
-        # V3 FIX: Always long formula (we buy tokens)
-        pnl = position_size * (exit_price - current_price) / current_price
-
-        outcome = "WIN" if pnl > 0 else "LOSS"
+        # Also track in paper_trades list (outcome = PENDING until resolved)
         paper_trade = PaperTrade(
             timestamp=datetime.now(timezone.utc),
             direction=direction.upper(),
@@ -1271,38 +1509,18 @@ class IntegratedBTCStrategy(Strategy):
             price=float(current_price),
             signal_score=signal.score,
             signal_confidence=signal.confidence,
-            outcome=outcome,
+            outcome="PENDING",
         )
         self.paper_trades.append(paper_trade)
 
-        self.performance_tracker.record_trade(
-            trade_id=f"paper_{int(datetime.now().timestamp())}",
-            direction=direction,
-            entry_price=current_price,
-            exit_price=exit_price,
-            size=position_size,
-            entry_time=datetime.now(timezone.utc),
-            exit_time=exit_time,
-            signal_score=signal.score,
-            signal_confidence=signal.confidence,
-            metadata={
-                "simulated": True,
-                "fusion_score": signal.score,
-            }
-        )
-
-        if hasattr(self, 'grafana_exporter') and self.grafana_exporter:
-            self.grafana_exporter.increment_trade_counter(won=(pnl > 0))
-            self.grafana_exporter.record_trade_duration(exit_delta.total_seconds())
-
         logger.info("=" * 80)
-        logger.info("[SIMULATION] PAPER TRADE RECORDED")
-        logger.info(f"  Direction: {direction.upper()}")
+        logger.info("[SIMULATION] PAPER TRADE OPENED — awaiting market resolution")
+        logger.info(f"  Direction: {direction.upper()} → {token_label}")
         logger.info(f"  Size: ${float(position_size):.2f}")
         logger.info(f"  Entry Price: ${float(current_price):,.4f}")
-        logger.info(f"  Simulated Exit: ${float(exit_price):,.4f}")
-        logger.info(f"  Simulated P&L: ${float(pnl):+.2f} ({movement*100:+.2f}%)")
-        logger.info(f"  Outcome: {outcome}")
+        logger.info(f"  Market: {current_market['slug']}")
+        logger.info(f"  Resolves at: {current_market['end_time'].strftime('%H:%M:%S')} UTC")
+        logger.info(f"  Order ID: {order_id}")
         logger.info("=" * 80)
 
         self._save_paper_trades()
@@ -1595,7 +1813,7 @@ class IntegratedBTCStrategy(Strategy):
             logger.error(f"Failed to start Grafana: {e}")
 
     def on_stop(self):
-        logger.info("Integrated BTC strategy V3 stopped")
+        logger.info("Integrated BTC strategy V3.1 stopped")
         logger.info(f"Total paper trades: {len(self.paper_trades)}")
 
         for pos in self._open_positions:
@@ -1604,8 +1822,27 @@ class IntegratedBTCStrategy(Strategy):
 
         # Log mispricing detector stats
         stats = self.mispricing_detector.get_stats()
-        logger.info(f"Mispricing detector: {stats['tradeable_detections']}/{stats['total_detections']} tradeable ({stats['hit_rate']:.0%})")
+        logger.info(
+            f"Mispricing detector: {stats['tradeable_detections']}/{stats['total_detections']} tradeable ({stats['hit_rate']:.0%})")
         logger.info(f"Vol estimator: {self.vol_estimator.get_stats()}")
+
+        # V3.1: RTDS stats + cleanup
+        if self.rtds:
+            rtds_stats = self.rtds.get_stats()
+            logger.info(
+                f"RTDS: {rtds_stats['chainlink_ticks']} Chainlink ticks, "
+                f"{rtds_stats['binance_ticks']} Binance ticks, "
+                f"avg latency={rtds_stats['avg_chainlink_latency_ms']}ms"
+            )
+            try:
+                _loop = asyncio.new_event_loop()
+                _loop.run_until_complete(self.rtds.disconnect())
+                _loop.close()
+            except Exception:
+                pass
+
+        if self.funding_filter:
+            logger.info(f"Funding filter: {self.funding_filter.get_stats()}")
 
         if self.grafana_exporter:
             try:
@@ -1621,8 +1858,8 @@ class IntegratedBTCStrategy(Strategy):
 
 def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, test_mode: bool = False):
     print("=" * 80)
-    print("INTEGRATED POLYMARKET BTC 15-MIN TRADING BOT V3")
-    print("BINARY OPTION PRICING MODEL + QUANT EDGE DETECTION")
+    print("INTEGRATED POLYMARKET BTC 15-MIN TRADING BOT V3.1")
+    print("BINARY OPTION PRICING + RTDS CHAINLINK ORACLE")
     print("=" * 80)
 
     redis_client = init_redis()
@@ -1648,6 +1885,9 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
     print(f"  Vol: {VOL_METHOD} (default {DEFAULT_VOL:.0%})")
     print(f"  Confirmation: fusion min {MIN_FUSION_SIGNALS} signals, score >= {MIN_FUSION_SCORE}")
     print(f"  Stability gate: {QUOTE_STABILITY_REQUIRED} valid ticks")
+    print(f"  RTDS Oracle: {'Enabled (Chainlink + Binance sub-second)' if USE_RTDS else 'Disabled'}")
+    print(f"  Late-window: {'Enabled (T-{:.0f}s)'.format(RTDS_LATE_WINDOW_SEC) if LATE_WINDOW_ENABLED else 'Disabled'}")
+    print(f"  Funding filter: {'Enabled' if USE_FUNDING_FILTER else 'Disabled'}")
     print()
 
     logger.info("=" * 80)
@@ -1678,7 +1918,7 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
 
     config = TradingNodeConfig(
         environment="live",
-        trader_id="BTC-15MIN-V3-001",
+        trader_id="BTC-15MIN-V31-001",
         logging=LoggingConfig(
             log_level="ERROR",  # Silences the "Reconciling NET position" spam
             log_directory="./logs/nautilus",

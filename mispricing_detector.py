@@ -270,6 +270,9 @@ class MispricingDetector:
         time_remaining_min: float,
         position_size_usd: float = 1.0,
         use_maker: bool = True,
+        # V3: Additional overlays
+        vol_skew: Optional[float] = None,
+        funding_bias: float = 0.0,
     ) -> MispricingSignal:
         """
         Detect mispricing between model and market.
@@ -299,6 +302,9 @@ class MispricingDetector:
             recent_return=return_stats.recent_return,
             recent_return_sigma=return_stats.recent_return_sigma,
             apply_overlays=True,
+            # V3: Skew + funding overlays
+            vol_skew=vol_skew,
+            funding_bias=funding_bias,
         )
 
         # ---- Step 3: Implied vol (BSM-based, standard) ----
