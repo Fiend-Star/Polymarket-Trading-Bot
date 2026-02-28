@@ -1,86 +1,32 @@
 import os
 import asyncio
-import math
 from decimal import Decimal
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from loguru import logger
 from dotenv import load_dotenv
 
 from nautilus_trader.adapters.polymarket import POLYMARKET
-from nautilus_trader.adapters.polymarket import (
-    PolymarketDataClientConfig,
-    PolymarketExecClientConfig,
-)
+from nautilus_trader.adapters.polymarket import PolymarketDataClientConfig, PolymarketExecClientConfig
 from nautilus_trader.adapters.polymarket.factories import (
-    PolymarketLiveDataClientFactory,
-    PolymarketLiveExecClientFactory,
-)
+    PolymarketLiveDataClientFactory, PolymarketLiveExecClientFactory)
 from nautilus_trader.adapters.polymarket.providers import PolymarketInstrumentProviderConfig
 from nautilus_trader.config import (
-    LiveDataEngineConfig,
-    LiveExecEngineConfig,
-    LiveRiskEngineConfig,
-    LoggingConfig,
-    TradingNodeConfig,
-)
+    LiveDataEngineConfig, LiveExecEngineConfig, LiveRiskEngineConfig,
+    LoggingConfig, TradingNodeConfig)
 from nautilus_trader.live.node import TradingNode
-from nautilus_trader.model.enums import OrderSide, OrderType, TimeInForce
+from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.objects import Quantity, Price
 from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId
 from nautilus_trader.trading.strategy import Strategy
 
+from execution.polymarket_slug_utils import (
+    current_btc_15m_slug, get_next_btc_15m_markets, IntegrationQueryMixin)
+
 load_dotenv()
 
 
-def current_btc_15m_slug() -> str:
-    """
-    Get the current BTC 15-minute market slug.
-    
-    Polymarket BTC 15-min markets follow the pattern:
-    btc-updown-15m-{unix_timestamp}
-    
-    Where unix_timestamp is the start of the 15-minute interval.
-    
-    Returns:
-        Current market slug (e.g., "btc-updown-15m-1739461800")
-    """
-    now = datetime.now(timezone.utc)
-    unix_s = int(now.timestamp())
-    interval_start = math.floor(unix_s / 900) * 900  # 900 = 15×60
-    slug = f"btc-updown-15m-{interval_start}"
-    
-    logger.info(f"Current BTC 15-min market slug: {slug}")
-    return slug
-
-
-def get_next_btc_15m_markets(count: int = 3) -> list[str]:
-    """
-    Get the next N BTC 15-minute market slugs.
-    
-    Useful for pre-loading markets that will be active soon.
-    
-    Args:
-        count: Number of future markets to include
-        
-    Returns:
-        List of market slugs including current and future markets
-    """
-    now = datetime.now(timezone.utc)
-    unix_s = int(now.timestamp())
-    interval_start = math.floor(unix_s / 900) * 900
-    
-    slugs = []
-    for i in range(count):
-        timestamp = interval_start + (i * 900)
-        slug = f"btc-updown-15m-{timestamp}"
-        slugs.append(slug)
-    
-    logger.info(f"BTC 15-min market slugs (next {count}): {slugs}")
-    return slugs
-
-
-class PolymarketBTCIntegration:
+class PolymarketBTCIntegration(IntegrationQueryMixin):
     """
     Integration layer between BTC strategy and Polymarket via Nautilus.
     
@@ -243,6 +189,7 @@ class PolymarketBTCIntegration:
                 quote_quantity=False, time_in_force=TimeInForce.GTC)
             logger.info(f"Limit: {order_side.name} {token_qty:.6f} @ ${limit_price:.4f}")
             self.node.trader.submit_order(order)
+
             self.orders_submitted += 1
             return oid
         except Exception as e:

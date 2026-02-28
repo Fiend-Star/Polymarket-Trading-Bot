@@ -13,6 +13,7 @@ from decimal import Decimal
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Callable
 from dataclasses import dataclass
+from execution.position_lifecycle import PositionLifecycleMixin
 from enum import Enum
 from loguru import logger
 
@@ -80,7 +81,7 @@ class Order:
             self.metadata = {}
 
 
-class ExecutionEngine:
+class ExecutionEngine(PositionLifecycleMixin):
     """
     Execution engine that manages order lifecycle.
     
@@ -222,85 +223,9 @@ class ExecutionEngine:
         if self.on_position_opened:
             await self.on_position_opened(position)
 
-    def _should_exit(self, position, current_price, level_key, long_cmp, short_cmp):
-        """Check if position should exit at given level."""
-        level = position.get(level_key)
-        if not level:
-            return False
-        if position["direction"] == "long":
-            return long_cmp(current_price, level)
-        return short_cmp(current_price, level)
-
-    async def close_position(self, position_id: str, exit_price: Decimal,
-                             reason: str = "manual") -> Optional[Decimal]:
-        """Close a position. Returns realized P&L or None."""
-        if position_id not in self._positions:
-            logger.error(f"Position not found: {position_id}"); return None
-        position = self._positions[position_id]
-        side = OrderSide.SELL if position["direction"] == "long" else OrderSide.BUY
-        close_order = await self.place_market_order(
-            side=side, size=position["size"],
-            metadata={"position_id": position_id, "close_reason": reason})
-        if not close_order:
-            return None
-        if self.dry_run:
-            close_order.status = OrderStatus.FILLED
-            close_order.filled_size = position["size"]
-            close_order.filled_price = exit_price
-        pnl = self.risk_engine.remove_position(position_id, exit_price)
-        position.update({"status": "closed", "exit_price": exit_price,
-                        "exit_time": datetime.now(), "pnl": pnl, "close_reason": reason})
-        logger.info(f"Position closed: {position_id} P&L: ${pnl:+.2f} ({reason})")
-        if self.on_position_closed:
-            await self.on_position_closed(position)
-
-        return pnl
-
-    async def update_positions(self, current_price: Decimal) -> None:
-        """Update all open positions — check stop loss and take profit."""
-        import operator
-        for pid, pos in list(self._positions.items()):
-            if pos["status"] != "open":
-                continue
-            self.risk_engine.update_position(pid, current_price)
-            if self._should_exit(pos, current_price, "stop_loss", operator.le, operator.ge):
-                logger.warning(f"Stop loss hit: {pid}")
-                await self.close_position(pid, current_price, "stop_loss"); continue
-            if self._should_exit(pos, current_price, "take_profit", operator.ge, operator.le):
-                logger.info(f"Take profit hit: {pid}")
-                await self.close_position(pid, current_price, "take_profit")
-
-    def get_order(self, order_id: str) -> Optional[Order]:
-        """Get order by ID."""
-        return self._orders.get(order_id)
-    
-    def get_position(self, position_id: str) -> Optional[Dict[str, Any]]:
-        """Get position by ID."""
-        return self._positions.get(position_id)
-    
-    def get_open_positions(self) -> List[Dict[str, Any]]:
-        """Get all open positions."""
-        return [
-            pos for pos in self._positions.values()
-            if pos["status"] == "open"
-        ]
-    
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get execution statistics."""
-        return {
-            "mode": "dry_run" if self.dry_run else "live",
-            "orders": {
-                "total": self._total_orders,
-                "filled": self._filled_orders,
-                "rejected": self._rejected_orders,
-                "pending": len([o for o in self._orders.values() if o.status == OrderStatus.PENDING]),
-            },
-            "positions": {
-                "open": len(self.get_open_positions()),
-                "total": len(self._positions),
-            },
-            "risk": self.risk_engine.get_risk_summary(),
-        }
+    # Position lifecycle methods inherited from PositionLifecycleMixin:
+    # _should_exit, close_position, update_positions, get_order,
+    # get_position, get_open_positions, get_statistics
 
 
 # Singleton instance

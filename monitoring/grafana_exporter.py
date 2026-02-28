@@ -7,125 +7,21 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Dict, Any, Optional
 from prometheus_client import (
-    Counter,
-    Gauge,
-    Histogram,
-    Summary,
-    start_http_server,
-    REGISTRY,
-    generate_latest,
-    CONTENT_TYPE_LATEST,
-    CollectorRegistry,
-    multiprocess,
+    Counter, Gauge, Histogram, Summary,
+    start_http_server, REGISTRY, generate_latest,
+    CONTENT_TYPE_LATEST, CollectorRegistry, multiprocess,
 )
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer
 import threading
-import urllib.parse
 from loguru import logger
 
-import os
-import sys
+import os, sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from monitoring.performance_tracker import get_performance_tracker
 from execution.risk_engine import get_risk_engine
 from execution.execution_engine import get_execution_engine
-
-
-class MetricsHandler(BaseHTTPRequestHandler):
-    """Custom HTTP handler that serves Prometheus metrics and handles Grafana queries."""
-    
-    exporter = None  # Will be set by the main class
-    
-    def _send_json(self, data, status=200, cors=False):
-        """Send JSON response."""
-        self.send_response(status)
-        self.send_header('Content-Type', 'application/json')
-        if cors:
-            self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
-        self.wfile.write(data if isinstance(data, bytes) else data.encode())
-
-    def _serve_root(self):
-        """Serve root HTML page."""
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html')
-        self.end_headers()
-        self.wfile.write(b"<html><body><h1>Polymarket Bot Metrics</h1>"
-                        b"<p><a href='/metrics'>/metrics</a> | <a href='/health'>/health</a></p>"
-                        b"</body></html>")
-
-    def _serve_metrics(self):
-        """Serve Prometheus metrics."""
-        try:
-            data = generate_latest(REGISTRY)
-            self.send_response(200)
-            self.send_header('Content-Type', CONTENT_TYPE_LATEST)
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            self.wfile.write(data)
-        except Exception as e:
-            logger.error(f"Error generating metrics: {e}")
-            self.send_response(500); self.end_headers()
-            self.wfile.write(f"Error: {e}".encode())
-
-    def _serve_api(self, path):
-        """Handle Grafana API probe requests."""
-        if 'labels' in path:
-            body = b'{"status":"success","data":[]}'
-        elif 'query' in path:
-            body = b'{"status":"success","data":{"resultType":"vector","result":[]}}'
-        else:
-            body = b'{"status":"success"}'
-        self._send_json(body, cors=True)
-
-    def do_GET(self):
-        """Handle GET requests - route to appropriate handler."""
-        path = urllib.parse.urlparse(self.path).path
-        if path in ('/', ''):
-            self._serve_root()
-        elif path == '/health':
-            self._send_json(b'{"status": "healthy"}')
-        elif path == '/metrics':
-            self._serve_metrics()
-        elif path.startswith('/api/v1/'):
-            self._serve_api(path)
-        else:
-            self.send_response(404); self.end_headers()
-            self.wfile.write(b"Not Found")
-
-    def do_POST(self):
-        """Handle POST requests — route same as GET."""
-        parsed = urllib.parse.urlparse(self.path)
-        if parsed.path.startswith('/api/v1/'):
-            self._serve_api(parsed.path)
-        elif parsed.path == '/metrics':
-            self.do_GET()
-        else:
-            self.send_response(404); self.end_headers()
-            self.wfile.write(b"Not Found")
-
-    def do_OPTIONS(self):
-        """Handle OPTIONS requests for CORS preflight."""
-        self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Accept, Content-Type')
-        self.send_header('Access-Control-Max-Age', '86400')  # 24 hours
-        self.end_headers()
-
-    def log_message(self, format, *args):
-        """Override to avoid excessive logging."""
-        try:
-            # Check if args[1] exists and is a string that can be converted to int
-            if len(args) >= 2:
-                # The status code is the second argument, convert to int for comparison
-                status_code = int(args[1]) if str(args[1]).isdigit() else 0
-                if status_code >= 400:
-                    logger.debug(f"Metrics server: {format % args}")
-        except Exception:
-            # If anything fails in logging, just ignore it
-            pass
+from monitoring.metrics_handler import MetricsHandler
 
 
 class GrafanaMetricsExporter:
