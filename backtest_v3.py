@@ -104,13 +104,18 @@ BANKROLL_USD = float(os.getenv("BANKROLL_USD", "20.0"))
 MARKET_BUY_USD = float(os.getenv("MARKET_BUY_USD", "1.00"))
 USE_LIMIT_ORDERS = os.getenv("USE_LIMIT_ORDERS", "true").lower() == "true"
 
+# V3 quant parameters continued...
+WINDOW_MINUTES = 15
+
+# V3.1: Gamma Scalping Config (matching bot.py)
+GAMMA_EXIT_PROFIT_PCT = float(os.getenv("GAMMA_EXIT_PROFIT_PCT", "0.04"))
+GAMMA_EXIT_TIME_MINS = float(os.getenv("GAMMA_EXIT_TIME_MINS", "3.0"))
+
 # Old fusion params (for confirmation / heuristic mode)
 MIN_FUSION_SIGNALS = int(os.getenv("MIN_FUSION_SIGNALS", "2"))
 MIN_FUSION_SCORE = float(os.getenv("MIN_FUSION_SCORE", "55.0"))
 TREND_UP_THRESHOLD = float(os.getenv("TREND_UP_THRESHOLD", "0.60"))
 TREND_DOWN_THRESHOLD = float(os.getenv("TREND_DOWN_THRESHOLD", "0.40"))
-
-WINDOW_MINUTES = 15
 
 
 # =============================================================================
@@ -903,12 +908,26 @@ def run_backtest_v3(
                 skipped += 1
                 continue
 
-        # Position size: Kelly-determined, capped
+        # ── Simulate New Risk Engine Sizing (Tier-0 Architecture) ─────
+        # 1. Base max risk amount
+        base_risk_amount = bankroll * 0.05
+
+        # 2. Signal score proxy (assume 85 for high conf, 50 for low)
+        signal_score = 85.0 if signal.confidence > 0.6 else 50.0
+        score_multiplier = signal_score / 100.0
+
+        # 3. Strength multiplier (using pure fraction from detector)
+        strength_multiplier = signal.confidence * score_multiplier * getattr(signal, 'kelly_fraction', 1.0)
+
+        # 4. Gamma Penalty: Reduce size aggressively in the final 5 minutes
+        time_factor = 1.0
+        if time_remaining_min < 5.0:
+            time_factor = max(0.1, time_remaining_min / 5.0)
+
+        theoretical_size = base_risk_amount * strength_multiplier * time_factor
+
         if rc:
-            # Realistic: Scale position with edge quality
-            # Small edges ($0.05-$0.10): reduced size for safety
-            # Medium edges ($0.10-$0.20): full $1 position
-            # Large edges ($0.20+): up to 1.5x position (high confidence)
+            # Realistic: Scale max position with edge quality
             abs_edge = abs(signal.edge)
             if abs_edge < 0.10:
                 edge_scale = 0.6  # 60% position on small edges
@@ -917,21 +936,56 @@ def run_backtest_v3(
             else:
                 edge_scale = 1.5  # 150% position on large edges
             max_position = MARKET_BUY_USD * edge_scale
-            position_size = min(signal.kelly_bet_usd, bankroll * 0.05, max_position)
+            position_size = min(theoretical_size, max_position)
         else:
-            position_size = min(signal.kelly_bet_usd, bankroll * 0.05, MARKET_BUY_USD)
-        position_size = max(position_size, 0.10)  # Min $0.10
+            position_size = min(theoretical_size, MARKET_BUY_USD)
 
-        # Outcome
-        if direction == "long":
-            won = btc_moved_up
-        else:
-            won = not btc_moved_up
+        # Floor at $1.00 minimum exchange size
+        position_size = max(position_size, 1.0)
 
-        outcome = "WIN" if won else "LOSS"
+        # ── Simulate Intra-Window Gamma Scalping (Early Exits) ────────
+        exit_price = None
+        resolved_early = False
+
+        # Scan subsequent minutes in the window for an exit trigger
+        for m in range(decision_minute + 1, len(window)):
+            # Synthesize the market price at minute 'm'
+            m_poly_price = btc_to_probability(
+                window, m, realistic=rc, model_fair_value=last_model_yes
+            )
+            m_market_price = m_poly_price if direction == "long" else (1.0 - m_poly_price)
+
+            # Apply taker spread to the exit (selling at the bid)
+            if rc:
+                m_half_spread = rc.spread_cents / 2.0
+                m_remaining = WINDOW_MINUTES - m
+                if m_remaining <= 3.0:
+                    m_half_spread += rc.spread_widen_late / 2.0
+                m_exit_price = max(0.01, m_market_price - m_half_spread)
+            else:
+                m_exit_price = m_market_price
+
+            pnl_pct = (m_exit_price - entry_price) / entry_price
+            m_remaining = WINDOW_MINUTES - m
+
+            # THE GAMMA EXIT TRIGGER
+            if pnl_pct >= TAKE_PROFIT_PCT or (m_remaining < GAMMA_EXIT_TIME_MINS and pnl_pct > GAMMA_EXIT_PROFIT_PCT):
+                exit_price = m_exit_price
+                resolved_early = True
+                break
+
+        # If no early exit triggered, hold to expiry
+        if not resolved_early:
+            if direction == "long":
+                won = btc_moved_up
+            else:
+                won = not btc_moved_up
+            exit_price = 1.0 if won else 0.0
+
+        outcome = "WIN" if exit_price > entry_price else "LOSS"
 
         # Track consecutive losses for streak throttle
-        if won:
+        if outcome == "WIN":
             consecutive_losses = 0
         else:
             consecutive_losses += 1
@@ -940,18 +994,21 @@ def run_backtest_v3(
         # ── P&L with correct fees ────────────────────────────────────────
         num_tokens = position_size / entry_price if entry_price > 0 else 0
 
+        # Entry Fee
         if use_maker:
-            fee_rate = 0.0  # Maker pays 0%
+            entry_fee_rate = 0.0  # Maker pays 0%
         else:
-            fee_rate = polymarket_taker_fee(entry_price)
+            entry_fee_rate = polymarket_taker_fee(entry_price)
 
-        fee = fee_rate * num_tokens * entry_price
-
-        if won:
-            pnl_before_fees = num_tokens * (1.0 - entry_price)
+        # Exit Fee (0% if held to expiry, otherwise nonlinear Taker fee)
+        if not resolved_early:
+            exit_fee_rate = 0.0
         else:
-            pnl_before_fees = -num_tokens * entry_price
+            exit_fee_rate = polymarket_taker_fee(exit_price)
 
+        fee = (entry_fee_rate * num_tokens * entry_price) + (exit_fee_rate * num_tokens * exit_price)
+
+        pnl_before_fees = (exit_price - entry_price) * num_tokens
         pnl = pnl_before_fees - fee
         total_fees += fee
 
