@@ -242,17 +242,17 @@ def fetch_binance_klines(
     return candles
 
 
-def load_csv_candles(csv_path: str) -> List[Candle]:
+def load_csv_candles(csv_path):
     """Load candles from CSV (columns: timestamp, open, high, low, close, volume)."""
     import csv
     candles = []
     with open(csv_path, "r") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            ts_raw = row["timestamp"]
+            ts_raw = row.get("timestamp")
             try:
                 ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-            except ValueError:
+            except Exception:
                 ts_val = float(ts_raw)
                 if ts_val > 1e12:
                     ts_val /= 1000
@@ -736,8 +736,8 @@ def run_backtest_v3(
 
     for wi, window in enumerate(windows):
 
-        # Feed ALL candle closes to vol estimator (builds vol across windows)
-        for c in window:
+        # Feed candle closes up to the decision minute to vol estimator to avoid lookahead
+        for c in window[: decision_minute + 1]:
             vol_est.add_price(c.close, c.timestamp.timestamp())
             historical_btc_closes.append(c.close)
 

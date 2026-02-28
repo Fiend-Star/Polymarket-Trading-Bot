@@ -380,38 +380,39 @@ class MispricingDetector:
             else:
                 vrp_signal = "NEUTRAL"
 
-        # ---- Step 4: Compute Edge (Conditional Edge Paradigm - V3.4 FIX) ----
-        # Instead of absolute fair value disagreement (model - market),
-        # we assume the market efficiently prices the base diffusion process.
-        # Our alpha is entirely isolated in the overlays.
-        total_overlay_adj = (
-                model.jump_adjustment +
-                model.mean_reversion_adj +
-                model.candle_effect_adj +
-                model.seasonality_adj +
-                model.skew_adj +
-                funding_bias
-        )
+        # ---- Step 4: Compute Edge (Use full model fair value) ----
+        # The edge should reflect the disagreement between the model's full
+        # fair value and the market. Keep individual overlays available for
+        # diagnostics, but compute edge as model - market to avoid missing
+        # the base BSM/JD signal.
 
-        # Apply overlays directly to market price
-        conditional_yes_prob = max(0.01, min(0.99, yes_market_price + total_overlay_adj))
-        conditional_no_prob = 1.0 - conditional_yes_prob
+        # Overlays (already applied inside `model`) available for diagnostics
 
-        # The edge is now purely the overlays
-        yes_edge = conditional_yes_prob - yes_market_price
-        no_edge = conditional_no_prob - no_market_price
+        # Model's absolute fair probabilities (already include overlays inside pricer)
+        model_yes = model.yes_fair_value
+        model_no = model.no_fair_value
+
+        # Edge = model fair value - market price
+        yes_edge = model_yes - yes_market_price
+        no_edge = model_no - no_market_price
 
         # Pick the side with positive edge
-        if yes_edge > 0:
+        if yes_edge > no_edge and yes_edge > 0:
             direction = "BUY_YES"
             trade_price = yes_market_price
             primary_edge = yes_edge
-            model_prob = conditional_yes_prob
-        else:
+            model_prob = model_yes
+        elif no_edge > 0:
             direction = "BUY_NO"
             trade_price = no_market_price
             primary_edge = no_edge
-            model_prob = conditional_no_prob
+            model_prob = model_no
+        else:
+            # No positive edge on either side
+            direction = "NO_TRADE"
+            trade_price = yes_market_price
+            primary_edge = 0.0
+            model_prob = model_yes
 
         abs_edge = abs(primary_edge)
         edge_pct = abs_edge / trade_price if trade_price > 0 else 0.0
