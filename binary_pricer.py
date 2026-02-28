@@ -173,6 +173,8 @@ class BinaryOptionPricer:
         vol_skew: Optional[float] = None,
         # V3: Funding rate regime bias
         funding_bias: float = 0.0,
+        # V3.4: Exact market end time
+        market_end_time: Optional[datetime] = None,
     ) -> BinaryOptionPrice:
         """
         Price a binary call (YES) and put (NO) using jump-diffusion + overlays.
@@ -205,23 +207,22 @@ class BinaryOptionPricer:
         skew_adj_val = 0.0
 
         # --- Step 3: Statistical overlays ---
-        if apply_overlays:
-            if recent_return is not None and recent_return_sigma is not None:
-                mr_adj = self._mean_reversion_adj(
-                    recent_return, recent_return_sigma, time_remaining_min
-                )
-            candle_adj = self._candle_effect_adj(time_remaining_min)
-            season_adj = self._seasonality_adj()
+        if recent_return is not None and recent_return_sigma is not None:
+            mr_adj = self._mean_reversion_adj(
+                recent_return, recent_return_sigma, time_remaining_min
+            )
+        candle_adj = self._candle_effect_adj(time_remaining_min, market_end_time)
+        season_adj = self._seasonality_adj()
 
-            # V3: Skew-adjusted binary correction
-            # Binary_adjusted = N(d2) - Vega × dσ/dK
-            # BTC has persistent negative vol skew (OTM puts > OTM calls)
-            if vol_skew is not None and greeks["vega"] != 0:
-                skew_adj_val = -greeks["vega"] * vol_skew
-                # Clamp to reasonable range
-                skew_adj_val = max(-0.03, min(0.03, skew_adj_val))
+        # V3: Skew-adjusted binary correction
+        # Binary_adjusted = N(d2) - Vega × dσ/dK
+        # BTC has persistent negative vol skew (OTM puts > OTM calls)
+        if vol_skew is not None and greeks["vega"] != 0:
+            skew_adj_val = -greeks["vega"] * vol_skew
+            # Clamp to reasonable range
+            skew_adj_val = max(-0.03, min(0.03, skew_adj_val))
 
-            method = "adjusted"
+        method = "adjusted"
 
         # --- Step 4: Funding rate regime bias ---
         # From FundingRateFilter: crowded longs → negative bias, crowded shorts → positive
@@ -388,13 +389,17 @@ class BinaryOptionPricer:
             # Down move → expect reversion UP → raise YES prob
             return strength * self.NEGATIVE_REVERSION_MULT
 
-    def _candle_effect_adj(self, time_remaining_min: float) -> float:
+    def _candle_effect_adj(self, time_remaining_min: float, market_end_time: Optional[datetime] = None) -> float:
         """
         Turn-of-candle effect (Shanaev & Vasenin 2023).
         +0.58 bps/min concentrated at minutes 0, 15, 30, 45 of each hour.
         """
-        now = datetime.now(timezone.utc)
-        resolve_minute = (now.minute + int(time_remaining_min)) % 60
+        # V3.4 FIX: Use exact market_end_time instead of volatile float math
+        if market_end_time is not None:
+            resolve_minute = market_end_time.minute
+        else:
+            now = datetime.now(timezone.utc)
+            resolve_minute = (now.minute + round(time_remaining_min)) % 60
 
         if resolve_minute in self.CANDLE_MINUTES:
             return 0.002   # +0.2% bullish bias at candle boundaries

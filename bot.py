@@ -135,6 +135,7 @@ RTDS_LATE_WINDOW_MIN_BPS = float(os.getenv("RTDS_LATE_WINDOW_MIN_BPS", "3.0"))
 RTDS_DIVERGENCE_THRESHOLD_BPS = float(os.getenv("RTDS_DIVERGENCE_THRESHOLD_BPS", "5.0"))
 USE_FUNDING_FILTER = os.getenv("USE_FUNDING_FILTER", "true").lower() == "true"
 LATE_WINDOW_ENABLED = os.getenv("LATE_WINDOW_ENABLED", "true").lower() == "true"
+SHADOW_MODE_ONLY = os.getenv("SHADOW_MODE_ONLY", "false").lower() == "true"
 
 
 # =============================================================================
@@ -640,7 +641,8 @@ class IntegratedBTCStrategy(Strategy):
         if self.rtds and self.rtds.chainlink_btc_price > 0 and self.rtds.chainlink_age_ms < 30000:
             spot = self.rtds.chainlink_btc_price
             # Log divergence if significant
-            if self.rtds.binance_btc_price > 0:
+            # V3.4 FIX: Check Binance staleness before logging divergence
+            if self.rtds.binance_btc_price > 0 and self.rtds.binance_age_ms < 60000:
                 div = self.rtds.get_divergence()
                 if div.is_significant:
                     logger.info(
@@ -648,7 +650,7 @@ class IntegratedBTCStrategy(Strategy):
                         f"Chainlink=${div.chainlink_price:,.2f} ({div.divergence_bps:+.1f}bps) "
                         f"→ {div.direction}"
                     )
-        elif self.rtds and self.rtds.binance_btc_price > 0 and self.rtds.binance_age_ms < 30000:
+        elif self.rtds and self.rtds.binance_btc_price > 0 and self.rtds.binance_age_ms < 60000:
             # V3.2: RTDS Binance as intermediate fallback (Chainlink feed may be silent)
             spot = self.rtds.binance_btc_price
             
@@ -1252,67 +1254,16 @@ class IntegratedBTCStrategy(Strategy):
                             )
                             strike_set = True
 
-                    # 4. Current Chainlink (streaming but no tick at boundary)
-                    # This is BELOW priceToBeat because on cold start, current
-                    # Chainlink may have drifted from the settlement reference.
-                    if not strike_set and self.rtds and self.rtds.chainlink_btc_price > 0:
-                        self._btc_strike_price = self.rtds.chainlink_btc_price
-                        self._strike_recorded = True
-                        self._strike_defer_start = None
-                        self._strike_source = "chainlink_current"
-                        logger.warning(
-                            f"📌 Strike from current Chainlink: "
-                            f"${self._btc_strike_price:,.2f} "
-                            f"(no boundary tick or priceToBeat available)"
-                        )
-                        strike_set = True
-
-                    # 5. Defer / timeout with fallback chain
-                    if not strike_set and self.rtds:
+                    # V3.4 FIX: Never fall back to unverified strike prices (chainlink_current, timeout, coinbase).
+                    # If we don't have a verified boundary tick or Gamma API priceToBeat, we must wait.
+                    # Trading on a phantom strike is catastrophic.
+                    if not strike_set:
                         if self._strike_defer_start is None:
                             self._strike_defer_start = time.time()
                         defer_elapsed = time.time() - self._strike_defer_start
-
-                        if defer_elapsed < 30.0:
-                            logger.debug(
-                                f"Strike deferred — waiting for Chainlink "
-                                f"({defer_elapsed:.0f}s / 30s timeout)"
-                            )
-                        else:
-                            # Timeout — try Binance, then Coinbase
-                            fallback = None
-                            source_label = ""
-                            if self.rtds.binance_btc_price > 0:
-                                fallback = self.rtds.binance_btc_price
-                                source_label = "RTDS Binance"
-                            if not fallback and self._cached_spot_price:
-                                fallback = self._cached_spot_price
-                                source_label = "Coinbase spot"
-
-                            if fallback:
-                                self._btc_strike_price = fallback
-                                self._strike_recorded = True
-                                self._strike_defer_start = None
-                                self._strike_source = "timeout_fallback"
-                                logger.warning(
-                                    f"📌 Strike TIMEOUT after {defer_elapsed:.0f}s — "
-                                    f"using {source_label}: ${fallback:,.2f}"
-                                )
-                            else:
-                                logger.warning(
-                                    f"Strike timeout but no price available "
-                                    f"({defer_elapsed:.0f}s elapsed)"
-                                )
-
-                    # 5. Last resort: no RTDS, use Coinbase
-                    if not strike_set and not self.rtds and self._cached_spot_price:
-                        self._btc_strike_price = self._cached_spot_price
-                        self._strike_recorded = True
-                        self._strike_defer_start = None
-                        self._strike_source = "coinbase"
-                        logger.warning(
-                            f"📌 Strike FALLBACK to Coinbase spot: "
-                            f"${self._btc_strike_price:,.2f} (RTDS unavailable)"
+                        logger.debug(
+                            f"Strike deferred — waiting for verified boundary/Gamma API "
+                            f"({defer_elapsed:.0f}s elapsed)"
                         )
 
             except Exception as e:
@@ -1589,11 +1540,14 @@ class IntegratedBTCStrategy(Strategy):
 
         # Step 5: Run mispricing detector (THE CORE QUANT SIGNAL)
         # V3.1: Compute vol skew + pass funding bias
-        vol_skew = BinaryOptionPricer.estimate_btc_vol_skew(
-            btc_spot, self._btc_strike_price,
-            self.vol_estimator.get_vol(VOL_METHOD).annualized_vol,
-            time_remaining_min,
-        )
+        # V3.4 FIX: Pass `vol_skew` from genuine Deribit data instead of synthetic formula
+        vol_skew = 0.0
+        if getattr(self, "deribit_pcr", None) and self.deribit_pcr._cached_result:
+            pcr = self.deribit_pcr._cached_result.get("short_pcr", 1.0)
+            # PCR > 1 (puts expensive) -> negative skew. 
+            # e.g. PCR = 1.2 -> skew = -0.02
+            vol_skew = -0.10 * (pcr - 1.0)
+            vol_skew = max(-0.10, min(0.05, vol_skew))
 
         signal = self.mispricing_detector.detect(
             yes_market_price=yes_price,
@@ -1606,6 +1560,8 @@ class IntegratedBTCStrategy(Strategy):
             # V3.1: Additional overlays
             vol_skew=vol_skew,
             funding_bias=funding_bias,
+            # V3.4: Exact market end time
+            market_end_time=getattr(self, "next_switch_time", None),
         )
 
         if not signal.is_tradeable:
@@ -1633,31 +1589,9 @@ class IntegratedBTCStrategy(Strategy):
             f"(of {len(old_signals)} signals)"
         )
 
-        # Step 7b: Orderbook hard block — extreme imbalance opposing model
-        # When ask/bid >10:1 and model says BUY YES, we're providing exit
-        # liquidity to informed sellers. Same logic for BUY NO with bid/ask >10:1.
-        for sig in old_signals:
-            if sig.source == "OrderBookImbalance" and sig.metadata:
-                bid_vol = sig.metadata.get("bid_volume_usd", 0)
-                ask_vol = sig.metadata.get("ask_volume_usd", 0)
-                if signal.direction == "BUY_YES" and bid_vol > 0 and ask_vol > 0:
-                    ratio = ask_vol / bid_vol
-                    if ratio > 10.0:
-                        logger.warning(
-                            f"🛑 ORDERBOOK HARD BLOCK: Model says BUY YES but "
-                            f"ask/bid ratio is {ratio:.1f}:1 (${ask_vol:.0f} vs ${bid_vol:.0f}) "
-                            f"— informed sellers dominating, blocking trade"
-                        )
-                        return
-                if signal.direction == "BUY_NO" and bid_vol > 0 and ask_vol > 0:
-                    ratio = bid_vol / ask_vol
-                    if ratio > 10.0:
-                        logger.warning(
-                            f"🛑 ORDERBOOK HARD BLOCK: Model says BUY NO but "
-                            f"bid/ask ratio is {ratio:.1f}:1 (${bid_vol:.0f} vs ${ask_vol:.0f}) "
-                            f"— informed buyers dominating, blocking trade"
-                        )
-                        return
+        # Step 7b: Orderbook hard block removed (Anomaly 9 fix)
+        # Filtering directionally correct signals based on extreme orderbook imbalance 
+        # causes too many false negatives. The model's edge should override queue-based dynamics.
 
         # Step 8: Decision — trade if model + confirmations align
         if contradicting > confirming and signal.confidence < 0.6:
@@ -1697,7 +1631,9 @@ class IntegratedBTCStrategy(Strategy):
             confidence=signal.confidence,
         )
 
-        if is_simulation:
+        if is_simulation or SHADOW_MODE_ONLY:
+            if SHADOW_MODE_ONLY and not is_simulation:
+                logger.warning(f"👻 [SHADOW MODE] Paper trading {direction.upper()} | Size: ${POSITION_SIZE_USD}")
             await self._record_paper_trade(mock_signal, POSITION_SIZE_USD, current_price, direction)
         else:
             if USE_LIMIT_ORDERS:
@@ -1815,14 +1751,9 @@ class IntegratedBTCStrategy(Strategy):
         if spike_signal:
             signals.append(spike_signal)
 
-        if 'sentiment_score' in processed_metadata:
-            sentiment_signal = self.sentiment_processor.process(
-                current_price=current_price,
-                historical_prices=self.price_history,
-                metadata=processed_metadata,
-            )
-            if sentiment_signal:
-                signals.append(sentiment_signal)
+        # V3.4 FIX: Removed SentimentProcessor (Fear & Greed) from intraday
+        # signal path. A daily indicator provides zero alpha for 15-minute
+        # binary options and only adds a permanent structural bias.
 
         if 'spot_price' in processed_metadata:
             divergence_signal = self.divergence_processor.process(

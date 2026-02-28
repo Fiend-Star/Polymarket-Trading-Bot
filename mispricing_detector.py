@@ -269,6 +269,8 @@ class MispricingDetector:
         # V3: Additional overlays
         vol_skew: Optional[float] = None,
         funding_bias: float = 0.0,
+        # V3.4: Exact market end time
+        market_end_time: Optional[datetime] = None,
     ) -> MispricingSignal:
         """
         Detect mispricing between model and market.
@@ -301,6 +303,8 @@ class MispricingDetector:
             # V3: Skew + funding overlays
             vol_skew=vol_skew,
             funding_bias=funding_bias,
+            # V3.4: Exact market end time
+            market_end_time=market_end_time,
         )
 
         # ---- Step 2b: Strike validation gate ----
@@ -341,72 +345,66 @@ class MispricingDetector:
             iv = None
 
         # IV convergence guard: if bisection couldn't find any vol that explains
-        # the market price, the spot/strike inputs are wrong. This is the smoke
-        # signal — treat it as a hard trading blocker.
+        # the market price, suppress VRP signals instead of blocking the trade.
         if iv is None:
             logger.warning(
-                f"⚠ IV EXTRACTION FAILED: no vol in [0.01, 5.0] explains "
+                f"⚠ IV EXTRACTION FAILED: bisection boundary hit or no vol explains "
                 f"market_price={yes_market_price:.4f} at spot={btc_spot:.2f}, "
                 f"strike={btc_strike:.2f}, T={time_remaining_min:.1f}min — "
-                f"marking untradeable"
+                f"suppressing VRP signal"
             )
-            return MispricingSignal(
-                edge=0.0, edge_pct=0.0, direction="NO_TRADE",
-                yes_market=yes_market_price, no_market=no_market_price,
-                yes_model=model.yes_fair_value, no_model=model.no_fair_value,
-                spot=btc_spot, strike=btc_strike, vol=realized_vol,
-                time_remaining_min=time_remaining_min,
-                delta=model.delta, gamma=model.gamma, theta_per_min=model.theta,
-                confidence=0.0, vol_confidence=vol_confidence,
-                implied_vol=0.0, realized_vol=realized_vol,
-                vol_spread=0.0, vrp=0.0, vrp_signal="IV_FAILED",
-                expected_pnl=0.0, fee_cost=0.0, net_expected_pnl=0.0,
-                is_tradeable=False, kelly_fraction=0.0, kelly_bet_usd=0.0,
-                pricing_method=model.method,
-            )
-
-        vol_spread = iv - realized_vol
-
-        # V2: Track VRP
-        self.vol_est.record_iv(iv)
-        self.vol_est.record_rv(realized_vol)
-        vrp = self.vol_est.get_vrp()
-
-        # VRP signal interpretation
-        if vrp > 0.20:  # IV exceeds RV by 20%+
-            vrp_signal = "FADE_EXTREME"  # Market overpricing vol → fade extreme prices
-        elif vrp < -0.05:
-            vrp_signal = "VOL_CHEAP"     # Rare: market underpricing vol
+            iv = realized_vol  # fallback for downstream logging
+            vol_spread = 0.0
+            vrp = 0.0
+            vrp_signal = "IV_FAILED"
         else:
-            vrp_signal = "NEUTRAL"
+            vol_spread = iv - realized_vol
 
-        # ---- Step 4: Compute edge on both sides ----
-        yes_edge = model.yes_fair_value - yes_market_price
-        no_edge = model.no_fair_value - no_market_price
+            # V2: Track VRP
+            self.vol_est.record_iv(iv)
+            self.vol_est.record_rv(realized_vol)
+            vrp = self.vol_est.get_vrp()
 
-        # Pick the side with more edge
-        if abs(yes_edge) >= abs(no_edge):
+            # VRP signal interpretation
+            if vrp > 0.20:  # IV exceeds RV by 20%+
+                vrp_signal = "FADE_EXTREME"  # Market overpricing vol → fade extreme prices
+            elif vrp < -0.05:
+                vrp_signal = "VOL_CHEAP"     # Rare: market underpricing vol
+            else:
+                vrp_signal = "NEUTRAL"
+
+        # ---- Step 4: Compute Edge (Conditional Edge Paradigm - V3.4 FIX) ----
+        # Instead of absolute fair value disagreement (model - market),
+        # we assume the market efficiently prices the base diffusion process.
+        # Our alpha is entirely isolated in the overlays.
+        total_overlay_adj = (
+            model.jump_adjustment +
+            model.mean_reversion_adj +
+            model.candle_effect_adj +
+            model.seasonality_adj +
+            model.skew_adj +
+            funding_bias
+        )
+        
+        # Apply overlays directly to market price
+        conditional_yes_prob = max(0.01, min(0.99, yes_market_price + total_overlay_adj))
+        conditional_no_prob = 1.0 - conditional_yes_prob
+
+        # The edge is now purely the overlays
+        yes_edge = conditional_yes_prob - yes_market_price
+        no_edge = conditional_no_prob - no_market_price
+
+        # Pick the side with positive edge
+        if yes_edge > 0:
+            direction = "BUY_YES"
+            trade_price = yes_market_price
             primary_edge = yes_edge
-            if yes_edge > 0:
-                direction = "BUY_YES"
-                trade_price = yes_market_price
-                model_prob = model.yes_fair_value
-            else:
-                direction = "BUY_NO"
-                trade_price = no_market_price
-                primary_edge = no_edge
-                model_prob = model.no_fair_value
+            model_prob = conditional_yes_prob
         else:
+            direction = "BUY_NO"
+            trade_price = no_market_price
             primary_edge = no_edge
-            if no_edge > 0:
-                direction = "BUY_NO"
-                trade_price = no_market_price
-                model_prob = model.no_fair_value
-            else:
-                direction = "BUY_YES"
-                trade_price = yes_market_price
-                primary_edge = yes_edge
-                model_prob = model.yes_fair_value
+            model_prob = conditional_no_prob
 
         abs_edge = abs(primary_edge)
         edge_pct = abs_edge / trade_price if trade_price > 0 else 0.0

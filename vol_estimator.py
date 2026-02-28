@@ -454,14 +454,12 @@ class VolEstimator:
 
     def _check_jump(self, timestamp: float, log_return: float):
         """Check if a return qualifies as a jump (> threshold σ)."""
-        vol_est = self._cached_vol
-        if vol_est is None or vol_est.vol_per_minute <= 0:
-            return
-
-        # Convert return to σ units using current vol estimate
+        # V3 FIX: Decouple jump detection from EWMA vol.
+        # Use a stable default reference so the jump threshold doesn't 
+        # scale up during crashes and blind the detector.
         interval_minutes = self.resample_interval_sec / 60.0
-        expected_std = vol_est.vol_per_minute * math.sqrt(interval_minutes)
-
+        expected_std = (self.default_vol / math.sqrt(MINUTES_PER_YEAR)) * math.sqrt(interval_minutes)
+        
         if expected_std > 0:
             sigma_units = abs(log_return) / expected_std
             if sigma_units > self.jump_threshold_sigma:
@@ -583,7 +581,8 @@ class VolEstimator:
 
         autocorr = self._compute_autocorr(log_returns) if len(log_returns) > 5 else 0.0
 
-        mean_reversion_active = abs(recent_sigma) > 1.5
+        # V3 FIX: Lowered MR threshold to 0.75σ (1.5σ is unreachable for 3-minute within-window returns)
+        mean_reversion_active = abs(recent_sigma) > 0.75
 
         return ReturnStats(
             recent_return=recent_return,

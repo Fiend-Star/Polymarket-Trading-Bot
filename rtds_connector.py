@@ -163,12 +163,12 @@ class RTDSConnector:
         # V3.3: Pre-scheduled boundary snapshots.
         # The bot registers upcoming 15-min boundary timestamps.  As Chainlink
         # ticks stream in, we capture the tick whose *source* timestamp is
-        # closest to each boundary — in real-time, zero extra latency.
-        # Key: boundary_timestamp_s (int), Value: (price, delta_ms)
+        # the tick whose *source* timestamp is closest to each boundary, looking strictly backwards.
         self._boundary_snapshots: Dict[int, tuple] = {}
-        # How close a tick must be (in ms) to be considered a boundary capture.
-        # With unfiltered Chainlink (1 tick/sec), ±5s is more than adequate.
-        self._boundary_capture_window_ms: int = 5_000  # 5 seconds
+        # How far back (in ms) to look for the last known price.
+        # With the strict `source_ts <= boundary` rule, we need a wide window (2 minutes)
+        # in case Chainlink didn't update right before the boundary.
+        self._boundary_capture_window_ms: int = 120_000  # 120 seconds
 
         # Stats
         self._chainlink_msg_count = 0
@@ -707,9 +707,12 @@ class RTDSConnector:
             # in real-time as the tick arrives (zero additional latency).
             for boundary_ts, existing in list(self._boundary_snapshots.items()):
                 boundary_ms = boundary_ts * 1000
-                delta_ms = abs(source_ts - boundary_ms)
-                if delta_ms <= self._boundary_capture_window_ms:
-                    # Keep the tick with the SMALLEST delta (closest to boundary)
+                
+                # V3.4: Only capture ticks that occurred AT OR BEFORE the boundary timestamp!
+                # We define a range of [0, boundary_capture_window_ms] looking backward.
+                delta_ms = boundary_ms - source_ts
+                if 0 <= delta_ms <= self._boundary_capture_window_ms:
+                    # Keep the tick with the SMALLEST delta (closest to boundary without going over)
                     if existing is None or delta_ms < existing[1]:
                         self._boundary_snapshots[boundary_ts] = (price, delta_ms)
                         if existing is None:
@@ -738,12 +741,12 @@ class RTDSConnector:
         else:
             self._avg_latency_ms = float(latency)
 
-        if self._chainlink_msg_count % 100 == 0:
-            logger.debug(
-                f"RTDS Chainlink: {self._chainlink_msg_count} ticks, "
-                f"price=${price:,.2f}, latency={latency}ms, "
-                f"avg_lat={self._avg_latency_ms:.0f}ms"
-            )
+        # Log every tick for diagnostics to trace boundary timing precisely
+        logger.debug(
+            f"RTDS Chainlink tick #{self._chainlink_msg_count}: "
+            f"price=${price:,.2f}, source_ts={source_ts}, latency={latency}ms, "
+            f"avg_lat={self._avg_latency_ms:.0f}ms"
+        )
 
     # ==================================================================
     # Stats
@@ -818,10 +821,13 @@ class RTDSConnector:
         best_tick = None
         best_delta = float("inf")
         for tick in ticks:
-            delta = abs(tick.source_timestamp_ms - target_ms)
-            if delta < best_delta:
-                best_delta = delta
-                best_tick = tick
+            # V3.4: The price "at" a timestamp is the most recent update <= timestamp
+            # We look strictly backward in a defining range [0, max_staleness_ms]
+            delta = target_ms - tick.source_timestamp_ms
+            if 0 <= delta <= max_staleness_ms:
+                if delta < best_delta:
+                    best_delta = delta
+                    best_tick = tick
 
         if best_tick is None or best_delta > max_staleness_ms:
             return None
