@@ -53,20 +53,20 @@ class Order:
     size: Decimal  # USD amount
     price: Optional[Decimal]  # None for market orders
     status: OrderStatus
-    
+
     # Position management
     position_id: Optional[str] = None
     stop_loss: Optional[Decimal] = None
     take_profit: Optional[Decimal] = None
-    
+
     # Execution details
     filled_size: Decimal = Decimal("0")
     filled_price: Optional[Decimal] = None
     fills: List[Dict[str, Any]] = None
-    
+
     # Metadata
     metadata: Dict[str, Any] = None
-    
+
     def __post_init__(self):
         if self.fills is None:
             self.fills = []
@@ -87,11 +87,11 @@ class ExecutionEngine:
     6. Manage position
     7. Handle exits (stop loss, take profit)
     """
-    
+
     def __init__(
-        self,
-        risk_engine: Optional[RiskEngine] = None,
-        dry_run: bool = True,  # Simulate orders without real execution
+            self,
+            risk_engine: Optional[RiskEngine] = None,
+            dry_run: bool = True,  # Simulate orders without real execution
     ):
         """
         Initialize execution engine.
@@ -102,35 +102,35 @@ class ExecutionEngine:
         """
         self.risk_engine = risk_engine or get_risk_engine()
         self.dry_run = dry_run
-        
+
         # Order tracking
         self._orders: Dict[str, Order] = {}
         self._order_counter = 0
-        
+
         # Position tracking
         self._positions: Dict[str, Dict[str, Any]] = {}
-        
+
         # Callbacks
         self.on_order_filled: Optional[Callable] = None
         self.on_position_opened: Optional[Callable] = None
         self.on_position_closed: Optional[Callable] = None
-        
+
         # Statistics
         self._total_orders = 0
         self._filled_orders = 0
         self._rejected_orders = 0
-        
+
         mode = "DRY RUN — simulation only, Nautilus handles live execution" if dry_run else "LIVE"
         logger.info(f"Initialized Execution Engine [{mode}]")
-    
+
     async def execute_signal(
-        self,
-        signal_direction: SignalDirection,
-        signal_confidence: float,
-        signal_score: float,
-        current_price: Decimal,
-        stop_loss: Optional[Decimal] = None,
-        take_profit: Optional[Decimal] = None,
+            self,
+            signal_direction: SignalDirection,
+            signal_confidence: float,
+            signal_score: float,
+            current_price: Decimal,
+            stop_loss: Optional[Decimal] = None,
+            take_profit: Optional[Decimal] = None,
     ) -> Optional[Order]:
         """
         Execute trading signal.
@@ -153,16 +153,16 @@ class ExecutionEngine:
         logger.info(f"Confidence: {signal_confidence:.2%}")
         logger.info(f"Score: {signal_score:.1f}")
         logger.info(f"Price: ${current_price:,.2f}")
-        
+
         # Calculate position size
         position_size = self.risk_engine.calculate_position_size(
             signal_confidence=signal_confidence,
             signal_score=signal_score,
             current_price=current_price,
         )
-        
+
         logger.info(f"Calculated position size: ${position_size:.2f}")
-        
+
         # Determine order side
         if signal_direction == SignalDirection.BULLISH:
             side = OrderSide.BUY
@@ -173,19 +173,19 @@ class ExecutionEngine:
         else:
             logger.warning("Neutral signal - no trade")
             return None
-        
+
         # Validate with risk engine
         is_valid, error = self.risk_engine.validate_new_position(
             size=position_size,
             direction=direction,
             current_price=current_price,
         )
-        
+
         if not is_valid:
             logger.error(f"Position rejected by risk engine: {error}")
             self._rejected_orders += 1
             return None
-        
+
         # Create order
         order = await self.place_market_order(
             side=side,
@@ -198,23 +198,23 @@ class ExecutionEngine:
                 "signal_score": signal_score,
             }
         )
-        
+
         if order:
             logger.info(f"Order placed: {order.order_id}")
-            
+
             # Simulate fill in dry run mode
             if self.dry_run:
                 await self._simulate_fill(order, current_price)
-        
+
         return order
-    
+
     async def place_market_order(
-        self,
-        side: OrderSide,
-        size: Decimal,
-        stop_loss: Optional[Decimal] = None,
-        take_profit: Optional[Decimal] = None,
-        metadata: Dict[str, Any] = None,
+            self,
+            side: OrderSide,
+            size: Decimal,
+            stop_loss: Optional[Decimal] = None,
+            take_profit: Optional[Decimal] = None,
+            metadata: Dict[str, Any] = None,
     ) -> Optional[Order]:
         """
         Place market order.
@@ -232,7 +232,7 @@ class ExecutionEngine:
         # Generate order ID
         self._order_counter += 1
         order_id = f"order_{self._order_counter}_{datetime.now().timestamp()}"
-        
+
         # Create order
         order = Order(
             order_id=order_id,
@@ -246,30 +246,30 @@ class ExecutionEngine:
             take_profit=take_profit,
             metadata=metadata or {},
         )
-        
+
         # Store order
         self._orders[order_id] = order
         self._total_orders += 1
-        
+
         logger.info(
             f"Created market order: {order_id} "
             f"{side.value.upper()} ${size:.2f}"
         )
-        
+
         # In live mode, submit to Polymarket via Nautilus
         if not self.dry_run:
             try:
                 from execution.nautilus_polymarket_integration import get_polymarket_integration
-                
+
                 integration = get_polymarket_integration(simulation_mode=False)
-                
+
                 # Place order via Nautilus
                 order_id_poly = await integration.place_market_order(
                     side=side.value,
                     size_usd=size,
                     metadata=metadata,
                 )
-                
+
                 if order_id_poly:
                     order.status = OrderStatus.SUBMITTED
                     order.metadata["polymarket_order_id"] = order_id_poly
@@ -278,20 +278,20 @@ class ExecutionEngine:
                     order.status = OrderStatus.REJECTED
                     logger.error("Polymarket order submission failed")
                     return None
-                    
+
             except Exception as e:
                 logger.error(f"Failed to submit to Polymarket: {e}")
                 order.status = OrderStatus.REJECTED
                 return None
         else:
             order.status = OrderStatus.SUBMITTED
-        
+
         return order
-    
+
     async def _simulate_fill(
-        self,
-        order: Order,
-        fill_price: Decimal,
+            self,
+            order: Order,
+            fill_price: Decimal,
     ) -> None:
         """
         Simulate order fill (for dry run mode).
@@ -301,7 +301,7 @@ class ExecutionEngine:
             fill_price: Fill price
         """
         logger.info(f"[SIMULATED] Filling order {order.order_id} @ ${fill_price:.2f}")
-        
+
         # Update order
         order.status = OrderStatus.FILLED
         order.filled_size = order.size
@@ -311,20 +311,20 @@ class ExecutionEngine:
             "price": fill_price,
             "size": order.size,
         })
-        
+
         self._filled_orders += 1
-        
+
         # Create position
         await self._create_position(order, fill_price)
-        
+
         # Callback
         if self.on_order_filled:
             await self.on_order_filled(order)
-    
+
     async def _create_position(
-        self,
-        order: Order,
-        entry_price: Decimal,
+            self,
+            order: Order,
+            entry_price: Decimal,
     ) -> None:
         """
         Create position from filled order.
@@ -335,10 +335,10 @@ class ExecutionEngine:
         """
         # Generate position ID
         position_id = f"pos_{datetime.now().timestamp()}"
-        
+
         # Determine direction
         direction = "long" if order.side == OrderSide.BUY else "short"
-        
+
         # Create position record
         position = {
             "position_id": position_id,
@@ -352,11 +352,11 @@ class ExecutionEngine:
             "status": "open",
             "metadata": order.metadata,
         }
-        
+
         # Store position
         self._positions[position_id] = position
         order.position_id = position_id
-        
+
         # Add to risk engine
         self.risk_engine.add_position(
             position_id=position_id,
@@ -366,21 +366,21 @@ class ExecutionEngine:
             stop_loss=order.stop_loss,
             take_profit=order.take_profit,
         )
-        
+
         logger.info(
             f"Position opened: {position_id} "
             f"{direction.upper()} ${order.filled_size:.2f} @ ${entry_price:.2f}"
         )
-        
+
         # Callback
         if self.on_position_opened:
             await self.on_position_opened(position)
-    
+
     async def close_position(
-        self,
-        position_id: str,
-        exit_price: Decimal,
-        reason: str = "manual",
+            self,
+            position_id: str,
+            exit_price: Decimal,
+            reason: str = "manual",
     ) -> Optional[Decimal]:
         """
         Close a position.
@@ -396,12 +396,12 @@ class ExecutionEngine:
         if position_id not in self._positions:
             logger.error(f"Position not found: {position_id}")
             return None
-        
+
         position = self._positions[position_id]
-        
+
         # Create closing order
         side = OrderSide.SELL if position["direction"] == "long" else OrderSide.BUY
-        
+
         close_order = await self.place_market_order(
             side=side,
             size=position["size"],
@@ -410,37 +410,37 @@ class ExecutionEngine:
                 "close_reason": reason,
             }
         )
-        
+
         if not close_order:
             return None
-        
+
         # Simulate fill
         if self.dry_run:
             close_order.status = OrderStatus.FILLED
             close_order.filled_size = position["size"]
             close_order.filled_price = exit_price
-        
+
         # Calculate P&L
         pnl = self.risk_engine.remove_position(position_id, exit_price)
-        
+
         # Update position
         position["status"] = "closed"
         position["exit_price"] = exit_price
         position["exit_time"] = datetime.now()
         position["pnl"] = pnl
         position["close_reason"] = reason
-        
+
         logger.info(
             f"Position closed: {position_id} "
             f"P&L: ${pnl:+.2f} ({reason})"
         )
-        
+
         # Callback
         if self.on_position_closed:
             await self.on_position_closed(position)
-        
+
         return pnl
-    
+
     async def update_positions(self, current_price: Decimal) -> None:
         """
         Update all open positions with current price.
@@ -451,51 +451,51 @@ class ExecutionEngine:
         for position_id, position in list(self._positions.items()):
             if position["status"] != "open":
                 continue
-            
+
             # Update in risk engine
             risk_pos = self.risk_engine.update_position(position_id, current_price)
-            
+
             if not risk_pos:
                 continue
-            
+
             # Check stop loss
             if position["stop_loss"]:
                 should_stop = (
-                    (position["direction"] == "long" and current_price <= position["stop_loss"]) or
-                    (position["direction"] == "short" and current_price >= position["stop_loss"])
+                        (position["direction"] == "long" and current_price <= position["stop_loss"]) or
+                        (position["direction"] == "short" and current_price >= position["stop_loss"])
                 )
-                
+
                 if should_stop:
                     logger.warning(f"Stop loss hit for {position_id}")
                     await self.close_position(position_id, current_price, "stop_loss")
                     continue
-            
+
             # Check take profit
             if position["take_profit"]:
                 should_take = (
-                    (position["direction"] == "long" and current_price >= position["take_profit"]) or
-                    (position["direction"] == "short" and current_price <= position["take_profit"])
+                        (position["direction"] == "long" and current_price >= position["take_profit"]) or
+                        (position["direction"] == "short" and current_price <= position["take_profit"])
                 )
-                
+
                 if should_take:
                     logger.info(f"Take profit hit for {position_id}")
                     await self.close_position(position_id, current_price, "take_profit")
-    
+
     def get_order(self, order_id: str) -> Optional[Order]:
         """Get order by ID."""
         return self._orders.get(order_id)
-    
+
     def get_position(self, position_id: str) -> Optional[Dict[str, Any]]:
         """Get position by ID."""
         return self._positions.get(position_id)
-    
+
     def get_open_positions(self) -> List[Dict[str, Any]]:
         """Get all open positions."""
         return [
             pos for pos in self._positions.values()
             if pos["status"] == "open"
         ]
-    
+
     def get_statistics(self) -> Dict[str, Any]:
         """Get execution statistics."""
         return {
@@ -516,6 +516,7 @@ class ExecutionEngine:
 
 # Singleton instance
 _execution_engine_instance = None
+
 
 def get_execution_engine() -> ExecutionEngine:
     """Get singleton execution engine.

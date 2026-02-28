@@ -23,7 +23,6 @@ from loguru import logger
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
-
 from core.strategy_brain.signal_processors.base_processor import (
     BaseSignalProcessor,
     TradingSignal,
@@ -50,11 +49,11 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
     """
 
     def __init__(
-        self,
-        spike_threshold: float = 0.05,    # FIXED: was 0.15, now 0.05 for probability prices
-        lookback_periods: int = 20,
-        min_confidence: float = 0.55,     # FIXED: was 0.60, slightly lower for more signals
-        velocity_threshold: float = 0.03, # 3% move in 3 ticks = velocity spike
+            self,
+            spike_threshold: float = 0.05,  # FIXED: was 0.15, now 0.05 for probability prices
+            lookback_periods: int = 20,
+            min_confidence: float = 0.55,  # FIXED: was 0.60, slightly lower for more signals
+            velocity_threshold: float = 0.03,  # 3% move in 3 ticks = velocity spike
     ):
         super().__init__("SpikeDetection")
 
@@ -71,10 +70,10 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
         )
 
     def process(
-        self,
-        current_price: Decimal,
-        historical_prices: list,
-        metadata: Dict[str, Any] = None,
+            self,
+            current_price: Decimal,
+            historical_prices: list,
+            metadata: Dict[str, Any] = None,
     ) -> Optional[TradingSignal]:
         """
         Detect probability spikes and generate mean-reversion or momentum signals.

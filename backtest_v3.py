@@ -66,6 +66,7 @@ from mispricing_detector import (
 # ── V3.1: Funding rate filter (optional — uses Binance historical) ──────────
 try:
     from funding_rate_filter import FundingRateFilter
+
     FUNDING_AVAILABLE = True
 except ImportError:
     FUNDING_AVAILABLE = False
@@ -77,35 +78,36 @@ try:
     from core.strategy_brain.signal_processors.divergence_processor import PriceDivergenceProcessor
     from core.strategy_brain.signal_processors.tick_velocity_processor import TickVelocityProcessor
     from core.strategy_brain.fusion_engine.signal_fusion import SignalFusionEngine
+
     FUSION_AVAILABLE = True
 except ImportError as e:
     logger.warning(f"Fusion processors not available: {e}")
     FUSION_AVAILABLE = False
-
 
 # =============================================================================
 # Configuration
 # =============================================================================
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
     pass
 
 # V3 quant parameters (from .env)
-MIN_EDGE_CENTS      = float(os.getenv("MIN_EDGE_CENTS", "0.02"))
-TAKE_PROFIT_PCT     = float(os.getenv("TAKE_PROFIT_PCT", "0.30"))
-CUT_LOSS_PCT        = float(os.getenv("CUT_LOSS_PCT", "-0.50"))
-VOL_METHOD          = os.getenv("VOL_METHOD", "ewma")
-DEFAULT_VOL         = float(os.getenv("DEFAULT_VOL", "0.65"))
-BANKROLL_USD        = float(os.getenv("BANKROLL_USD", "20.0"))
-MARKET_BUY_USD      = float(os.getenv("MARKET_BUY_USD", "1.00"))
-USE_LIMIT_ORDERS    = os.getenv("USE_LIMIT_ORDERS", "true").lower() == "true"
+MIN_EDGE_CENTS = float(os.getenv("MIN_EDGE_CENTS", "0.02"))
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.30"))
+CUT_LOSS_PCT = float(os.getenv("CUT_LOSS_PCT", "-0.50"))
+VOL_METHOD = os.getenv("VOL_METHOD", "ewma")
+DEFAULT_VOL = float(os.getenv("DEFAULT_VOL", "0.65"))
+BANKROLL_USD = float(os.getenv("BANKROLL_USD", "20.0"))
+MARKET_BUY_USD = float(os.getenv("MARKET_BUY_USD", "1.00"))
+USE_LIMIT_ORDERS = os.getenv("USE_LIMIT_ORDERS", "true").lower() == "true"
 
 # Old fusion params (for confirmation / heuristic mode)
-MIN_FUSION_SIGNALS  = int(os.getenv("MIN_FUSION_SIGNALS", "2"))
-MIN_FUSION_SCORE    = float(os.getenv("MIN_FUSION_SCORE", "55.0"))
-TREND_UP_THRESHOLD  = float(os.getenv("TREND_UP_THRESHOLD", "0.60"))
+MIN_FUSION_SIGNALS = int(os.getenv("MIN_FUSION_SIGNALS", "2"))
+MIN_FUSION_SCORE = float(os.getenv("MIN_FUSION_SCORE", "55.0"))
+TREND_UP_THRESHOLD = float(os.getenv("TREND_UP_THRESHOLD", "0.60"))
 TREND_DOWN_THRESHOLD = float(os.getenv("TREND_DOWN_THRESHOLD", "0.40"))
 
 WINDOW_MINUTES = 15
@@ -127,21 +129,21 @@ class Candle:
 @dataclass
 class BacktestTrade:
     window_start: datetime
-    direction: str              # "long" or "short"
-    entry_price: float          # synthetic Polymarket price paid
-    position_size: float        # USD size (Kelly-determined)
+    direction: str  # "long" or "short"
+    entry_price: float  # synthetic Polymarket price paid
+    position_size: float  # USD size (Kelly-determined)
     actual_btc_open: float
     actual_btc_close: float
     btc_moved_up: bool
-    outcome: str                # "WIN" or "LOSS"
-    pnl: float                  # dollar P&L (after fees)
+    outcome: str  # "WIN" or "LOSS"
+    pnl: float  # dollar P&L (after fees)
     pnl_before_fees: float
     fee_paid: float
 
     # V3 quant fields
-    model_yes_price: float      # Jump-diffusion fair value
+    model_yes_price: float  # Jump-diffusion fair value
     model_no_price: float
-    edge: float                 # model - market
+    edge: float  # model - market
     edge_pct: float
     kelly_fraction: float
     realized_vol: float
@@ -166,7 +168,7 @@ class BacktestTrade:
 class BacktestResult:
     start_date: str
     end_date: str
-    strategy_mode: str          # "quant_v3" or "heuristic_v1"
+    strategy_mode: str  # "quant_v3" or "heuristic_v1"
     total_windows: int
     trades_taken: int
     trades_skipped: int
@@ -196,8 +198,8 @@ BINANCE_KLINE_URL = "https://api.binance.com/api/v3/klines"
 
 
 def fetch_binance_klines(
-    start_dt: datetime, end_dt: datetime,
-    symbol: str = "BTCUSDT", interval: str = "1m",
+        start_dt: datetime, end_dt: datetime,
+        symbol: str = "BTCUSDT", interval: str = "1m",
 ) -> List[Candle]:
     """Fetch 1-minute BTC/USDT candles from Binance public API."""
     candles: List[Candle] = []
@@ -267,15 +269,15 @@ def load_csv_candles(csv_path: str) -> List[Candle]:
 @dataclass
 class FundingSnapshot:
     timestamp: datetime
-    rate: float           # e.g. 0.0001 = 0.01%
-    rate_pct: float       # e.g. 0.01
-    classification: str   # EXTREME_POSITIVE, HIGH_POSITIVE, NEUTRAL, etc.
+    rate: float  # e.g. 0.0001 = 0.01%
+    rate_pct: float  # e.g. 0.01
+    classification: str  # EXTREME_POSITIVE, HIGH_POSITIVE, NEUTRAL, etc.
     mean_reversion_bias: float  # ±0.02 max
 
 
-FUNDING_EXTREME_THRESHOLD = 0.0005   # 0.05%/8h
-FUNDING_HIGH_THRESHOLD    = 0.0002   # 0.02%/8h
-FUNDING_MAX_BIAS          = 0.02     # ±2%
+FUNDING_EXTREME_THRESHOLD = 0.0005  # 0.05%/8h
+FUNDING_HIGH_THRESHOLD = 0.0002  # 0.02%/8h
+FUNDING_MAX_BIAS = 0.02  # ±2%
 
 
 def classify_funding(rate: float) -> Tuple[str, float]:
@@ -357,7 +359,6 @@ def get_funding_bias_at(snapshots: List[FundingSnapshot], ts: datetime) -> float
     return best.mean_reversion_bias if best else 0.0
 
 
-
 # =============================================================================
 # Realistic simulation config
 # =============================================================================
@@ -378,20 +379,20 @@ class RealisticConfig:
     genuinely increase live performance via better selectivity.
     """
     # ── Market simulation ─────────────────────────────────────
-    market_noise_std: float = 0.025     # ±2.5 cent random noise on synthetic prob
-    market_efficiency: float = 0.35     # Market already reflects 35% of model's view
-    spread_cents: float = 0.03          # 3-cent bid-ask spread (1.5c each side)
-    spread_widen_late: float = 0.02     # Spread widens +2c in last 3 minutes
+    market_noise_std: float = 0.025  # ±2.5 cent random noise on synthetic prob
+    market_efficiency: float = 0.35  # Market already reflects 35% of model's view
+    spread_cents: float = 0.03  # 3-cent bid-ask spread (1.5c each side)
+    spread_widen_late: float = 0.02  # Spread widens +2c in last 3 minutes
 
     # ── Execution simulation ──────────────────────────────────
-    fill_rate: float = 0.72             # Limit orders at bid fill 72% of time
+    fill_rate: float = 0.72  # Limit orders at bid fill 72% of time
     fill_rate_boost_edge: float = 0.10  # +10% fill rate per $0.10 edge (bigger edges = more aggressive)
 
     # ── Strategy improvements ─────────────────────────────────
-    min_edge_realistic: float = 0.05    # Raise floor from $0.02 → $0.05 (kills 52% WR noise)
-    min_vol_confidence: float = 0.40    # Don't trade when vol estimate is unreliable
-    max_consecutive_losses: int = 3     # Skip 1 window after 3 straight losses
-    max_trade_rate: float = 0.60        # Cap at 60% of windows traded (selectivity)
+    min_edge_realistic: float = 0.05  # Raise floor from $0.02 → $0.05 (kills 52% WR noise)
+    min_vol_confidence: float = 0.40  # Don't trade when vol estimate is unreliable
+    max_consecutive_losses: int = 3  # Skip 1 window after 3 straight losses
+    max_trade_rate: float = 0.60  # Cap at 60% of windows traded (selectivity)
 
     enabled: bool = False
 
@@ -400,10 +401,10 @@ class RealisticConfig:
 # Synthetic Polymarket probability from BTC price action
 # =============================================================================
 def btc_to_probability(
-    window_candles: List[Candle],
-    decision_minute: int = 2,
-    realistic: Optional[RealisticConfig] = None,
-    model_fair_value: Optional[float] = None,
+        window_candles: List[Candle],
+        decision_minute: int = 2,
+        realistic: Optional[RealisticConfig] = None,
+        model_fair_value: Optional[float] = None,
 ) -> float:
     """
     Convert BTC price movement into a synthetic Polymarket "Up" probability.
@@ -456,8 +457,8 @@ def btc_to_probability(
             # The Polymarket crowd partially knows what the model knows
             # efficiency=0.35 means the market price is 35% model + 65% base
             base_prob = (
-                realistic.market_efficiency * model_fair_value
-                + (1.0 - realistic.market_efficiency) * base_prob
+                    realistic.market_efficiency * model_fair_value
+                    + (1.0 - realistic.market_efficiency) * base_prob
             )
 
         # ── Random noise from retail flow / MM repositioning ──────────
@@ -513,11 +514,11 @@ def create_fusion_processors() -> Optional[Dict]:
 
 
 def run_confirmation(
-    processors: Optional[Dict],
-    current_price: Decimal,
-    price_history: List[Decimal],
-    metadata: Dict[str, Any],
-    model_bullish: bool,
+        processors: Optional[Dict],
+        current_price: Decimal,
+        price_history: List[Decimal],
+        metadata: Dict[str, Any],
+        model_bullish: bool,
 ) -> Tuple[int, int]:
     """
     Run old signal processors as CONFIRMATION.
@@ -560,9 +561,9 @@ def run_confirmation(
 
 
 def build_confirmation_metadata(
-    window_candles: List[Candle],
-    decision_minute: int,
-    historical_btc_closes: List[float],
+        window_candles: List[Candle],
+        decision_minute: int,
+        historical_btc_closes: List[float],
 ) -> Dict[str, Any]:
     """Build metadata dict for confirmation signal processors."""
     if len(window_candles) <= decision_minute:
@@ -608,25 +609,30 @@ def build_confirmation_metadata(
 
 
 def _classify_sentiment(score: float) -> str:
-    if score < 25: return "Extreme Fear"
-    elif score < 45: return "Fear"
-    elif score < 55: return "Neutral"
-    elif score < 75: return "Greed"
-    else: return "Extreme Greed"
+    if score < 25:
+        return "Extreme Fear"
+    elif score < 45:
+        return "Fear"
+    elif score < 55:
+        return "Neutral"
+    elif score < 75:
+        return "Greed"
+    else:
+        return "Extreme Greed"
 
 
 # =============================================================================
 # Main backtest loop — V3 QUANT STRATEGY
 # =============================================================================
 def run_backtest_v3(
-    candles: List[Candle],
-    decision_minute: int = 2,
-    verbose: bool = False,
-    use_confirmation: bool = True,
-    use_maker: bool = True,
-    use_funding: bool = True,
-    funding_snapshots: Optional[List[FundingSnapshot]] = None,
-    realistic: Optional[RealisticConfig] = None,
+        candles: List[Candle],
+        decision_minute: int = 2,
+        verbose: bool = False,
+        use_confirmation: bool = True,
+        use_maker: bool = True,
+        use_funding: bool = True,
+        funding_snapshots: Optional[List[FundingSnapshot]] = None,
+        realistic: Optional[RealisticConfig] = None,
 ) -> BacktestResult:
     """
     Backtest the V3.1 quant strategy:
@@ -721,7 +727,7 @@ def run_backtest_v3(
     windows_processed = 0
 
     # ── Process each window ──────────────────────────────────────────────
-    last_model_yes: Optional[float] = None   # For realistic market efficiency
+    last_model_yes: Optional[float] = None  # For realistic market efficiency
 
     for wi, window in enumerate(windows):
 
@@ -993,7 +999,7 @@ def run_backtest_v3(
             emoji = "✅" if won else "❌"
             fund_tag = f" fund={funding_regime[:3]}" if funding_bias != 0 else ""
             logger.info(
-                f"W{wi+1:>4}/{total_windows} | "
+                f"W{wi + 1:>4}/{total_windows} | "
                 f"{window[0].timestamp.strftime('%m-%d %H:%M')} | "
                 f"BTC ${btc_open:,.0f}{arrow}${btc_close:,.0f} | "
                 f"{'long' if direction == 'long' else 'short':>5} @{entry_price:.2f} "
@@ -1354,7 +1360,8 @@ Examples:
     print(f"  Decision minute:   {args.decision_minute}")
     if rc.enabled:
         print(f"  ── REALISTIC MODE ──")
-        print(f"  Spread:            {rc.spread_cents*100:.0f}¢ ({(rc.spread_cents + rc.spread_widen_late)*100:.0f}¢ late window)")
+        print(
+            f"  Spread:            {rc.spread_cents * 100:.0f}¢ ({(rc.spread_cents + rc.spread_widen_late) * 100:.0f}¢ late window)")
         print(f"  Fill rate:         {rc.fill_rate:.0%} base (+{rc.fill_rate_boost_edge:.0%}/10¢ edge)")
         print(f"  Market noise:      ±{rc.market_noise_std * 100:.1f}¢")
         print(f"  Market efficiency: {rc.market_efficiency:.0%} (MM partially reflects model)")

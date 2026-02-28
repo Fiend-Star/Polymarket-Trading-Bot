@@ -66,7 +66,7 @@ def apply_market_order_patch():
 
                 market_order_args = MarketOrderArgs(
                     token_id=get_polymarket_token_id(order.instrument_id),
-                    amount=usd_amount,          # ← USD, not tokens
+                    amount=usd_amount,  # ← USD, not tokens
                     side=order_side_to_str(order.side),
                     order_type=order_type,
                 )

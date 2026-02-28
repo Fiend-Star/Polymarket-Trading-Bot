@@ -33,12 +33,12 @@ class CustomDataProvider:
     - MarketData → TradeTick (synthetic)
     - Aggregates → Bar data
     """
-    
+
     def __init__(
-        self,
-        data_engine: DataEngine,
-        clock: LiveClock,
-        logger: Logger,
+            self,
+            data_engine: DataEngine,
+            clock: LiveClock,
+            logger: Logger,
     ):
         """
         Initialize custom data provider.
@@ -51,60 +51,60 @@ class CustomDataProvider:
         self.data_engine = data_engine
         self.clock = clock
         self.logger = logger
-        
+
         # Our unified adapter
         self.adapter: Optional[UnifiedDataAdapter] = None
-        
+
         # Instrument registry
         self.instruments = get_instrument_registry()
-        
+
         # Track last prices for each source
         self._last_prices: dict = {}
-        
+
         # Bar aggregators (for creating candlesticks)
         self._bar_aggregators: dict = defaultdict(list)
-        
+
         loguru_logger.info("Initialized Custom Data Provider")
-    
+
     async def connect(self) -> None:
         """Connect to data sources."""
         loguru_logger.info("Connecting custom data provider...")
-        
+
         # Create and connect unified adapter
         self.adapter = UnifiedDataAdapter()
-        
+
         # Set callbacks
         self.adapter.on_price_update = self._on_price_update
         self.adapter.on_sentiment_update = self._on_sentiment_update
-        
+
         # Connect all sources
         results = await self.adapter.connect_all()
-        
+
         connected = sum(results.values())
         loguru_logger.info(f"Connected {connected}/{len(results)} data sources")
-        
+
         # Register instruments with data engine
         self._register_instruments()
-        
+
         # Start streaming
         await self.adapter.start_streaming()
-        
+
         loguru_logger.info("Custom data provider connected and streaming")
-    
+
     async def disconnect(self) -> None:
         """Disconnect from data sources."""
         if self.adapter:
             await self.adapter.disconnect_all()
-        
+
         loguru_logger.info("Custom data provider disconnected")
-    
+
     def _register_instruments(self) -> None:
         """Register instruments with data engine."""
         for instrument in self.instruments.get_all():
             # Add instrument to data engine's cache
             # This makes it available to strategies
             loguru_logger.info(f"Registered instrument: {instrument.id}")
-    
+
     async def _on_price_update(self, data: MarketData) -> None:
         """
         Handle price update from ingestion layer.
@@ -119,25 +119,25 @@ class CustomDataProvider:
             instrument_id = self._get_instrument_id(data.source)
             if not instrument_id:
                 return
-            
+
             # Create quote tick
             quote_tick = self._create_quote_tick(data, instrument_id)
-            
+
             if quote_tick:
                 # Send to data engine
                 self.data_engine.process(quote_tick)
-                
+
                 # Also create synthetic trade tick
                 trade_tick = self._create_trade_tick(data, instrument_id)
                 if trade_tick:
                     self.data_engine.process(trade_tick)
-            
+
             # Update last price
             self._last_prices[data.source] = data.price
-            
+
         except Exception as e:
             loguru_logger.error(f"Error processing price update: {e}")
-    
+
     async def _on_sentiment_update(self, data) -> None:
         """
         Handle sentiment update.
@@ -147,7 +147,7 @@ class CustomDataProvider:
         """
         # Store sentiment for strategies to access
         loguru_logger.debug(f"Sentiment update: {data.score}/100 - {data.classification}")
-    
+
     def _get_instrument_id(self, source: str) -> Optional[InstrumentId]:
         """
         Map data source to instrument ID.
@@ -162,18 +162,18 @@ class CustomDataProvider:
             "coinbase": "BTC-USD.COINBASE",
             "binance": "BTCUSDT.BINANCE",
         }
-        
+
         instrument_id_str = mapping.get(source)
         if not instrument_id_str:
             return None
-        
+
         instrument = self.instruments.get(instrument_id_str)
         return instrument.id if instrument else None
-    
+
     def _create_quote_tick(
-        self,
-        data: MarketData,
-        instrument_id: InstrumentId,
+            self,
+            data: MarketData,
+            instrument_id: InstrumentId,
     ) -> Optional[QuoteTick]:
         """
         Create QuoteTick from market data.
@@ -203,11 +203,11 @@ class CustomDataProvider:
                 ask_str = f"{ask_val:.9f}".rstrip('0').rstrip('.')
                 bid_price = Price.from_str(bid_str if '.' in bid_str else f"{bid_str}.0")
                 ask_price = Price.from_str(ask_str if '.' in ask_str else f"{ask_str}.0")
-            
+
             # Default size
             bid_size = Quantity.from_str("1.0")
             ask_size = Quantity.from_str("1.0")
-            
+
             # Create quote tick
             quote_tick = QuoteTick(
                 instrument_id=instrument_id,
@@ -218,17 +218,17 @@ class CustomDataProvider:
                 ts_event=self._to_nanoseconds(data.timestamp),
                 ts_init=self.clock.timestamp_ns(),
             )
-            
+
             return quote_tick
-            
+
         except Exception as e:
             loguru_logger.error(f"Error creating quote tick: {e}")
             return None
-    
+
     def _create_trade_tick(
-        self,
-        data: MarketData,
-        instrument_id: InstrumentId,
+            self,
+            data: MarketData,
+            instrument_id: InstrumentId,
     ) -> Optional[TradeTick]:
         """
         Create synthetic TradeTick from market data.
@@ -245,7 +245,7 @@ class CustomDataProvider:
             last_price = self._last_prices.get(data.source)
             if last_price and last_price == data.price:
                 return None  # No price change, skip trade tick
-            
+
             # Determine aggressor side based on price movement
             if last_price:
                 aggressor_side = (
@@ -254,7 +254,7 @@ class CustomDataProvider:
                 )
             else:
                 aggressor_side = AggressorSide.BUYER
-            
+
             trade_tick = TradeTick(
                 instrument_id=instrument_id,
                 price=Price.from_str(str(data.price)),
@@ -264,22 +264,22 @@ class CustomDataProvider:
                 ts_event=self._to_nanoseconds(data.timestamp),
                 ts_init=self.clock.timestamp_ns(),
             )
-            
+
             return trade_tick
-            
+
         except Exception as e:
             loguru_logger.error(f"Error creating trade tick: {e}")
             return None
-    
+
     @staticmethod
     def _to_nanoseconds(dt: datetime) -> int:
         """Convert datetime to nanoseconds since epoch."""
         return int(dt.timestamp() * 1_000_000_000)
-    
+
     def get_latest_price(self, source: str) -> Optional[Decimal]:
         """Get latest price from a source."""
         return self._last_prices.get(source)
-    
+
     def get_price_consensus(self) -> Optional[dict]:
         """Get price consensus across all sources."""
         if self.adapter:

@@ -56,11 +56,11 @@ def set_simulation_mode(client, simulation: bool):
 def display_status(client):
     """Display current status."""
     mode = get_current_mode(client)
-    
+
     print("\n" + "=" * 60)
     print("BTC BOT - CURRENT STATUS")
     print("=" * 60)
-    
+
     if mode is None:
         print("Status: ⚪ Not set (using default from .env)")
     elif mode:
@@ -71,7 +71,7 @@ def display_status(client):
         print("Status: 🔴 LIVE TRADING MODE")
         print("  - REAL MONEY AT RISK!")
         print("  - Real orders will be placed")
-    
+
     print("=" * 60 + "\n")
 
 
@@ -80,24 +80,24 @@ def main():
     print("\n" + "=" * 60)
     print("BTC BOT - SIMULATION MODE CONTROL")
     print("=" * 60)
-    
+
     # Connect to Redis
     client = get_redis_client()
     if not client:
         return
-    
+
     # Show current status
     display_status(client)
-    
+
     # Parse command
     if len(sys.argv) > 1:
         command = sys.argv[1].lower()
-        
+
         if command in ['sim', 'simulation', 'on']:
             print("Switching to SIMULATION mode...")
             set_simulation_mode(client, True)
             display_status(client)
-            
+
         elif command in ['live', 'off']:
             print("\n⚠️  WARNING: Switching to LIVE TRADING mode!")
             confirm = input("Type 'yes' to confirm: ")
@@ -106,11 +106,11 @@ def main():
                 display_status(client)
             else:
                 print("Cancelled.")
-                
+
         elif command in ['status', 'check']:
             # Already displayed above
             pass
-            
+
         else:
             print(f"Unknown command: {command}")
             print("\nUsage:")
@@ -124,15 +124,15 @@ def main():
         print("  2. Enable live trading (⚠️ DANGEROUS!)")
         print("  3. Check status")
         print("  4. Exit")
-        
+
         while True:
             try:
                 choice = input("\nEnter choice (1-4): ").strip()
-                
+
                 if choice == '1':
                     set_simulation_mode(client, True)
                     display_status(client)
-                    
+
                 elif choice == '2':
                     print("\n⚠️  WARNING: This will enable LIVE TRADING!")
                     confirm = input("Type 'yes' to confirm: ")
@@ -141,17 +141,17 @@ def main():
                         display_status(client)
                     else:
                         print("Cancelled.")
-                        
+
                 elif choice == '3':
                     display_status(client)
-                    
+
                 elif choice == '4':
                     print("Goodbye!")
                     break
-                    
+
                 else:
                     print("Invalid choice!")
-                    
+
             except KeyboardInterrupt:
                 print("\nGoodbye!")
                 break

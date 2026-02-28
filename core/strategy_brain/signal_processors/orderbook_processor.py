@@ -68,12 +68,12 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
     """
 
     def __init__(
-        self,
-        imbalance_threshold: float = 0.30,   # 30% skew to signal
-        wall_threshold: float = 0.20,         # single order > 20% of book = wall
-        min_book_volume: float = 50.0,        # ignore books with < $50 total (illiquid)
-        min_confidence: float = 0.55,
-        top_levels: int = 10,                 # how many price levels to consider
+            self,
+            imbalance_threshold: float = 0.30,  # 30% skew to signal
+            wall_threshold: float = 0.20,  # single order > 20% of book = wall
+            min_book_volume: float = 50.0,  # ignore books with < $50 total (illiquid)
+            min_confidence: float = 0.55,
+            top_levels: int = 10,  # how many price levels to consider
     ):
         super().__init__("OrderBookImbalance")
 
@@ -123,7 +123,7 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
             try:
                 price = float(level.get("price", 0))
                 size = float(level.get("size", 0))
-                total += price * size   # USD value at each level
+                total += price * size  # USD value at each level
             except (ValueError, TypeError):
                 continue
         return total
@@ -144,10 +144,10 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
         return None
 
     def process(
-        self,
-        current_price: Decimal,
-        historical_prices: list,
-        metadata: Dict[str, Any] = None,
+            self,
+            current_price: Decimal,
+            historical_prices: list,
+            metadata: Dict[str, Any] = None,
     ) -> Optional[TradingSignal]:
         """Fetch order book synchronously and generate signal."""
         if not self.is_enabled or not metadata:

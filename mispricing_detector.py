@@ -36,15 +36,14 @@ RESEARCH-DRIVEN UPGRADES over V1:
      - VRP confirmation
 """
 
-import time
-import math
 from dataclasses import dataclass
-from typing import Optional
-from loguru import logger
 from datetime import datetime
+from typing import Optional
 
-from binary_pricer import BinaryOptionPricer, BinaryOptionPrice, get_binary_pricer
-from vol_estimator import VolEstimator, VolEstimate, get_vol_estimator
+from loguru import logger
+
+from binary_pricer import BinaryOptionPricer, get_binary_pricer
+from vol_estimator import VolEstimator, get_vol_estimator
 
 
 # ---------------------------------------------------------------------------
@@ -78,10 +77,10 @@ def polymarket_taker_fee_usd(price: float, num_shares: float) -> float:
 # ---------------------------------------------------------------------------
 
 def kelly_fraction(
-    true_prob: float,
-    market_price: float,
-    use_half_kelly: bool = True,
-    max_fraction: float = 0.05,
+        true_prob: float,
+        market_price: float,
+        use_half_kelly: bool = True,
+        max_fraction: float = 0.05,
 ) -> float:
     """
     Kelly-optimal fraction of bankroll to bet on a binary option.
@@ -128,7 +127,7 @@ class MispricingSignal:
     # Edge
     edge: float
     edge_pct: float
-    direction: str              # "BUY_YES", "BUY_NO", or "NO_TRADE"
+    direction: str  # "BUY_YES", "BUY_NO", or "NO_TRADE"
 
     # Prices
     yes_market: float
@@ -154,24 +153,24 @@ class MispricingSignal:
     # Vol analysis
     implied_vol: float
     realized_vol: float
-    vol_spread: float           # IV - RV (positive = market overpricing vol)
+    vol_spread: float  # IV - RV (positive = market overpricing vol)
 
     # V2: Variance Risk Premium
-    vrp: float                  # Current VRP (IV - RV annualized)
-    vrp_signal: str             # "FADE_EXTREME", "NEUTRAL", "VOL_CHEAP"
+    vrp: float  # Current VRP (IV - RV annualized)
+    vrp_signal: str  # "FADE_EXTREME", "NEUTRAL", "VOL_CHEAP"
 
     # Expected PnL
     expected_pnl: float
-    fee_cost: float             # V2: Uses correct nonlinear formula
+    fee_cost: float  # V2: Uses correct nonlinear formula
     net_expected_pnl: float
     is_tradeable: bool
 
     # V2: Kelly sizing
-    kelly_fraction: float       # Optimal bankroll fraction (half-Kelly)
-    kelly_bet_usd: float        # Dollar amount at optimal sizing
+    kelly_fraction: float  # Optimal bankroll fraction (half-Kelly)
+    kelly_bet_usd: float  # Dollar amount at optimal sizing
 
     # V2: Pricing method
-    pricing_method: str         # "adjusted", "merton_jd", "bsm"
+    pricing_method: str  # "adjusted", "merton_jd", "bsm"
 
     def __repr__(self):
         return (
@@ -188,7 +187,7 @@ class MispricingSignal:
 @dataclass
 class ExitSignal:
     """Signal to exit an existing position mid-market."""
-    action: str                 # "TAKE_PROFIT", "CUT_LOSS", "HOLD"
+    action: str  # "TAKE_PROFIT", "CUT_LOSS", "HOLD"
     current_value: float
     entry_price: float
     unrealized_pnl: float
@@ -213,21 +212,21 @@ class MispricingDetector:
     """
 
     def __init__(
-        self,
-        pricer: Optional[BinaryOptionPricer] = None,
-        vol_estimator: Optional[VolEstimator] = None,
-        # V2: maker_fee stays 0%, taker_fee is now computed dynamically
-        maker_fee: float = 0.00,
-        taker_fee: float = 0.02,    # V2: DEFAULT ~2% (was 10%!!) — overridden by nonlinear formula
-        min_edge_cents: float = 0.02,
-        min_edge_after_fees: float = 0.005,
-        take_profit_pct: float = 0.30,
-        cut_loss_pct: float = -0.50,
-        vol_method: str = "ewma",
-        # V2: Kelly parameters
-        bankroll: float = 50.0,     # Total bankroll in USD
-        use_half_kelly: bool = True,
-        max_kelly_fraction: float = 0.05,
+            self,
+            pricer: Optional[BinaryOptionPricer] = None,
+            vol_estimator: Optional[VolEstimator] = None,
+            # V2: maker_fee stays 0%, taker_fee is now computed dynamically
+            maker_fee: float = 0.00,
+            taker_fee: float = 0.02,  # V2: DEFAULT ~2% (was 10%!!) — overridden by nonlinear formula
+            min_edge_cents: float = 0.02,
+            min_edge_after_fees: float = 0.005,
+            take_profit_pct: float = 0.30,
+            cut_loss_pct: float = -0.50,
+            vol_method: str = "ewma",
+            # V2: Kelly parameters
+            bankroll: float = 50.0,  # Total bankroll in USD
+            use_half_kelly: bool = True,
+            max_kelly_fraction: float = 0.05,
     ):
         self.pricer = pricer or get_binary_pricer()
         self.vol_est = vol_estimator or get_vol_estimator()
@@ -259,19 +258,19 @@ class MispricingDetector:
     # ------------------------------------------------------------------
 
     def detect(
-        self,
-        yes_market_price: float,
-        no_market_price: float,
-        btc_spot: float,
-        btc_strike: float,
-        time_remaining_min: float,
-        position_size_usd: float = 1.0,
-        use_maker: bool = True,
-        # V3: Additional overlays
-        vol_skew: Optional[float] = None,
-        funding_bias: float = 0.0,
-        # V3.4: Exact market end time
-        market_end_time: Optional[datetime] = None,
+            self,
+            yes_market_price: float,
+            no_market_price: float,
+            btc_spot: float,
+            btc_strike: float,
+            time_remaining_min: float,
+            position_size_usd: float = 1.0,
+            use_maker: bool = True,
+            # V3: Additional overlays
+            vol_skew: Optional[float] = None,
+            funding_bias: float = 0.0,
+            # V3.4: Exact market end time
+            market_end_time: Optional[datetime] = None,
     ) -> MispricingSignal:
         """
         Detect mispricing between model and market.
@@ -370,7 +369,7 @@ class MispricingDetector:
             if vrp > 0.20:  # IV exceeds RV by 20%+
                 vrp_signal = "FADE_EXTREME"  # Market overpricing vol → fade extreme prices
             elif vrp < -0.05:
-                vrp_signal = "VOL_CHEAP"     # Rare: market underpricing vol
+                vrp_signal = "VOL_CHEAP"  # Rare: market underpricing vol
             else:
                 vrp_signal = "NEUTRAL"
 
@@ -379,14 +378,14 @@ class MispricingDetector:
         # we assume the market efficiently prices the base diffusion process.
         # Our alpha is entirely isolated in the overlays.
         total_overlay_adj = (
-            model.jump_adjustment +
-            model.mean_reversion_adj +
-            model.candle_effect_adj +
-            model.seasonality_adj +
-            model.skew_adj +
-            funding_bias
+                model.jump_adjustment +
+                model.mean_reversion_adj +
+                model.candle_effect_adj +
+                model.seasonality_adj +
+                model.skew_adj +
+                funding_bias
         )
-        
+
         # Apply overlays directly to market price
         conditional_yes_prob = max(0.01, min(0.99, yes_market_price + total_overlay_adj))
         conditional_no_prob = 1.0 - conditional_yes_prob
@@ -440,11 +439,11 @@ class MispricingDetector:
         )
 
         is_tradeable = (
-            abs_edge >= min_edge
-            and net_expected_pnl >= self.min_edge_after_fees
-            and time_remaining_min >= 1.0
-            and vol_confidence >= 0.2    # V2: Lowered from 0.3 (JD more robust)
-            and kf > 0.001              # V2: Kelly says there's an edge
+                abs_edge >= min_edge
+                and net_expected_pnl >= self.min_edge_after_fees
+                and time_remaining_min >= 1.0
+                and vol_confidence >= 0.2  # V2: Lowered from 0.3 (JD more robust)
+                and kf > 0.001  # V2: Kelly says there's an edge
         )
 
         # V2: VRP confirmation — if VRP is wide and we're fading an extreme, boost confidence
@@ -452,7 +451,7 @@ class MispricingDetector:
         if vrp_signal == "FADE_EXTREME":
             # We should be fading extreme market prices
             if (direction == "BUY_NO" and yes_market_price > 0.70) or \
-               (direction == "BUY_YES" and no_market_price > 0.70):
+                    (direction == "BUY_YES" and no_market_price > 0.70):
                 vrp_boost = 0.10  # Extra confidence for VRP-confirmed trades
 
         # V2: Theta check — don't trade if time decay exceeds edge
@@ -468,11 +467,11 @@ class MispricingDetector:
         edge_conf = min(1.0, abs_edge / 0.10)
         time_conf = min(1.0, time_remaining_min / 5.0)
         confidence = (
-            vol_confidence * 0.3
-            + edge_conf * 0.3
-            + time_conf * 0.2
-            + (0.1 if kf > 0.01 else 0.0)  # Kelly confirms edge
-            + vrp_boost
+                vol_confidence * 0.3
+                + edge_conf * 0.3
+                + time_conf * 0.2
+                + (0.1 if kf > 0.01 else 0.0)  # Kelly confirms edge
+                + vrp_boost
         )
 
         if is_tradeable:
@@ -504,8 +503,8 @@ class MispricingDetector:
             fee_cost=fee_cost,
             net_expected_pnl=net_expected_pnl,
             is_tradeable=is_tradeable,
-            kelly_fraction=kf,          # We pass the pure fraction
-            kelly_bet_usd=0.0,          # Deprecated, Risk Engine handles this now
+            kelly_fraction=kf,  # We pass the pure fraction
+            kelly_bet_usd=0.0,  # Deprecated, Risk Engine handles this now
             pricing_method=model.method,
         )
 
@@ -519,7 +518,8 @@ class MispricingDetector:
         logger.info(f"  Returns: ret={return_stats.recent_return:+.3%}, σ={return_stats.recent_return_sigma:+.2f}")
         logger.info(f"  Model: YES=${model.yes_fair_value:.4f}, NO=${model.no_fair_value:.4f} [{model.method}]")
         logger.info(f"    BSM base={model.bsm_base:.4f}, JD adj={model.jump_adjustment:+.4f}")
-        logger.info(f"    MR adj={model.mean_reversion_adj:+.4f}, candle={model.candle_effect_adj:+.4f}, season={model.seasonality_adj:+.4f}")
+        logger.info(
+            f"    MR adj={model.mean_reversion_adj:+.4f}, candle={model.candle_effect_adj:+.4f}, season={model.seasonality_adj:+.4f}")
         logger.info(f"  Market: YES=${yes_market_price:.4f}, NO=${no_market_price:.4f}")
         logger.info(f"  Edge: {primary_edge:+.4f} ({edge_pct:+.1%})")
         logger.info(f"  Fee: {fee_rate:.2%} (V2 nonlinear) → cost=${fee_cost:.4f}")
@@ -536,14 +536,14 @@ class MispricingDetector:
     # ------------------------------------------------------------------
 
     def check_exit(
-        self,
-        entry_price: float,
-        direction: str,
-        btc_spot: float,
-        btc_strike: float,
-        time_remaining_min: float,
-        yes_market_price: float,
-        no_market_price: float,
+            self,
+            entry_price: float,
+            direction: str,
+            btc_spot: float,
+            btc_strike: float,
+            time_remaining_min: float,
+            yes_market_price: float,
+            no_market_price: float,
     ) -> ExitSignal:
         """Check if an open position should be exited mid-market."""
         vol_estimate = self.vol_est.get_vol(method=self.vol_method)
@@ -610,7 +610,7 @@ class MispricingDetector:
     # ------------------------------------------------------------------
 
     def optimal_entry_window(
-        self, btc_spot: float, btc_strike: float, total_market_minutes: float = 15.0,
+            self, btc_spot: float, btc_strike: float, total_market_minutes: float = 15.0,
     ) -> dict:
         """Analyze Greeks across market lifetime for optimal entry timing."""
         vol_est = self.vol_est.get_vol(method=self.vol_method)
@@ -670,6 +670,7 @@ class MispricingDetector:
 # Singleton
 # ---------------------------------------------------------------------------
 _detector_instance = None
+
 
 def get_mispricing_detector(**kwargs) -> MispricingDetector:
     global _detector_instance

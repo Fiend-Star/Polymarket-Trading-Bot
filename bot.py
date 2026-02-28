@@ -1,15 +1,15 @@
 import asyncio
+import math
 import os
 import sys
-from pathlib import Path
-from datetime import datetime, timezone
-import math
-from decimal import Decimal
-import time
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict
-from types import SimpleNamespace
 import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+from types import SimpleNamespace
+from typing import List, Optional, Dict
 
 # Add project to path
 project_root = Path(__file__).parent
@@ -49,7 +49,7 @@ from nautilus_trader.adapters.polymarket.factories import (
     PolymarketLiveExecClientFactory,
 )
 from nautilus_trader.trading.strategy import Strategy
-from nautilus_trader.model.identifiers import InstrumentId, ClientOrderId
+from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.objects import Quantity, Price
 from nautilus_trader.model.data import QuoteTick
@@ -62,6 +62,7 @@ import requests
 # Persistent HTTP session for Gamma API calls (reuses TCP/TLS connections)
 _gamma_session: Optional[requests.Session] = None
 
+
 def _get_gamma_session() -> requests.Session:
     """Return a module-level persistent requests.Session for Gamma API."""
     global _gamma_session
@@ -69,6 +70,7 @@ def _get_gamma_session() -> requests.Session:
         _gamma_session = requests.Session()
         _gamma_session.headers.update({"Accept": "application/json"})
     return _gamma_session
+
 
 # Signal processors (kept as confirmation signals in V3)
 from core.strategy_brain.signal_processors.spike_detector import SpikeDetectionProcessor
@@ -82,7 +84,7 @@ from monitoring.grafana_exporter import get_grafana_exporter
 from feedback.learning_engine import get_learning_engine
 
 # V3: Quantitative pricing model
-from binary_pricer import get_binary_pricer, BinaryOptionPricer
+from binary_pricer import get_binary_pricer
 from vol_estimator import get_vol_estimator
 from mispricing_detector import get_mispricing_detector
 
@@ -137,7 +139,8 @@ SHADOW_MODE_ONLY = os.getenv("SHADOW_MODE_ONLY", "false").lower() == "true"
 
 # V3: Gamma Scalping Config
 GAMMA_EXIT_PROFIT_PCT = float(os.getenv("GAMMA_EXIT_PROFIT_PCT", "0.04"))  # 4% profit threshold for late exit
-GAMMA_EXIT_TIME_MINS = float(os.getenv("GAMMA_EXIT_TIME_MINS", "3.0"))     # Active threshold in final 3 minutes
+GAMMA_EXIT_TIME_MINS = float(os.getenv("GAMMA_EXIT_TIME_MINS", "3.0"))  # Active threshold in final 3 minutes
+
 
 # =============================================================================
 # Data classes
@@ -349,7 +352,7 @@ class IntegratedBTCStrategy(Strategy):
         self.vol_estimator = get_vol_estimator()
         self.mispricing_detector = get_mispricing_detector(
             maker_fee=0.00,
-            taker_fee=0.02,         # V2: ~2% default, overridden by nonlinear formula (was 10%!)
+            taker_fee=0.02,  # V2: ~2% default, overridden by nonlinear formula (was 10%!)
             min_edge_cents=MIN_EDGE_CENTS,
             min_edge_after_fees=0.005,
             take_profit_pct=TAKE_PROFIT_PCT,
@@ -642,7 +645,7 @@ class IntegratedBTCStrategy(Strategy):
         elif self.rtds and self.rtds.binance_btc_price > 0 and self.rtds.binance_age_ms < 60000:
             # V3.2: RTDS Binance as intermediate fallback (Chainlink feed may be silent)
             spot = self.rtds.binance_btc_price
-            
+
         # Concurrent I/O fetches
         async def _fetch_coinbase():
             if spot is not None or not self._coinbase_source:
@@ -768,7 +771,7 @@ class IntegratedBTCStrategy(Strategy):
 
         if self.grafana_exporter:
             threading.Thread(target=self._start_grafana_sync, daemon=True).start()
-            
+
         # V3.2 FIX: Dedicated background thread for News polling
         self.news_thread = self._start_news_polling()
 
@@ -1251,7 +1254,7 @@ class IntegratedBTCStrategy(Strategy):
                         if self._strike_defer_start is None:
                             self._strike_defer_start = time.time()
                         defer_elapsed = time.time() - self._strike_defer_start
-                        
+
                         # Throttle log to every 30s
                         if getattr(self, "_last_defer_log", 0) < time.time() - 25:
                             logger.debug(
@@ -1330,14 +1333,14 @@ class IntegratedBTCStrategy(Strategy):
             # Evaluates continuously between TRADE_WINDOW_START_SEC and TRADE_WINDOW_END_SEC
             # Locks out only AFTER a successful execution or decision has been recorded
             if (TRADE_WINDOW_START_SEC <= seconds_into_sub_interval < TRADE_WINDOW_END_SEC
-                    and trade_key != self.last_trade_time 
+                    and trade_key != self.last_trade_time
                     and self._btc_strike_price is not None):
 
                 # We don't lock `self.last_trade_time` here yet! 
                 # We only lock it if `_make_trading_decision_sync` actually executes a trade.
                 # However we do want to ratelimit the logs + evaluations so we don't spam the CPU 
                 # 50 times a second. We'll evaluate once every 5 seconds.
-                
+
                 # Use a throttling key for evaluations
                 throttle_key = f"{sub_interval}_{int(seconds_into_sub_interval // 5)}"
                 if getattr(self, "_last_eval_throttle", None) != throttle_key:
@@ -1507,8 +1510,8 @@ class IntegratedBTCStrategy(Strategy):
             else:
                 logger.warning(
                     f"No BTC spot or strike — SKIPPING trade (live mode requires quant model). "
-                    f"spot={'$'+f'{btc_spot:,.2f}' if btc_spot else 'None'}, "
-                    f"strike={'$'+f'{self._btc_strike_price:,.2f}' if self._btc_strike_price else 'None'}"
+                    f"spot={'$' + f'{btc_spot:,.2f}' if btc_spot else 'None'}, "
+                    f"strike={'$' + f'{self._btc_strike_price:,.2f}' if self._btc_strike_price else 'None'}"
                 )
             return
 
@@ -1954,7 +1957,7 @@ class IntegratedBTCStrategy(Strategy):
             elif edge > 0.04 or signal.confidence > 0.70:
                 # STRONG EDGE: Penny the bid to jump the queue (Maker status likely)
                 limit_price = token_bid + Decimal("0.001")
-                limit_price = min(limit_price, token_ask - Decimal("0.001")) # Don't cross ask
+                limit_price = min(limit_price, token_ask - Decimal("0.001"))  # Don't cross ask
                 logger.info(f"🎯 STRONG EDGE ({edge:.1%}): Pennying the bid (+0.001) to jump queue.")
             else:
                 # STANDARD EDGE: Rest passively at the bid (Pure Maker)
@@ -2196,6 +2199,7 @@ class IntegratedBTCStrategy(Strategy):
 
     def _start_news_polling(self):
         """Start news/sentiment polling in a dedicated background thread."""
+
         def _run():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -2335,6 +2339,7 @@ class IntegratedBTCStrategy(Strategy):
                     async def _shutdown_grafana():
                         await self.grafana_exporter.stop()
                         grafana_loop.stop()
+
                     asyncio.run_coroutine_threadsafe(_shutdown_grafana(), grafana_loop)
                 else:
                     # Loop already stopped — just clean up
@@ -2366,7 +2371,8 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         except Exception as e:
             logger.warning(f"Could not set Redis simulation mode: {e}")
 
-    print(f"\nMode: {'SIMULATION' if simulation else 'LIVE TRADING'} | Trade Size: ${POSITION_SIZE_USD} | Min Edge: ${MIN_EDGE_CENTS:.2f}")
+    print(
+        f"\nMode: {'SIMULATION' if simulation else 'LIVE TRADING'} | Trade Size: ${POSITION_SIZE_USD} | Min Edge: ${MIN_EDGE_CENTS:.2f}")
 
     logger.info("Loading BTC 15-min markets via event slug builder...")
 
@@ -2463,5 +2469,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

@@ -36,26 +36,26 @@ console = Console()
 async def test_signal_processors():
     """Test all signal processors."""
     console.print("\n[cyan]═══ Testing Signal Processors ═══[/cyan]")
-    
+
     try:
         # Create processors
         spike = SpikeDetectionProcessor()
         sentiment = SentimentProcessor()
         divergence = PriceDivergenceProcessor()
-        
+
         console.print("✓ All processors initialized")
-        
+
         # Test spike detector with simulated data
         console.print("\nTesting Spike Detector...", end="")
-        
+
         # Create price history (stable around 65000)
-        history = [Decimal(str(65000 + i*10)) for i in range(-20, 0)]
-        
+        history = [Decimal(str(65000 + i * 10)) for i in range(-20, 0)]
+
         # Simulate a spike
         current = Decimal("70000")  # 7.7% spike
-        
+
         signal = spike.process(current, history)
-        
+
         if signal:
             console.print(" [green]✓ Spike detected![/green]")
             console.print(f"  Direction: {signal.direction.value}")
@@ -63,36 +63,36 @@ async def test_signal_processors():
             console.print(f"  Score: {signal.score:.1f}")
         else:
             console.print(" [yellow]⚠ No spike detected (adjust threshold)[/yellow]")
-        
+
         # Test sentiment processor
         console.print("\nTesting Sentiment Processor...", end="")
-        
+
         metadata = {"sentiment_score": 15.0}  # Extreme fear
         signal = sentiment.process(current, history, metadata)
-        
+
         if signal:
             console.print(" [green]✓ Sentiment signal generated![/green]")
             console.print(f"  Direction: {signal.direction.value}")
             console.print(f"  Score: {signal.score:.1f}")
         else:
             console.print(" [yellow]⚠ No sentiment signal[/yellow]")
-        
+
         # Test divergence processor
         console.print("\nTesting Divergence Processor...", end="")
-        
+
         metadata = {"spot_price": 67000.0}  # 4.5% divergence
         signal = divergence.process(current, history, metadata)
-        
+
         if signal:
             console.print(" [green]✓ Divergence detected![/green]")
             console.print(f"  Direction: {signal.direction.value}")
             console.print(f"  Divergence: {signal.metadata['divergence_pct']:.2%}")
         else:
             console.print(" [yellow]⚠ No divergence detected[/yellow]")
-        
+
         console.print("\n[green]✓ Signal Processors - Tests passed![/green]")
         return True
-        
+
     except Exception as e:
         console.print(f"\n[red]Error testing processors: {e}[/red]")
         import traceback
@@ -103,10 +103,10 @@ async def test_signal_processors():
 async def test_fusion_engine():
     """Test signal fusion engine."""
     console.print("\n[cyan]═══ Testing Signal Fusion Engine ═══[/cyan]")
-    
+
     try:
         fusion = get_fusion_engine()
-        
+
         # Create test signals
         from strategy_brain.signal_processors.base_processor import (
             TradingSignal,
@@ -114,7 +114,7 @@ async def test_fusion_engine():
             SignalDirection,
             SignalStrength,
         )
-        
+
         signals = [
             # Bullish spike signal
             TradingSignal(
@@ -137,11 +137,11 @@ async def test_fusion_engine():
                 current_price=Decimal("65000"),
             ),
         ]
-        
+
         console.print(f"Fusing {len(signals)} signals...", end="")
-        
+
         fused = fusion.fuse_signals(signals)
-        
+
         if fused:
             console.print(" [green]✓ Fusion successful![/green]")
             console.print(f"  Direction: {fused.direction.value}")
@@ -151,17 +151,17 @@ async def test_fusion_engine():
         else:
             console.print(" [red]✗ Fusion failed[/red]")
             return False
-        
+
         # Test statistics
         console.print("\nChecking statistics...", end="")
         stats = fusion.get_statistics()
-        
+
         console.print(" [green]✓ Stats available[/green]")
         console.print(f"  Total fusions: {stats['total_fusions']}")
-        
+
         console.print("\n[green]✓ Signal Fusion Engine - Tests passed![/green]")
         return True
-        
+
     except Exception as e:
         console.print(f"\n[red]Error testing fusion: {e}[/red]")
         import traceback
@@ -172,54 +172,54 @@ async def test_fusion_engine():
 async def test_btc_strategy():
     """Test 15-minute BTC strategy."""
     console.print("\n[cyan]═══ Testing 15-Min BTC Strategy ═══[/cyan]")
-    
+
     try:
         strategy = get_btc_strategy()
-        
+
         # Update market data
         console.print("Updating market data...", end="")
-        
+
         # Simulate price history
         for i in range(30):
             strategy.update_market_data(
-                price=Decimal(str(65000 + i*50)),
-                spot_consensus=Decimal(str(65000 + i*50)),
+                price=Decimal(str(65000 + i * 50)),
+                spot_consensus=Decimal(str(65000 + i * 50)),
                 sentiment=20.0,  # Extreme fear
             )
-        
+
         # Spike price
         strategy.update_market_data(
             price=Decimal("75000"),  # 15% spike
             spot_consensus=Decimal("67000"),
             sentiment=85.0,  # Extreme greed
         )
-        
+
         console.print(" [green]✓ Market data updated[/green]")
-        
+
         # Process signals manually
         console.print("Processing signals...", end="")
-        
+
         signals = strategy._process_signals()
-        
+
         if signals:
             console.print(f" [green]✓ {len(signals)} signals generated[/green]")
             for sig in signals:
                 console.print(f"  • {sig.source}: {sig.direction.value} (score={sig.score:.1f})")
         else:
             console.print(" [yellow]⚠ No signals generated[/yellow]")
-        
+
         # Get statistics
         console.print("\nGetting strategy statistics...", end="")
         stats = strategy.get_statistics()
-        
+
         console.print(" [green]✓ Stats available[/green]")
         console.print(f"  Signals processed: {stats['signals_processed']}")
         console.print(f"  Trades executed: {stats['trades_executed']}")
         console.print(f"  Open positions: {stats['open_positions']}")
-        
+
         console.print("\n[green]✓ BTC Strategy - Tests passed![/green]")
         return True
-        
+
     except Exception as e:
         console.print(f"\n[red]Error testing strategy: {e}[/red]")
         import traceback
@@ -234,35 +234,35 @@ async def run_all_tests():
         "Testing signal processing and strategy logic...",
         border_style="cyan"
     ))
-    
+
     results = {}
-    
+
     # Test each component
     results["Signal Processors"] = await test_signal_processors()
     results["Fusion Engine"] = await test_fusion_engine()
     results["BTC Strategy"] = await test_btc_strategy()
-    
+
     # Summary
-    console.print("\n" + "="*60)
+    console.print("\n" + "=" * 60)
     console.print("[bold]TEST SUMMARY[/bold]")
-    console.print("="*60)
-    
+    console.print("=" * 60)
+
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Component", style="cyan", width=25)
     table.add_column("Status", width=15)
     table.add_column("Ready for Phase 5", width=15)
-    
+
     for component, passed in results.items():
         status = "[green]✓ PASSED[/green]" if passed else "[red]✗ FAILED[/red]"
         ready = "[green]Yes[/green]" if passed else "[red]No[/red]"
         table.add_row(component, status, ready)
-    
+
     console.print(table)
-    
+
     # Overall result
     all_passed = all(results.values())
-    
-    console.print("\n" + "="*60)
+
+    console.print("\n" + "=" * 60)
     if all_passed:
         console.print("[bold green]✓ ALL TESTS PASSED![/bold green]")
         console.print("\n[cyan]Phase 4 is complete and working![/cyan]")
@@ -276,12 +276,12 @@ async def run_all_tests():
 
 @app.command()
 def test(
-    component: str = typer.Option(
-        "all",
-        "--component",
-        "-c",
-        help="Test specific component: all, processors, fusion, strategy"
-    )
+        component: str = typer.Option(
+            "all",
+            "--component",
+            "-c",
+            help="Test specific component: all, processors, fusion, strategy"
+        )
 ):
     """
     Test Strategy Brain components.
@@ -290,6 +290,7 @@ def test(
         python scripts/test_strategy.py test
         python scripts/test_strategy.py test --component processors
     """
+
     async def run_specific_test():
         if component == "all":
             return await run_all_tests()
@@ -302,7 +303,7 @@ def test(
         else:
             console.print(f"[red]Unknown component: {component}[/red]")
             return 1
-    
+
     exit_code = asyncio.run(run_specific_test())
     raise typer.Exit(exit_code)
 

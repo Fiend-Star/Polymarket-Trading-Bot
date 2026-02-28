@@ -52,7 +52,7 @@ class VolEstimate:
     num_returns: int
     vol_per_minute: float
     method: str
-    confidence: float           # 0-1, based on sample size
+    confidence: float  # 0-1, based on sample size
     timestamp: float
 
     def __repr__(self):
@@ -68,12 +68,12 @@ class VolEstimate:
 @dataclass
 class JumpEstimate:
     """Jump parameters for Merton jump-diffusion pricer."""
-    intensity: float        # λ: jumps per year
-    mean: float             # μ_J: mean log-jump size
-    vol: float              # σ_J: jump size std dev
-    recent_jump: bool       # Whether a jump was detected in the last N bars
-    num_jumps_detected: int # Jumps in current window
-    confidence: float       # 0-1
+    intensity: float  # λ: jumps per year
+    mean: float  # μ_J: mean log-jump size
+    vol: float  # σ_J: jump size std dev
+    recent_jump: bool  # Whether a jump was detected in the last N bars
+    num_jumps_detected: int  # Jumps in current window
+    confidence: float  # 0-1
 
     def __repr__(self):
         return (
@@ -86,10 +86,10 @@ class JumpEstimate:
 @dataclass
 class ReturnStats:
     """Return statistics for mean reversion and other overlays."""
-    recent_return: float            # Return since some reference (e.g., market open)
-    recent_return_sigma: float      # That return in σ units
-    rolling_autocorr: float         # First-order autocorrelation of recent returns
-    mean_reversion_active: bool     # Whether |return_sigma| > threshold
+    recent_return: float  # Return since some reference (e.g., market open)
+    recent_return_sigma: float  # That return in σ units
+    rolling_autocorr: float  # First-order autocorrelation of recent returns
+    mean_reversion_active: bool  # Whether |return_sigma| > threshold
     num_returns: int
 
     def __repr__(self):
@@ -126,16 +126,16 @@ class VolEstimator:
     """
 
     def __init__(
-        self,
-        window_minutes: float = 60.0,
-        resample_interval_sec: float = 60.0,
-        ewma_halflife_samples: int = 20,
-        min_samples: int = 5,
-        default_vol: float = 0.65,
-        # V2: EGARCH parameters
-        leverage_gamma: float = 0.15,       # Asymmetric response to negative returns
-        # V2: Jump detection
-        jump_threshold_sigma: float = 3.0,  # Flag returns > 3σ as jumps
+            self,
+            window_minutes: float = 60.0,
+            resample_interval_sec: float = 60.0,
+            ewma_halflife_samples: int = 20,
+            min_samples: int = 5,
+            default_vol: float = 0.65,
+            # V2: EGARCH parameters
+            leverage_gamma: float = 0.15,  # Asymmetric response to negative returns
+            # V2: Jump detection
+            jump_threshold_sigma: float = 3.0,  # Flag returns > 3σ as jumps
     ):
         self.window_minutes = window_minutes
         self.resample_interval_sec = resample_interval_sec
@@ -459,7 +459,7 @@ class VolEstimator:
         # scale up during crashes and blind the detector.
         interval_minutes = self.resample_interval_sec / 60.0
         expected_std = (self.default_vol / math.sqrt(MINUTES_PER_YEAR)) * math.sqrt(interval_minutes)
-        
+
         if expected_std > 0:
             sigma_units = abs(log_return) / expected_std
             if sigma_units > self.jump_threshold_sigma:
@@ -494,9 +494,9 @@ class VolEstimator:
         if num_jumps < 2:
             # Conservative defaults: ~4 jumps/day, slight negative bias
             return JumpEstimate(
-                intensity=1500.0,   # ~4/day
-                mean=-0.0008,       # Slight negative (liquidation cascades)
-                vol=0.003,          # ~0.3% typical jump size
+                intensity=1500.0,  # ~4/day
+                mean=-0.0008,  # Slight negative (liquidation cascades)
+                vol=0.003,  # ~0.3% typical jump size
                 recent_jump=recent_jump,
                 num_jumps_detected=num_jumps,
                 confidence=0.1,
@@ -537,7 +537,7 @@ class VolEstimator:
     # ------------------------------------------------------------------
 
     def get_return_stats(
-        self, reference_price: Optional[float] = None
+            self, reference_price: Optional[float] = None
     ) -> ReturnStats:
         """
         Compute return statistics for mean reversion and other overlays.
@@ -674,6 +674,7 @@ class VolEstimator:
 # Singleton
 # ---------------------------------------------------------------------------
 _vol_instance = None
+
 
 def get_vol_estimator() -> VolEstimator:
     global _vol_instance

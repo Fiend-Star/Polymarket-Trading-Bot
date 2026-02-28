@@ -32,32 +32,32 @@ class Trade:
 class PerformanceMetrics:
     """Performance metrics snapshot."""
     timestamp: datetime
-    
+
     # P&L metrics
     total_pnl: Decimal
     realized_pnl: Decimal
     unrealized_pnl: Decimal
-    
+
     # Trade statistics
     total_trades: int
     winning_trades: int
     losing_trades: int
     win_rate: float
-    
+
     # Return metrics
     roi: float  # Return on investment
     sharpe_ratio: float
     max_drawdown: float
-    
+
     # Position metrics
     open_positions: int
     avg_position_size: Decimal
     avg_hold_time: float  # seconds
-    
+
     # Risk metrics
     total_exposure: Decimal
     risk_utilization: float  # % of max risk used
-    
+
     # Signal performance
     avg_signal_score: float
     avg_signal_confidence: float
@@ -73,10 +73,10 @@ class PerformanceTracker:
     - Risk analytics
     - Signal effectiveness
     """
-    
+
     def __init__(
-        self,
-        initial_capital: Decimal = Decimal("1000.0"),
+            self,
+            initial_capital: Decimal = Decimal("1000.0"),
     ):
         """
         Initialize performance tracker.
@@ -86,35 +86,35 @@ class PerformanceTracker:
         """
         self.initial_capital = initial_capital
         self.current_capital = initial_capital
-        
+
         # Trade history
         self._trades: List[Trade] = []
         self._max_trades_history = 1000
-        
+
         # Metrics history (for Grafana)
         self._metrics_history: deque = deque(maxlen=10000)
-        
+
         # Performance cache
         self._last_metrics: Optional[PerformanceMetrics] = None
         self._metrics_dirty = True
-        
+
         # Peak tracking for drawdown
         self._peak_capital = initial_capital
-        
+
         logger.info(f"Initialized Performance Tracker (capital=${initial_capital})")
-    
+
     def record_trade(
-        self,
-        trade_id: str,
-        direction: str,
-        entry_price: Decimal,
-        exit_price: Decimal,
-        size: Decimal,
-        entry_time: datetime,
-        exit_time: datetime,
-        signal_score: float = 0.0,
-        signal_confidence: float = 0.0,
-        metadata: Dict[str, Any] = None,
+            self,
+            trade_id: str,
+            direction: str,
+            entry_price: Decimal,
+            exit_price: Decimal,
+            size: Decimal,
+            entry_time: datetime,
+            exit_time: datetime,
+            signal_score: float = 0.0,
+            signal_confidence: float = 0.0,
+            metadata: Dict[str, Any] = None,
     ) -> Trade:
         """
         Record a completed trade.
@@ -139,12 +139,12 @@ class PerformanceTracker:
             pnl_pct = (exit_price - entry_price) / entry_price
         else:  # short
             pnl_pct = (entry_price - exit_price) / entry_price
-        
+
         pnl = size * pnl_pct
-        
+
         # Calculate duration
         duration = (exit_time - entry_time).total_seconds()
-        
+
         # Create trade record
         trade = Trade(
             trade_id=trade_id,
@@ -160,31 +160,31 @@ class PerformanceTracker:
             signal_confidence=signal_confidence,
             metadata=metadata or {},
         )
-        
+
         # Store trade
         self._trades.append(trade)
-        
+
         # Limit history size
         if len(self._trades) > self._max_trades_history:
             self._trades.pop(0)
-        
+
         # Update capital
         self.current_capital += pnl
-        
+
         # Update peak for drawdown tracking
         if self.current_capital > self._peak_capital:
             self._peak_capital = self.current_capital
-        
+
         # Mark metrics as dirty
         self._metrics_dirty = True
-        
+
         logger.info(
             f"Recorded trade: {trade_id} "
             f"{direction.upper()} P&L=${pnl:+.2f} ({pnl_pct:+.2%})"
         )
-        
+
         return trade
-    
+
     def calculate_metrics(self, force: bool = False) -> PerformanceMetrics:
         """
         Calculate current performance metrics.
@@ -198,25 +198,26 @@ class PerformanceTracker:
         # Return cached if available and not dirty
         if not force and not self._metrics_dirty and self._last_metrics:
             return self._last_metrics
-        
+
         # Calculate metrics
         total_pnl = self.current_capital - self.initial_capital
-        
+
         # Trade statistics
         total_trades = len(self._trades)
         winning_trades = len([t for t in self._trades if t.pnl > 0])
         losing_trades = len([t for t in self._trades if t.pnl < 0])
         win_rate = winning_trades / total_trades if total_trades > 0 else 0.0
-        
+
         # Return metrics
         roi = float((self.current_capital - self.initial_capital) / self.initial_capital)
-        
+
         # Sharpe ratio (simplified - uses daily returns)
         sharpe = self._calculate_sharpe_ratio()
-        
+
         # Max drawdown
-        max_dd = float((self._peak_capital - self.current_capital) / self._peak_capital) if self._peak_capital > 0 else 0.0
-        
+        max_dd = float(
+            (self._peak_capital - self.current_capital) / self._peak_capital) if self._peak_capital > 0 else 0.0
+
         # Position metrics
         if total_trades > 0:
             avg_size = sum(t.size for t in self._trades) / total_trades
@@ -228,7 +229,7 @@ class PerformanceTracker:
             avg_hold = 0.0
             avg_score = 0.0
             avg_conf = 0.0
-        
+
         # Create metrics
         metrics = PerformanceMetrics(
             timestamp=datetime.now(),
@@ -250,16 +251,16 @@ class PerformanceTracker:
             avg_signal_score=avg_score,
             avg_signal_confidence=avg_conf,
         )
-        
+
         # Cache metrics
         self._last_metrics = metrics
         self._metrics_dirty = False
-        
+
         # Add to history for Grafana
         self._metrics_history.append(metrics)
-        
+
         return metrics
-    
+
     def _calculate_sharpe_ratio(self, risk_free_rate: float = 0.02) -> float:
         """
         Calculate Sharpe ratio.
@@ -272,32 +273,32 @@ class PerformanceTracker:
         """
         if len(self._trades) < 2:
             return 0.0
-        
+
         # Get daily returns
         returns = [float(t.pnl / t.size) for t in self._trades if t.size > 0]
-        
+
         if not returns:
             return 0.0
-        
+
         # Calculate mean and std
         mean_return = sum(returns) / len(returns)
         variance = sum((r - mean_return) ** 2 for r in returns) / len(returns)
         std_return = variance ** 0.5
-        
+
         if std_return == 0:
             return 0.0
-        
+
         # Sharpe = (mean return - risk free) / std
         # Annualize assuming 252 trading days
         sharpe = (mean_return - risk_free_rate / 252) / std_return * (252 ** 0.5)
-        
+
         return sharpe
-    
+
     def get_trade_history(
-        self,
-        limit: int = 100,
-        start_date: Optional[datetime] = None,
-        end_date: Optional[datetime] = None,
+            self,
+            limit: int = 100,
+            start_date: Optional[datetime] = None,
+            end_date: Optional[datetime] = None,
     ) -> List[Trade]:
         """
         Get trade history.
@@ -311,17 +312,17 @@ class PerformanceTracker:
             List of trades
         """
         trades = self._trades
-        
+
         # Apply date filters
         if start_date:
             trades = [t for t in trades if t.timestamp >= start_date]
-        
+
         if end_date:
             trades = [t for t in trades if t.timestamp <= end_date]
-        
+
         # Return most recent trades
         return trades[-limit:]
-    
+
     def get_equity_curve(self) -> List[Dict[str, Any]]:
         """
         Get equity curve over time.
@@ -335,18 +336,18 @@ class PerformanceTracker:
                 "equity": float(self.initial_capital),
             }
         ]
-        
+
         running_capital = self.initial_capital
-        
+
         for trade in self._trades:
             running_capital += trade.pnl
             curve.append({
                 "timestamp": trade.timestamp,
                 "equity": float(running_capital),
             })
-        
+
         return curve
-    
+
     def get_daily_pnl(self, days: int = 30) -> List[Dict[str, Any]]:
         """
         Get daily P&L summary.
@@ -359,18 +360,18 @@ class PerformanceTracker:
         """
         cutoff = datetime.now() - timedelta(days=days)
         recent_trades = [t for t in self._trades if t.timestamp >= cutoff]
-        
+
         # Group by day
         daily_pnl: Dict[str, Decimal] = {}
-        
+
         for trade in recent_trades:
             day_key = trade.timestamp.strftime("%Y-%m-%d")
-            
+
             if day_key not in daily_pnl:
                 daily_pnl[day_key] = Decimal("0")
-            
+
             daily_pnl[day_key] += trade.pnl
-        
+
         # Convert to list
         return [
             {
@@ -379,7 +380,7 @@ class PerformanceTracker:
             }
             for day, pnl in sorted(daily_pnl.items())
         ]
-    
+
     def get_win_loss_distribution(self) -> Dict[str, Any]:
         """
         Get win/loss distribution statistics.
@@ -389,7 +390,7 @@ class PerformanceTracker:
         """
         wins = [t.pnl for t in self._trades if t.pnl > 0]
         losses = [t.pnl for t in self._trades if t.pnl < 0]
-        
+
         return {
             "total_trades": len(self._trades),
             "wins": {
@@ -406,7 +407,7 @@ class PerformanceTracker:
             },
             "profit_factor": abs(sum(wins) / sum(losses)) if losses and sum(losses) != 0 else 0.0,
         }
-    
+
     def export_for_grafana(self) -> Dict[str, Any]:
         """
         Export data in Grafana-friendly format.
@@ -415,7 +416,7 @@ class PerformanceTracker:
             Dict with time-series data
         """
         metrics = self.calculate_metrics()
-        
+
         return {
             "timestamp": datetime.now().isoformat(),
             "metrics": {
@@ -434,6 +435,7 @@ class PerformanceTracker:
 
 # Singleton instance
 _performance_tracker_instance = None
+
 
 def get_performance_tracker() -> PerformanceTracker:
     """Get singleton performance tracker."""
