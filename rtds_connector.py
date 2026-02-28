@@ -502,19 +502,41 @@ class RTDSConnector:
                 _resub_after = 0.0
 
                 # Process messages
-                async for msg in ws:
-                    if self._should_stop:
+                while not self._should_stop:
+                    try:
+                        msg = await asyncio.wait_for(ws.receive(), timeout=1.0)
+                    except TimeoutError:
+                        # Timed out waiting for message; evaluate if we need to retry subscription
+                        if _resub_pending and time.time() >= _resub_after:
+                            logger.info("RTDS: Retrying subscriptions after error cooldown (timeout)...")
+                            await self._subscribe(ws)
+                            _resub_pending = False
+                        continue
+                    except asyncio.TimeoutError:
+                        # Depending on Python version, asyncio.TimeoutError vs TimeoutError
+                        if _resub_pending and time.time() >= _resub_after:
+                            logger.info("RTDS: Retrying subscriptions after error cooldown (timeout)...")
+                            await self._subscribe(ws)
+                            _resub_pending = False
+                        continue
+
+                    if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSING):
+                        if msg.type == aiohttp.WSMsgType.ERROR:
+                            logger.error(f"RTDS WS error: {ws.exception()}")
+                        else:
+                            logger.warning(f"RTDS WS closed by server ({msg.type})")
                         break
 
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         # V3.3: Detect 429 or 400 errors on subscriptions
                         if not _resub_pending:
-                            if '"Too Many Requests"' in msg.data:
-                                logger.warning("RTDS: Subscription rate-limited (429) — will retry in 10s")
+                            data_lower = msg.data.lower()
+                            if '"message"' in data_lower and ('too many' in data_lower or 'rate limit' in data_lower):
+                                logger.warning(f"RTDS: Subscription rate-limited (429) — will retry in 10s. Server replied: {msg.data}")
                                 _resub_pending = True
                                 _resub_after = time.time() + 10.0
-                            elif '"statusCode":400' in msg.data and "failed validation" in msg.data:
-                                logger.warning("RTDS: Subscription validation error (400) — will retry in 5s")
+                            elif 'failed validation' in data_lower or 'invalid' in data_lower:
+                                logger.warning(f"RTDS: Subscription validation error (400) — will retry in 5s. Server replied: {msg.data}")
                                 _resub_pending = True
                                 _resub_after = time.time() + 5.0
 
@@ -525,12 +547,6 @@ class RTDSConnector:
                             _resub_pending = False
 
                         self._handle_message(msg.data)
-                    elif msg.type == aiohttp.WSMsgType.ERROR:
-                        logger.error(f"RTDS WS error: {ws.exception()}")
-                        break
-                    elif msg.type == aiohttp.WSMsgType.CLOSED:
-                        logger.warning("RTDS WS closed by server")
-                        break
         finally:
             # Always clean up the session — prevents "Unclosed client session" warnings
             self._connected = False
@@ -587,7 +603,7 @@ class RTDSConnector:
 
         if not payload:
             if self._total_messages <= 20:
-                logger.debug(f"RTDS msg dropped (no payload): topic='{topic}', keys={list(data.keys())}")
+                logger.debug(f"RTDS msg dropped (no payload): topic='{topic}', keys={list(data.keys())}, raw={raw}")
             return
 
         # RTDS delivers two formats:

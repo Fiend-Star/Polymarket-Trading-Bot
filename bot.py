@@ -1330,22 +1330,32 @@ class IntegratedBTCStrategy(Strategy):
             seconds_into_sub_interval = elapsed_secs % MARKET_INTERVAL_SECONDS
 
             # Early window trade trigger
+            # Evaluates continuously between TRADE_WINDOW_START_SEC and TRADE_WINDOW_END_SEC
+            # Locks out only AFTER a successful execution or decision has been recorded
             if (TRADE_WINDOW_START_SEC <= seconds_into_sub_interval < TRADE_WINDOW_END_SEC
-                    and trade_key != self.last_trade_time):
-                self.last_trade_time = trade_key
-                self._retry_count_this_window = 0
+                    and trade_key != self.last_trade_time 
+                    and self._btc_strike_price is not None):
 
-                logger.info("=" * 80)
-                logger.info(f"🎯 EARLY-WINDOW TRADE: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
-                logger.info(f"   Market: {current_market['slug']}")
-                logger.info(
-                    f"   Sub-interval #{sub_interval} ({seconds_into_sub_interval:.1f}s in = {seconds_into_sub_interval / 60:.1f} min)")
-                logger.info(
-                    f"   YES Price: ${float(mid_price):,.4f} | Bid: ${float(bid_decimal):,.4f} | Ask: ${float(ask_decimal):,.4f}")
-                logger.info(f"   Price history: {len(self.price_history)} points")
-                logger.info("=" * 80)
+                # We don't lock `self.last_trade_time` here yet! 
+                # We only lock it if `_make_trading_decision_sync` actually executes a trade.
+                # However we do want to ratelimit the logs + evaluations so we don't spam the CPU 
+                # 50 times a second. We'll evaluate once every 5 seconds.
+                
+                # Use a throttling key for evaluations
+                throttle_key = f"{sub_interval}_{int(seconds_into_sub_interval // 5)}"
+                if getattr(self, "_last_eval_throttle", None) != throttle_key:
+                    self._last_eval_throttle = throttle_key
 
-                self.run_in_executor(lambda: self._make_trading_decision_sync(float(mid_price)))
+                    logger.info("=" * 80)
+                    logger.info(f"🔎 CONTINUOUS EVALUATION: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                    logger.info(f"   Market: {current_market['slug']}")
+                    logger.info(
+                        f"   Sub-interval #{sub_interval} ({seconds_into_sub_interval:.1f}s in = {seconds_into_sub_interval / 60:.1f} min)")
+                    logger.info(
+                        f"   YES Price: ${float(mid_price):,.4f} | Bid: ${float(bid_decimal):,.4f} | Ask: ${float(ask_decimal):,.4f}")
+                    logger.info("=" * 80)
+
+                    self.run_in_executor(lambda: self._make_trading_decision_sync(float(mid_price), trade_key))
 
             # V3.1: Late-window Chainlink strategy
             # At T-15s through T-0s, use Chainlink settlement oracle for high-confidence trades
@@ -1382,13 +1392,13 @@ class IntegratedBTCStrategy(Strategy):
     # Trading decision (V3: Binary Option Model)
     # ------------------------------------------------------------------
 
-    def _make_trading_decision_sync(self, current_price):
+    def _make_trading_decision_sync(self, current_price, trade_key=None):
         """Sync wrapper — runs in executor thread."""
         price_decimal = Decimal(str(current_price))
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(self._make_trading_decision(price_decimal))
+            loop.run_until_complete(self._make_trading_decision(price_decimal, trade_key))
         finally:
             loop.close()
 
@@ -1450,7 +1460,7 @@ class IntegratedBTCStrategy(Strategy):
             await self._place_limit_order(mock_signal, POSITION_SIZE_USD,
                                           limit_price, direction)
 
-    async def _make_trading_decision(self, current_price: Decimal):
+    async def _make_trading_decision(self, current_price: Decimal, trade_key=None):
         """
         V3: Quantitative trading decision using binary option pricing.
 
@@ -1496,7 +1506,7 @@ class IntegratedBTCStrategy(Strategy):
         if btc_spot is None or self._btc_strike_price is None:
             if is_simulation:
                 logger.warning(f"No BTC spot or strike — falling back to heuristic signals (SIMULATION)")
-                await self._make_trading_decision_heuristic(current_price, cached, is_simulation)
+                await self._make_trading_decision_heuristic(current_price, cached, is_simulation, trade_key)
             else:
                 logger.warning(
                     f"No BTC spot or strike — SKIPPING trade (live mode requires quant model). "
@@ -1631,6 +1641,11 @@ class IntegratedBTCStrategy(Strategy):
             confidence=signal.confidence,
         )
 
+        # Lock out future early-window trades for this specific market sub-interval!
+        # This prevents the bot from spamming trades on every tick once an edge is found.
+        if trade_key is not None:
+            self.last_trade_time = trade_key
+
         if is_simulation or SHADOW_MODE_ONLY:
             if SHADOW_MODE_ONLY and not is_simulation:
                 logger.warning(f"👻 [SHADOW MODE] Paper trading {direction.upper()} | Size: ${POSITION_SIZE_USD}")
@@ -1677,7 +1692,7 @@ class IntegratedBTCStrategy(Strategy):
 
         return metadata
 
-    async def _make_trading_decision_heuristic(self, current_price, cached, is_simulation):
+    async def _make_trading_decision_heuristic(self, current_price, cached, is_simulation, trade_key=None):
         """Fallback to V2 fusion-based logic when Coinbase data is unavailable."""
         metadata = self._build_metadata(cached, current_price)
 
@@ -1718,6 +1733,9 @@ class IntegratedBTCStrategy(Strategy):
         if not is_valid:
             logger.warning(f"Risk engine blocked: {error}")
             return
+
+        if trade_key is not None:
+            self.last_trade_time = trade_key
 
         if is_simulation:
             await self._record_paper_trade(fused, POSITION_SIZE_USD, current_price, direction)
