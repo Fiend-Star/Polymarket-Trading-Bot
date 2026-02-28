@@ -303,6 +303,31 @@ class MispricingDetector:
             funding_bias=funding_bias,
         )
 
+        # ---- Step 2b: Strike validation gate ----
+        # If model says ~50% but market says ~20%, our strike is likely wrong.
+        # This catches the cold-start bug where current Chainlink ≠ settlement reference.
+        model_market_divergence = abs(model.yes_fair_value - yes_market_price)
+        if model_market_divergence > 0.25:
+            logger.warning(
+                f"⚠ STRIKE VALIDATION FAILED: model YES={model.yes_fair_value:.3f} vs "
+                f"market YES={yes_market_price:.3f} (Δ={model_market_divergence:.3f}) — "
+                f"possible strike mismatch, skipping trade"
+            )
+            return MispricingSignal(
+                edge=0.0, edge_pct=0.0, direction="NO_TRADE",
+                yes_market=yes_market_price, no_market=no_market_price,
+                yes_model=model.yes_fair_value, no_model=model.no_fair_value,
+                spot=btc_spot, strike=btc_strike, vol=realized_vol,
+                time_remaining_min=time_remaining_min,
+                delta=model.delta, gamma=model.gamma, theta_per_min=model.theta,
+                confidence=0.0, vol_confidence=vol_confidence,
+                implied_vol=realized_vol, realized_vol=realized_vol,
+                vol_spread=0.0, vrp=0.0, vrp_signal="STRIKE_MISMATCH",
+                expected_pnl=0.0, fee_cost=0.0, net_expected_pnl=0.0,
+                is_tradeable=False, kelly_fraction=0.0, kelly_bet_usd=0.0,
+                pricing_method=model.method,
+            )
+
         # ---- Step 3: Implied vol (BSM-based, standard) ----
         try:
             iv = self.pricer.implied_vol(
@@ -313,7 +338,32 @@ class MispricingDetector:
                 is_call=True,
             )
         except Exception:
-            iv = realized_vol
+            iv = None
+
+        # IV convergence guard: if bisection couldn't find any vol that explains
+        # the market price, the spot/strike inputs are wrong. This is the smoke
+        # signal — treat it as a hard trading blocker.
+        if iv is None:
+            logger.warning(
+                f"⚠ IV EXTRACTION FAILED: no vol in [0.01, 5.0] explains "
+                f"market_price={yes_market_price:.4f} at spot={btc_spot:.2f}, "
+                f"strike={btc_strike:.2f}, T={time_remaining_min:.1f}min — "
+                f"marking untradeable"
+            )
+            return MispricingSignal(
+                edge=0.0, edge_pct=0.0, direction="NO_TRADE",
+                yes_market=yes_market_price, no_market=no_market_price,
+                yes_model=model.yes_fair_value, no_model=model.no_fair_value,
+                spot=btc_spot, strike=btc_strike, vol=realized_vol,
+                time_remaining_min=time_remaining_min,
+                delta=model.delta, gamma=model.gamma, theta_per_min=model.theta,
+                confidence=0.0, vol_confidence=vol_confidence,
+                implied_vol=0.0, realized_vol=realized_vol,
+                vol_spread=0.0, vrp=0.0, vrp_signal="IV_FAILED",
+                expected_pnl=0.0, fee_cost=0.0, net_expected_pnl=0.0,
+                is_tradeable=False, kelly_fraction=0.0, kelly_bet_usd=0.0,
+                pricing_method=model.method,
+            )
 
         vol_spread = iv - realized_vol
 

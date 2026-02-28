@@ -155,17 +155,15 @@ class RTDSConnector:
         # closest to each boundary — in real-time, zero extra latency.
         # Key: boundary_timestamp_s (int), Value: (price, delta_ms)
         self._boundary_snapshots: Dict[int, tuple] = {}
-        # How close a tick must be (in ms) to be considered a boundary capture
-        self._boundary_capture_window_ms: int = 5000  # 5 seconds
+        # How close a tick must be (in ms) to be considered a boundary capture.
+        # With unfiltered Chainlink (1 tick/sec), ±5s is more than adequate.
+        self._boundary_capture_window_ms: int = 5_000  # 5 seconds
 
         # Stats
         self._chainlink_msg_count = 0
         self._binance_msg_count = 0
         self._avg_latency_ms = 0.0
         self._last_divergence: Optional[DivergenceSignal] = None
-
-        # V3.4: Track whether server supports Chainlink symbol filter
-        self._chainlink_filter_supported = True  # Optimistic; falls back if 400
 
         logger.info(
             f"Initialized RTDS Connector: endpoint={RTDS_WS_URL}, "
@@ -480,16 +478,9 @@ class RTDSConnector:
                                 _resub_pending = True
                                 _resub_after = time.time() + 10.0
                             elif '"statusCode":400' in msg.data and "failed validation" in msg.data:
-                                # V3.4: Server rejected filter — disable and retry
-                                if self._chainlink_filter_supported:
-                                    self._chainlink_filter_supported = False
-                                    logger.warning("RTDS: Chainlink filter rejected (400) — falling back to unfiltered, retrying in 3s")
-                                    _resub_pending = True
-                                    _resub_after = time.time() + 3.0
-                                else:
-                                    logger.warning("RTDS: Subscription validation error (400) — will retry in 5s")
-                                    _resub_pending = True
-                                    _resub_after = time.time() + 5.0
+                                logger.warning("RTDS: Subscription validation error (400) — will retry in 5s")
+                                _resub_pending = True
+                                _resub_after = time.time() + 5.0
 
                         # V3.3: Retry subscriptions after rate-limit cooldown
                         if _resub_pending and time.time() >= _resub_after:
@@ -514,18 +505,12 @@ class RTDSConnector:
     async def _subscribe(self, ws):
         """Subscribe to Binance + Chainlink BTC price feeds.
 
-        V3.4: Filter Chainlink to btc/usd only when server supports it.
-        Falls back to unfiltered (client-side filtering) on 400 validation error.
+        Chainlink subscription is unfiltered — server-side filters silently
+        drop all ticks without error. Client-side filtering in _handle_message
+        routes btc/usd ticks to the Chainlink handler.
         """
         # Small delay after connect to avoid immediate rate-limit
         await asyncio.sleep(0.5)
-
-        chainlink_sub = {
-            "topic": "crypto_prices_chainlink",
-            "type": "update",
-        }
-        if self._chainlink_filter_supported:
-            chainlink_sub["filters"] = json.dumps({"symbol": "btc/usd"})
 
         combined_sub = {
             "action": "subscribe",
@@ -535,12 +520,14 @@ class RTDSConnector:
                     "type": "update",
                     "filters": json.dumps({"symbol": "btcusdt"}),
                 },
-                chainlink_sub,
+                {
+                    "topic": "crypto_prices_chainlink",
+                    "type": "update",
+                },
             ],
         }
         await ws.send_json(combined_sub)
-        filter_note = "btc/usd only" if self._chainlink_filter_supported else "all symbols, client-filtered"
-        logger.info(f"RTDS: Subscribed to crypto_prices (btcusdt) + crypto_prices_chainlink ({filter_note})")
+        logger.info("RTDS: Subscribed to crypto_prices (btcusdt) + crypto_prices_chainlink (unfiltered)")
 
     def _handle_message(self, raw: str):
         """Parse and route an incoming RTDS message."""

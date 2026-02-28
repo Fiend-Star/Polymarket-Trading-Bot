@@ -1226,7 +1226,25 @@ class IntegratedBTCStrategy(Strategy):
                             )
                             strike_set = True
 
-                    # 3. Current Chainlink (streaming but no tick at boundary)
+                    # 3. Gamma API priceToBeat (authoritative settlement reference)
+                    # CRITICAL: Try this BEFORE falling back to current Chainlink.
+                    # On cold start, current Chainlink ≠ settlement reference because
+                    # we missed the boundary tick. priceToBeat IS the real strike.
+                    if not strike_set and mkt:
+                        ptb = fetch_price_to_beat(mkt['slug'])
+                        if ptb:
+                            self._btc_strike_price = ptb
+                            self._strike_recorded = True
+                            self._strike_defer_start = None
+                            self._strike_source = "ptb"
+                            logger.info(
+                                f"📌 Strike from Gamma API priceToBeat: ${ptb:,.2f}"
+                            )
+                            strike_set = True
+
+                    # 4. Current Chainlink (streaming but no tick at boundary)
+                    # This is BELOW priceToBeat because on cold start, current
+                    # Chainlink may have drifted from the settlement reference.
                     if not strike_set and self.rtds and self.rtds.chainlink_btc_price > 0:
                         self._btc_strike_price = self.rtds.chainlink_btc_price
                         self._strike_recorded = True
@@ -1235,11 +1253,11 @@ class IntegratedBTCStrategy(Strategy):
                         logger.warning(
                             f"📌 Strike from current Chainlink: "
                             f"${self._btc_strike_price:,.2f} "
-                            f"(no boundary tick available)"
+                            f"(no boundary tick or priceToBeat available)"
                         )
                         strike_set = True
 
-                    # 4. Defer / timeout with fallback chain
+                    # 5. Defer / timeout with fallback chain
                     if not strike_set and self.rtds:
                         if self._strike_defer_start is None:
                             self._strike_defer_start = time.time()
@@ -1251,15 +1269,10 @@ class IntegratedBTCStrategy(Strategy):
                                 f"({defer_elapsed:.0f}s / 30s timeout)"
                             )
                         else:
-                            # Timeout — try priceToBeat from Gamma API, then Binance, then Coinbase
+                            # Timeout — try Binance, then Coinbase
                             fallback = None
                             source_label = ""
-                            if mkt:
-                                ptb = fetch_price_to_beat(mkt['slug'])
-                                if ptb:
-                                    fallback = ptb
-                                    source_label = "Gamma API priceToBeat"
-                            if not fallback and self.rtds.binance_btc_price > 0:
+                            if self.rtds.binance_btc_price > 0:
                                 fallback = self.rtds.binance_btc_price
                                 source_label = "RTDS Binance"
                             if not fallback and self._cached_spot_price:
@@ -1609,6 +1622,32 @@ class IntegratedBTCStrategy(Strategy):
             f"Confirmation: {confirming} agree, {contradicting} disagree "
             f"(of {len(old_signals)} signals)"
         )
+
+        # Step 7b: Orderbook hard block — extreme imbalance opposing model
+        # When ask/bid >10:1 and model says BUY YES, we're providing exit
+        # liquidity to informed sellers. Same logic for BUY NO with bid/ask >10:1.
+        for sig in old_signals:
+            if sig.source == "OrderBookImbalance" and sig.metadata:
+                bid_vol = sig.metadata.get("bid_volume_usd", 0)
+                ask_vol = sig.metadata.get("ask_volume_usd", 0)
+                if signal.direction == "BUY_YES" and bid_vol > 0 and ask_vol > 0:
+                    ratio = ask_vol / bid_vol
+                    if ratio > 10.0:
+                        logger.warning(
+                            f"🛑 ORDERBOOK HARD BLOCK: Model says BUY YES but "
+                            f"ask/bid ratio is {ratio:.1f}:1 (${ask_vol:.0f} vs ${bid_vol:.0f}) "
+                            f"— informed sellers dominating, blocking trade"
+                        )
+                        return
+                if signal.direction == "BUY_NO" and bid_vol > 0 and ask_vol > 0:
+                    ratio = bid_vol / ask_vol
+                    if ratio > 10.0:
+                        logger.warning(
+                            f"🛑 ORDERBOOK HARD BLOCK: Model says BUY NO but "
+                            f"bid/ask ratio is {ratio:.1f}:1 (${bid_vol:.0f} vs ${ask_vol:.0f}) "
+                            f"— informed buyers dominating, blocking trade"
+                        )
+                        return
 
         # Step 8: Decision — trade if model + confirmations align
         if contradicting > confirming and signal.confidence < 0.6:

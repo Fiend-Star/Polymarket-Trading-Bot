@@ -498,38 +498,90 @@ class BinaryOptionPricer:
         is_call: bool = True,
         max_iterations: int = 50,
         tolerance: float = 1e-6,
-    ) -> float:
+    ) -> Optional[float]:
         """
         Back out implied volatility from market price using bisection.
         Uses BSM component for IV — the gap between BSM-IV and realized vol
         IS the Variance Risk Premium signal (~14% annualized for BTC).
+
+        Returns None if bisection fails to converge — this is a strong signal
+        that spot/strike inputs are wrong (e.g. ATM where N(d2)≈0.5 for all vol).
         """
         if time_remaining_min < 0.1:
             return 0.0
 
         T = max(time_remaining_min / self.MINUTES_PER_YEAR, 1e-12)
         vol_low, vol_high = 0.01, 5.0
+        sqrt_T = math.sqrt(T)
+
+        def _bsm_price(vol: float) -> float:
+            vst = vol * sqrt_T
+            if vst < 1e-12:
+                # At near-zero vol: price is 1 if ITM, 0 if OTM, 0.5 if ATM
+                if spot > strike:
+                    return 1.0 if is_call else 0.0
+                elif spot < strike:
+                    return 0.0 if is_call else 1.0
+                else:
+                    return 0.5
+            d2 = (math.log(spot / strike) + (self.r - 0.5 * vol ** 2) * T) / vst
+            return _norm_cdf(d2) if is_call else _norm_cdf(-d2)
+
+        # Determine monotonicity: binary option price is NOT always monotonic
+        # in vol. For ITM calls (spot>strike), higher vol → lower price.
+        # For OTM calls (spot<strike), higher vol → higher price (up to a point).
+        p_low = _bsm_price(vol_low)
+        p_high = _bsm_price(vol_high)
+
+        # Check if the target is achievable within [vol_low, vol_high]
+        p_min = min(p_low, p_high)
+        p_max = max(p_low, p_high)
+        if market_price < p_min - 0.05 or market_price > p_max + 0.05:
+            logger.warning(
+                f"IV bisection: target={market_price:.4f} outside achievable range "
+                f"[{p_min:.4f}, {p_max:.4f}] — likely strike mismatch"
+            )
+            return None
+
+        # price_decreasing: True if higher vol → lower price (ITM case)
+        price_decreasing = (p_low > p_high)
 
         for _ in range(max_iterations):
             vol_mid = (vol_low + vol_high) / 2.0
-            sqrt_T = math.sqrt(T)
-            vst = vol_mid * sqrt_T
-
-            if vst < 1e-12:
-                vol_low = vol_mid
-                continue
-
-            d2 = (math.log(spot / strike) + (self.r - 0.5 * vol_mid ** 2) * T) / vst
-            p = _norm_cdf(d2) if is_call else _norm_cdf(-d2)
+            p = _bsm_price(vol_mid)
 
             if abs(p - market_price) < tolerance:
                 return vol_mid
-            if p > market_price:
-                vol_high = vol_mid
-            else:
-                vol_low = vol_mid
 
-        return (vol_low + vol_high) / 2.0
+            if price_decreasing:
+                # Higher vol → lower price: if p > target, need more vol
+                if p > market_price:
+                    vol_low = vol_mid
+                else:
+                    vol_high = vol_mid
+            else:
+                # Higher vol → higher price: if p > target, need less vol
+                if p > market_price:
+                    vol_high = vol_mid
+                else:
+                    vol_low = vol_mid
+
+        # Convergence check: verify the final midpoint actually prices close
+        # to the target. For ATM binaries (spot≈strike), N(d2)≈0.5 for ALL
+        # vol values, so bisection converges to vol_low=vol_high but the
+        # price residual is huge. This is a smoke signal: if no vol can
+        # explain the market price at these inputs, the inputs are wrong.
+        final_vol = (vol_low + vol_high) / 2.0
+        final_p = _bsm_price(final_vol)
+        if abs(final_p - market_price) > 0.05:
+            logger.warning(
+                f"IV bisection did NOT converge: target={market_price:.4f}, "
+                f"best={final_p:.4f}, vol={final_vol:.4f}, "
+                f"spot={spot:.2f}, strike={strike:.2f}, T={time_remaining_min:.1f}min "
+                f"— likely strike mismatch"
+            )
+            return None
+        return final_vol
 
     # ==================================================================
     # BSM-only pricing (V1 backward compatible)
