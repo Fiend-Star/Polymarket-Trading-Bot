@@ -50,20 +50,27 @@ from vol_estimator import VolEstimator, get_vol_estimator
 # Polymarket fee calculation (CRITICAL FIX)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Polymarket fee calculation (Official Formula Update)
+# ---------------------------------------------------------------------------
+
 def polymarket_taker_fee(price: float) -> float:
     """
-    Polymarket nonlinear taker fee for gamma/crypto 15-min markets.
+    Polymarket nonlinear taker fee for 5-Min & 15-Min Crypto markets.
 
-    Formula: fee_per_share = p × (1-p) × base_rate
-    Where base_rate ≈ 0.0624 (calibrated so max fee = 1.56% at p=0.50)
+    Official Formula: feeRate * (p * (1 - p))^exponent
+    Crypto Parameters: feeRate = 0.25, exponent = 2
 
-    V1 BUG: Used flat 10% — was 6.4× too high, killed all thin edges.
-
-    Returns: effective fee rate (0 to 0.0156)
+    Max fee is 1.5625% at p=0.50, scaling down quadratically at the extremes
+    (e.g., 0.2025% at p=0.10 or p=0.90).
     """
     p = max(0.01, min(0.99, price))
-    # base_rate calibrated: 0.0624 × 0.25 = 0.0156 = 1.56% at p=0.50
-    return 0.0624 * p * (1 - p)
+
+    fee_rate_param = 0.25
+    exponent = 2.0
+
+    effective_rate = fee_rate_param * ((p * (1.0 - p)) ** exponent)
+    return effective_rate
 
 
 def polymarket_taker_fee_usd(price: float, num_shares: float) -> float:
