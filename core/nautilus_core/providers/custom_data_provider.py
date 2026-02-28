@@ -36,36 +36,15 @@ class CustomDataProvider:
     - Aggregates → Bar data
     """
     
-    def __init__(
-        self,
-        data_engine: DataEngine,
-        clock: LiveClock,
-        logger: Logger,
-    ):
-        """
-        Initialize custom data provider.
-        
-        Args:
-            data_engine: Nautilus data engine
-            clock: Nautilus clock
-            logger: Nautilus logger
-        """
+    def __init__(self, data_engine: DataEngine, clock: LiveClock, logger: Logger):
+        """Initialize custom data provider."""
         self.data_engine = data_engine
         self.clock = clock
         self.logger = logger
-        
-        # Our unified adapter
         self.adapter: Optional[UnifiedDataAdapter] = None
-        
-        # Instrument registry
         self.instruments = get_instrument_registry()
-        
-        # Track last prices for each source
         self._last_prices: dict = {}
-        
-        # Bar aggregators (for creating candlesticks)
         self._bar_aggregators: dict = defaultdict(list)
-        
         loguru_logger.info("Initialized Custom Data Provider")
     
     async def connect(self) -> None:
@@ -108,38 +87,19 @@ class CustomDataProvider:
             loguru_logger.info(f"Registered instrument: {instrument.id}")
     
     async def _on_price_update(self, data: MarketData) -> None:
-        """
-        Handle price update from ingestion layer.
-        
-        Converts to Nautilus QuoteTick and sends to data engine.
-        
-        Args:
-            data: Market data from ingestion layer
-        """
+        """Handle price update - convert to Nautilus ticks."""
         try:
-            # Map source to instrument
-            instrument_id = self._get_instrument_id(data.source)
-            if not instrument_id:
-                return
-            
-            # Create quote tick
-            quote_tick = self._create_quote_tick(data, instrument_id)
-            
-            if quote_tick:
-                # Send to data engine
-                self.data_engine.process(quote_tick)
-                
-                # Also create synthetic trade tick
-                trade_tick = self._create_trade_tick(data, instrument_id)
-                if trade_tick:
-                    self.data_engine.process(trade_tick)
-            
-            # Update last price
+            iid = self._get_instrument_id(data.source)
+            if not iid: return
+            qt = self._create_quote_tick(data, iid)
+            if qt:
+                self.data_engine.process(qt)
+                tt = self._create_trade_tick(data, iid)
+                if tt: self.data_engine.process(tt)
             self._last_prices[data.source] = data.price
-            
         except Exception as e:
-            loguru_logger.error(f"Error processing price update: {e}")
-    
+            loguru_logger.error(f"Price update error: {e}")
+
     async def _on_sentiment_update(self, data) -> None:
         """
         Handle sentiment update.
@@ -172,107 +132,51 @@ class CustomDataProvider:
         instrument = self.instruments.get(instrument_id_str)
         return instrument.id if instrument else None
     
+    @staticmethod
+    def _format_price_str(val):
+        """Format a float/Decimal to a valid Price string (max 9 decimals)."""
+        s = f"{float(val):.9f}".rstrip('0').rstrip('.')
+        return s if '.' in s else f"{s}.0"
+
     def _create_quote_tick(
         self,
         data: MarketData,
         instrument_id: InstrumentId,
     ) -> Optional[QuoteTick]:
-        """
-        Create QuoteTick from market data.
-        
-        Args:
-            data: Market data
-            instrument_id: Instrument ID
-            
-        Returns:
-            QuoteTick or None
-        """
+        """Create QuoteTick from market data."""
         try:
-            # Use bid/ask if available, otherwise use price ± small spread
             if data.bid and data.ask:
-                # Round to max 9 decimal places (Nautilus limit)
-                bid_str = f"{float(data.bid):.9f}".rstrip('0').rstrip('.')
-                ask_str = f"{float(data.ask):.9f}".rstrip('0').rstrip('.')
-                bid_price = Price.from_str(bid_str if '.' in bid_str else f"{bid_str}.0")
-                ask_price = Price.from_str(ask_str if '.' in ask_str else f"{ask_str}.0")
+                bid_p = Price.from_str(self._format_price_str(data.bid))
+                ask_p = Price.from_str(self._format_price_str(data.ask))
             else:
-                # Create synthetic bid/ask with 0.1% spread
                 spread = data.price * Decimal("0.001")
-                bid_val = float(data.price - spread)
-                ask_val = float(data.price + spread)
-                # Round to max 9 decimal places
-                bid_str = f"{bid_val:.9f}".rstrip('0').rstrip('.')
-                ask_str = f"{ask_val:.9f}".rstrip('0').rstrip('.')
-                bid_price = Price.from_str(bid_str if '.' in bid_str else f"{bid_str}.0")
-                ask_price = Price.from_str(ask_str if '.' in ask_str else f"{ask_str}.0")
-            
-            # Default size
-            bid_size = Quantity.from_str("1.0")
-            ask_size = Quantity.from_str("1.0")
-            
-            # Create quote tick
-            quote_tick = QuoteTick(
-                instrument_id=instrument_id,
-                bid_price=bid_price,
-                ask_price=ask_price,
-                bid_size=bid_size,
-                ask_size=ask_size,
-                ts_event=self._to_nanoseconds(data.timestamp),
-                ts_init=self.clock.timestamp_ns(),
-            )
-            
-            return quote_tick
-            
+                bid_p = Price.from_str(self._format_price_str(data.price - spread))
+                ask_p = Price.from_str(self._format_price_str(data.price + spread))
+            return QuoteTick(
+                instrument_id=instrument_id, bid_price=bid_p, ask_price=ask_p,
+                bid_size=Quantity.from_str("1.0"), ask_size=Quantity.from_str("1.0"),
+                ts_event=self._to_nanoseconds(data.timestamp), ts_init=self.clock.timestamp_ns())
         except Exception as e:
-            loguru_logger.error(f"Error creating quote tick: {e}")
-            return None
-    
+            loguru_logger.error(f"Quote tick error: {e}"); return None
+
     def _create_trade_tick(
         self,
         data: MarketData,
         instrument_id: InstrumentId,
     ) -> Optional[TradeTick]:
-        """
-        Create synthetic TradeTick from market data.
-        
-        Args:
-            data: Market data
-            instrument_id: Instrument ID
-            
-        Returns:
-            TradeTick or None
-        """
+        """Create synthetic TradeTick from market data."""
         try:
-            # Check if price changed (only create trade tick if price moved)
-            last_price = self._last_prices.get(data.source)
-            if last_price and last_price == data.price:
-                return None  # No price change, skip trade tick
-            
-            # Determine aggressor side based on price movement
-            if last_price:
-                aggressor_side = (
-                    AggressorSide.BUYER if data.price > last_price
-                    else AggressorSide.SELLER
-                )
-            else:
-                aggressor_side = AggressorSide.BUYER
-            
-            trade_tick = TradeTick(
-                instrument_id=instrument_id,
-                price=Price.from_str(str(data.price)),
-                size=Quantity.from_str("1.0"),  # Synthetic size
-                aggressor_side=aggressor_side,
+            last = self._last_prices.get(data.source)
+            if last and last == data.price: return None
+            side = AggressorSide.BUYER if (not last or data.price > last) else AggressorSide.SELLER
+            return TradeTick(
+                instrument_id=instrument_id, price=Price.from_str(str(data.price)),
+                size=Quantity.from_str("1.0"), aggressor_side=side,
                 trade_id=TradeId(f"{data.source}_{data.timestamp.timestamp()}"),
-                ts_event=self._to_nanoseconds(data.timestamp),
-                ts_init=self.clock.timestamp_ns(),
-            )
-            
-            return trade_tick
-            
+                ts_event=self._to_nanoseconds(data.timestamp), ts_init=self.clock.timestamp_ns())
         except Exception as e:
-            loguru_logger.error(f"Error creating trade tick: {e}")
-            return None
-    
+            loguru_logger.error(f"Trade tick error: {e}"); return None
+
     @staticmethod
     def _to_nanoseconds(dt: datetime) -> int:
         """Convert datetime to nanoseconds since epoch."""

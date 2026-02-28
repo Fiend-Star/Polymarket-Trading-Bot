@@ -136,7 +136,18 @@ class BaseSignalProcessor(ABC):
         """Record that a signal was generated."""
         self._signals_generated += 1
         self._last_signal = signal
-    
+
+    def _build_and_record(self, signal_type, direction, strength, confidence,
+                          current_price, metadata=None):
+        """Build a TradingSignal, record it, and return it."""
+        signal = TradingSignal(
+            timestamp=datetime.now(), source=self.name,
+            signal_type=signal_type, direction=direction,
+            strength=strength, confidence=confidence,
+            current_price=current_price, metadata=metadata or {})
+        self._record_signal(signal)
+        return signal
+
     def get_stats(self) -> Dict[str, Any]:
         """Get processor statistics."""
         return {

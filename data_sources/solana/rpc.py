@@ -46,229 +46,89 @@ class SolanaRPCDataSource:
         
         logger.info("Initialized Solana RPC data source")
     
+    async def _rpc_call(self, method, params=None):
+        """Make a JSON-RPC call. Returns result value or None."""
+        payload = {"jsonrpc": "2.0", "id": 1, "method": method}
+        if params:
+            payload["params"] = params
+        resp = await self.session.post(self.rpc_url, json=payload)
+        resp.raise_for_status()
+        return resp.json().get("result")
+
     async def connect(self) -> bool:
-        """
-        Connect to Solana RPC.
-        
-        Returns:
-            True if connection successful
-        """
+        """Connect to Solana RPC."""
         try:
-            self.session = httpx.AsyncClient(
-                timeout=30.0,
-                headers={"Content-Type": "application/json"}
-            )
-            
-            # Test connection - get current slot
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getSlot"
-            }
-            
-            response = await self.session.post(self.rpc_url, json=payload)
-            response.raise_for_status()
-            
-            result = response.json()
-            if "result" in result:
-                logger.info(f"✓ Connected to Solana RPC (Slot: {result['result']})")
+            self.session = httpx.AsyncClient(timeout=30.0, headers={"Content-Type": "application/json"})
+            result = await self._rpc_call("getSlot")
+            if result is not None:
+                logger.info(f"✓ Connected to Solana RPC (Slot: {result})")
                 return True
-            else:
-                logger.error("Solana RPC returned unexpected response")
-                return False
-                
+            logger.error("Solana RPC unexpected response"); return False
         except Exception as e:
-            logger.error(f"Failed to connect to Solana RPC: {e}")
-            return False
-    
+            logger.error(f"Solana connect failed: {e}"); return False
+
     async def disconnect(self) -> None:
         """Close connection."""
         if self.session:
             await self.session.aclose()
             logger.info("Disconnected from Solana RPC")
-    
+
     async def get_pyth_price(self) -> Optional[Decimal]:
-        """
-        Get BTC price from Pyth Network oracle.
-        
-        Returns:
-            BTC price or None if error
-        """
+        """Get BTC price from Pyth Network oracle."""
         if not self.use_pyth:
             return None
-        
         try:
-            # Get Pyth account data
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getAccountInfo",
-                "params": [
-                    self.pyth_btc_address,
-                    {"encoding": "base64"}
-                ]
-            }
-            
-            response = await self.session.post(self.rpc_url, json=payload)
-            response.raise_for_status()
-            
-            result = response.json()
-            
-            # Note: Parsing Pyth data requires their SDK
-            # This is a simplified placeholder
-            # In production, use: from pyth_sdk import PythClient
-            
-            if "result" in result and result["result"]["value"]:
-                logger.debug("Fetched Pyth price data (parsing requires Pyth SDK)")
-                # Placeholder - would need actual Pyth parsing
-                return None
-            
-            return None
-            
+            result = await self._rpc_call("getAccountInfo",
+                                           [self.pyth_btc_address, {"encoding": "base64"}])
+            if result and result.get("value"):
+                logger.debug("Fetched Pyth data (requires Pyth SDK to parse)")
+            return None  # Placeholder - needs Pyth SDK
         except Exception as e:
-            logger.error(f"Error fetching Pyth price: {e}")
-            return None
-    
+            logger.error(f"Pyth price error: {e}"); return None
+
     async def get_slot(self) -> Optional[int]:
-        """
-        Get current slot number.
-        
-        Returns:
-            Current slot or None
-        """
+        """Get current slot number."""
         try:
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getSlot"
-            }
-            
-            response = await self.session.post(self.rpc_url, json=payload)
-            response.raise_for_status()
-            
-            result = response.json()
-            return result.get("result")
-            
+            return await self._rpc_call("getSlot")
         except Exception as e:
-            logger.error(f"Error fetching slot: {e}")
-            return None
-    
+            logger.error(f"Slot error: {e}"); return None
+
     async def get_block_time(self, slot: int) -> Optional[datetime]:
-        """
-        Get block timestamp.
-        
-        Args:
-            slot: Slot number
-            
-        Returns:
-            Block timestamp
-        """
+        """Get block timestamp for a slot."""
         try:
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getBlockTime",
-                "params": [slot]
-            }
-            
-            response = await self.session.post(self.rpc_url, json=payload)
-            response.raise_for_status()
-            
-            result = response.json()
-            timestamp = result.get("result")
-            
-            if timestamp:
-                return datetime.fromtimestamp(timestamp)
-            
-            return None
-            
+            ts = await self._rpc_call("getBlockTime", [slot])
+            return datetime.fromtimestamp(ts) if ts else None
         except Exception as e:
-            logger.error(f"Error fetching block time: {e}")
-            return None
-    
+            logger.error(f"Block time error: {e}"); return None
+
     async def get_token_supply(self, token_mint: str) -> Optional[Dict[str, Any]]:
-        """
-        Get token supply information.
-        
-        Args:
-            token_mint: Token mint address
-            
-        Returns:
-            Supply information
-        """
+        """Get token supply information."""
         try:
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getTokenSupply",
-                "params": [token_mint]
-            }
-            
-            response = await self.session.post(self.rpc_url, json=payload)
-            response.raise_for_status()
-            
-            result = response.json()
-            
-            if "result" in result and "value" in result["result"]:
-                value = result["result"]["value"]
-                return {
-                    "amount": value["amount"],
-                    "decimals": value["decimals"],
-                    "ui_amount": value["uiAmount"],
-                }
-            
+            result = await self._rpc_call("getTokenSupply", [token_mint])
+            if result and "value" in result:
+                v = result["value"]
+                return {"amount": v["amount"], "decimals": v["decimals"], "ui_amount": v["uiAmount"]}
             return None
-            
         except Exception as e:
-            logger.error(f"Error fetching token supply: {e}")
-            return None
-    
+            logger.error(f"Token supply error: {e}"); return None
+
     async def get_network_stats(self) -> Optional[Dict[str, Any]]:
-        """
-        Get Solana network statistics.
-        
-        Returns:
-            Network stats dict
-        """
+        """Get Solana network statistics (slot, TPS, etc.)."""
         try:
-            # Get current slot
             slot = await self.get_slot()
-            if not slot:
-                return None
-            
-            # Get block time
-            block_time = await self.get_block_time(slot)
-            
-            # Get performance samples
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getRecentPerformanceSamples",
-                "params": [1]
-            }
-            
-            response = await self.session.post(self.rpc_url, json=payload)
-            response.raise_for_status()
-            
-            result = response.json()
-            
-            if "result" in result and len(result["result"]) > 0:
-                perf = result["result"][0]
-                
-                return {
-                    "timestamp": block_time or datetime.now(),
-                    "current_slot": slot,
-                    "num_transactions": perf.get("numTransactions"),
-                    "sample_period_secs": perf.get("samplePeriodSecs"),
-                    "tps": perf.get("numTransactions", 0) / max(perf.get("samplePeriodSecs", 1), 1),
-                }
-            
+            if not slot: return None
+            bt = await self.get_block_time(slot)
+            result = await self._rpc_call("getRecentPerformanceSamples", [1])
+            if result and len(result) > 0:
+                p = result[0]
+                return {"timestamp": bt or datetime.now(), "current_slot": slot,
+                        "num_transactions": p.get("numTransactions"),
+                        "sample_period_secs": p.get("samplePeriodSecs"),
+                        "tps": p.get("numTransactions", 0) / max(p.get("samplePeriodSecs", 1), 1)}
             return None
-            
         except Exception as e:
-            logger.error(f"Error fetching network stats: {e}")
-            return None
-    
+            logger.error(f"Network stats error: {e}"); return None
+
     @property
     def last_price(self) -> Optional[Decimal]:
         """Get cached last price."""

@@ -49,48 +49,22 @@ class RateLimiter:
         )
     
     async def acquire(self, wait: bool = True) -> bool:
-        """
-        Acquire permission to make a request.
-        
-        Args:
-            wait: If True, wait for available slot. If False, return immediately.
-            
-        Returns:
-            True if permission granted, False if limit reached (when wait=False)
-        """
+        """Acquire permission to make a request. Waits if limit reached."""
         async with self._lock:
             now = datetime.now()
-            
-            # Remove old requests outside time window
-            cutoff_time = now - timedelta(seconds=self.time_window)
-            
-            while self._requests and self._requests[0] < cutoff_time:
+            cutoff = now - timedelta(seconds=self.time_window)
+            while self._requests and self._requests[0] < cutoff:
                 self._requests.popleft()
-            
-            # Check if we can make a request
             if len(self._requests) < self.max_requests:
-                self._requests.append(now)
-                return True
-            
-            # Limit reached
+                self._requests.append(now); return True
             if not wait:
-                logger.warning(
-                    f"Rate limit reached for '{self.name}': "
-                    f"{len(self._requests)}/{self.max_requests} in {self.time_window}s"
-                )
+                logger.warning(f"Rate limit: '{self.name}' {len(self._requests)}/{self.max_requests}")
                 return False
-            
-            # Wait until oldest request expires
-            oldest_request = self._requests[0]
-            wait_time = (oldest_request + timedelta(seconds=self.time_window) - now).total_seconds()
-            
+            oldest = self._requests[0]
+            wait_time = (oldest + timedelta(seconds=self.time_window) - now).total_seconds()
             if wait_time > 0:
-                logger.info(
-                    f"Rate limit for '{self.name}' - waiting {wait_time:.1f}s..."
-                )
+                logger.info(f"Rate limit '{self.name}' — waiting {wait_time:.1f}s")
                 await asyncio.sleep(wait_time)
-            
-            # Retry
             return await self.acquire(wait=True)
     
     def get_remaining(self) -> int:

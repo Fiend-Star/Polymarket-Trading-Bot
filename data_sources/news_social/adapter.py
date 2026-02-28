@@ -66,131 +66,60 @@ class NewsSocialDataSource:
             logger.info("Disconnected from News/Social APIs")
     
     async def get_fear_greed_index(self) -> Optional[Dict[str, Any]]:
-        """
-        Get Fear & Greed Index (0-100).
-        
-        Returns:
-            Dict with value, classification, and timestamp
-        """
+        """Get Fear & Greed Index (0-100)."""
         try:
-            response = await self.session.get(self.sentiment_api_url)
-            response.raise_for_status()
-            
-            data = response.json()
-            current = data["data"][0]
-            
-            sentiment = {
-                "timestamp": datetime.fromtimestamp(int(current["timestamp"])),
-                "value": int(current["value"]),  # 0-100
-                "classification": current["value_classification"],  # "Extreme Fear", "Fear", etc.
-                "time_until_update": current.get("time_until_update"),
-            }
-            
-            self._last_sentiment = sentiment
-            
-            if sentiment['value'] != self._last_logged_fg_value:
-                logger.debug(f"Fear & Greed Index: {sentiment['value']} ({sentiment['classification']})")
-                self._last_logged_fg_value = sentiment['value']
-            return sentiment
-            
+            resp = await self.session.get(self.sentiment_api_url)
+            resp.raise_for_status()
+            cur = resp.json()["data"][0]
+            s = {"timestamp": datetime.fromtimestamp(int(cur["timestamp"])),
+                 "value": int(cur["value"]), "classification": cur["value_classification"],
+                 "time_until_update": cur.get("time_until_update")}
+            self._last_sentiment = s
+            if s['value'] != self._last_logged_fg_value:
+                logger.debug(f"F&G: {s['value']} ({s['classification']})")
+                self._last_logged_fg_value = s['value']
+            return s
         except Exception as e:
-            logger.error(f"Error fetching Fear & Greed Index: {e}")
-            return None
-    
-    async def get_crypto_news(
-        self,
-        filter_: str = "hot",  # "rising", "hot", "bullish", "bearish"
-        currencies: str = "BTC",
-        limit: int = 20
-    ) -> List[Dict[str, Any]]:
-        """
-        Get crypto news from CryptoPanic.
-        
-        Note: Free tier has rate limits. Consider caching.
-        
-        Args:
-            filter_: News filter type
-            currencies: Comma-separated currency codes
-            limit: Max number of articles
-            
-        Returns:
-            List of news articles
-        """
+            logger.error(f"Fear & Greed error: {e}"); return None
+
+    def _parse_article(self, article):
+        """Parse a single news article into dict."""
+        votes = article.get("votes", {})
+        pos, neg = votes.get("positive", 0), votes.get("negative", 0)
+        return {"timestamp": datetime.fromisoformat(article["published_at"].replace("Z", "+00:00")),
+                "title": article["title"], "url": article["url"],
+                "source": article["source"]["title"], "votes": pos - neg,
+                "sentiment": "positive" if pos > neg else "negative"}
+
+    async def get_crypto_news(self, filter_: str = "hot", currencies: str = "BTC",
+                               limit: int = 20) -> List[Dict[str, Any]]:
+        """Get crypto news from CryptoPanic."""
         try:
-            # Note: CryptoPanic free tier requires API key
-            # This is a placeholder - you'll need to sign up at cryptopanic.com
-            params = {
-                "auth_token": "YOUR_CRYPTOPANIC_API_KEY",  # Get from cryptopanic.com
-                "filter": filter_,
-                "currencies": currencies,
-                "public": "true",
-            }
-            
-            response = await self.session.get(self.news_api_url, params=params)
-            
-            # If no API key, return cached or empty
-            if response.status_code == 401:
-                logger.warning("CryptoPanic API key not configured - using cached news")
-                return self._last_news
-            
-            response.raise_for_status()
-            data = response.json()
-            
-            news = []
-            for article in data.get("results", [])[:limit]:
-                news.append({
-                    "timestamp": datetime.fromisoformat(article["published_at"].replace("Z", "+00:00")),
-                    "title": article["title"],
-                    "url": article["url"],
-                    "source": article["source"]["title"],
-                    "votes": article.get("votes", {}).get("positive", 0) - article.get("votes", {}).get("negative", 0),
-                    "sentiment": "positive" if article.get("votes", {}).get("positive", 0) > article.get("votes", {}).get("negative", 0) else "negative",
-                })
-            
+            params = {"auth_token": "YOUR_CRYPTOPANIC_API_KEY", "filter": filter_,
+                      "currencies": currencies, "public": "true"}
+            resp = await self.session.get(self.news_api_url, params=params)
+            if resp.status_code == 401:
+                logger.warning("CryptoPanic API key not configured"); return self._last_news
+            resp.raise_for_status()
+            news = [self._parse_article(a) for a in resp.json().get("results", [])[:limit]]
             self._last_news = news
             return news
-            
         except Exception as e:
-            logger.error(f"Error fetching crypto news: {e}")
-            return self._last_news
-    
+            logger.error(f"Crypto news error: {e}"); return self._last_news
+
     async def get_sentiment_score(self) -> Optional[float]:
-        """
-        Calculate aggregate sentiment score (0-100).
-        
-        Combines Fear & Greed Index with news sentiment.
-        
-        Returns:
-            Sentiment score (0=extreme fear, 100=extreme greed)
-        """
+        """Calculate aggregate sentiment (0-100). Combines F&G + news."""
         try:
-            # Get Fear & Greed Index
-            fg_data = await self.get_fear_greed_index()
-            if not fg_data:
-                return None
-            
-            fg_score = fg_data["value"]
-            
-            # Try to get news sentiment
+            fg = await self.get_fear_greed_index()
+            if not fg: return None
             news = await self.get_crypto_news(limit=10)
-            
             if news:
-                # Calculate news sentiment
-                positive_count = sum(1 for n in news if n.get("sentiment") == "positive")
-                news_score = (positive_count / len(news)) * 100
-                
-                # Weighted average (70% Fear & Greed, 30% News)
-                total_score = (fg_score * 0.7) + (news_score * 0.3)
-            else:
-                total_score = fg_score
-            
-            logger.info(f"Aggregate sentiment score: {total_score:.1f}")
-            return total_score
-            
+                pos = sum(1 for n in news if n.get("sentiment") == "positive")
+                return fg["value"] * 0.7 + (pos / len(news) * 100) * 0.3
+            return float(fg["value"])
         except Exception as e:
-            logger.error(f"Error calculating sentiment score: {e}")
-            return None
-    
+            logger.error(f"Sentiment score error: {e}"); return None
+
     async def get_trending_topics(self) -> List[str]:
         """
         Get trending crypto topics.

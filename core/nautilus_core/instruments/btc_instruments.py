@@ -9,121 +9,46 @@ from nautilus_trader.model.currencies import USDC, BTC
 from loguru import logger
 
 
+def _create_btc_instrument(symbol_str, venue_str, price_prec=2, size_prec=8,
+                           price_inc="0.01", size_inc="0.00000001",
+                           max_qty="1000", min_qty="0.001",
+                           max_price="1000000.00", min_price="1.00",
+                           margin_init="0.05", margin_maint="0.03",
+                           maker_fee="0.001", taker_fee="0.002") -> CryptoPerpetual:
+    """Create a BTC CryptoPerpetual instrument with given parameters."""
+    inst = CryptoPerpetual(
+        instrument_id=InstrumentId(symbol=Symbol(symbol_str), venue=Venue(venue_str)),
+        raw_symbol=Symbol(symbol_str), base_currency=BTC,
+        quote_currency=USDC, settlement_currency=USDC, is_inverse=False,
+        price_precision=price_prec, size_precision=size_prec,
+        price_increment=Price.from_str(price_inc), size_increment=Quantity.from_str(size_inc),
+        max_quantity=Quantity.from_str(max_qty), min_quantity=Quantity.from_str(min_qty),
+        max_price=Price.from_str(max_price), min_price=Price.from_str(min_price),
+        margin_init=Decimal(margin_init), margin_maint=Decimal(margin_maint),
+        maker_fee=Decimal(maker_fee), taker_fee=Decimal(taker_fee),
+        ts_event=0, ts_init=0)
+    logger.info(f"Created instrument: {inst.id}")
+    return inst
+
+
 def create_btc_polymarket_instrument() -> CryptoPerpetual:
-    """
-    Create BTC prediction market instrument for Polymarket.
-    
-    This represents the BTC price prediction market on Polymarket.
-    We model it as a perpetual contract for compatibility with Nautilus.
-    
-    Returns:
-        CryptoPerpetual instrument
-    """
-    instrument = CryptoPerpetual(
-        instrument_id=InstrumentId(
-            symbol=Symbol("BTC-POLYMARKET"),
-            venue=Venue("POLYMARKET")
-        ),
-        raw_symbol=Symbol("BTC-POLYMARKET"),
-        base_currency=BTC,
-        quote_currency=USDC,
-        settlement_currency=USDC,
-        is_inverse=False,
-        price_precision=2,  # $0.01 precision
-        size_precision=4,   # 0.0001 precision
-        price_increment=Price.from_str("0.01"),
-        size_increment=Quantity.from_str("0.0001"),
-        max_quantity=Quantity.from_str("1000000"),
-        min_quantity=Quantity.from_str("0.01"),
-        max_price=Price.from_str("1.00"),  # Prediction markets trade 0-1
-        min_price=Price.from_str("0.00"),
-        margin_init=Decimal("0.05"),  # 5% initial margin
-        margin_maint=Decimal("0.03"),  # 3% maintenance margin
-        maker_fee=Decimal("0.001"),  # 0.1% maker fee
-        taker_fee=Decimal("0.002"),  # 0.2% taker fee
-        ts_event=0,
-        ts_init=0,
-    )
-    
-    logger.info(f"Created Polymarket BTC instrument: {instrument.id}")
-    return instrument
+    """Create BTC prediction market instrument for Polymarket."""
+    return _create_btc_instrument(
+        "BTC-POLYMARKET", "POLYMARKET", size_prec=4, size_inc="0.0001",
+        max_qty="1000000", min_qty="0.01", max_price="1.00", min_price="0.00")
 
 
 def create_btc_spot_instrument() -> CryptoPerpetual:
-    """
-    Create BTC spot price instrument (for reference data).
-    
-    This represents actual BTC-USD spot price from exchanges.
-    Used for comparison and signal generation.
-    
-    Returns:
-        CryptoPerpetual instrument
-    """
-    instrument = CryptoPerpetual(
-        instrument_id=InstrumentId(
-            symbol=Symbol("BTC-USD"),
-            venue=Venue("COINBASE")
-        ),
-        raw_symbol=Symbol("BTC-USD"),
-        base_currency=BTC,
-        quote_currency=USDC,
-        settlement_currency=USDC,
-        is_inverse=False,
-        price_precision=2,
-        size_precision=8,
-        price_increment=Price.from_str("0.01"),
-        size_increment=Quantity.from_str("0.00000001"),
-        max_quantity=Quantity.from_str("1000"),
-        min_quantity=Quantity.from_str("0.001"),
-        max_price=Price.from_str("1000000.00"),
-        min_price=Price.from_str("1.00"),
-        margin_init=Decimal("0.05"),
-        margin_maint=Decimal("0.03"),
-        maker_fee=Decimal("0.005"),  # 0.5%
-        taker_fee=Decimal("0.005"),
-        ts_event=0,
-        ts_init=0,
-    )
-    
-    logger.info(f"Created Coinbase BTC spot instrument: {instrument.id}")
-    return instrument
+    """Create BTC spot price instrument (Coinbase reference)."""
+    return _create_btc_instrument(
+        "BTC-USD", "COINBASE", maker_fee="0.005", taker_fee="0.005")
 
 
 def create_btc_binance_instrument() -> CryptoPerpetual:
-    """
-    Create Binance BTC instrument.
-    
-    Returns:
-        CryptoPerpetual instrument
-    """
-    instrument = CryptoPerpetual(
-        instrument_id=InstrumentId(
-            symbol=Symbol("BTCUSDT"),
-            venue=Venue("BINANCE")
-        ),
-        raw_symbol=Symbol("BTCUSDT"),
-        base_currency=BTC,
-        quote_currency=USDC,
-        settlement_currency=USDC,
-        is_inverse=False,
-        price_precision=2,
-        size_precision=8,
-        price_increment=Price.from_str("0.01"),
-        size_increment=Quantity.from_str("0.00000001"),
-        max_quantity=Quantity.from_str("9000"),
-        min_quantity=Quantity.from_str("0.00001"),
-        max_price=Price.from_str("1000000.00"),
-        min_price=Price.from_str("1.00"),
-        margin_init=Decimal("0.01"),
-        margin_maint=Decimal("0.005"),
-        maker_fee=Decimal("0.001"),
-        taker_fee=Decimal("0.001"),
-        ts_event=0,
-        ts_init=0,
-    )
-    
-    logger.info(f"Created Binance BTCUSDT instrument: {instrument.id}")
-    return instrument
+    """Create Binance BTC instrument."""
+    return _create_btc_instrument(
+        "BTCUSDT", "BINANCE", max_qty="9000", min_qty="0.00001",
+        margin_init="0.01", margin_maint="0.005", taker_fee="0.001")
 
 
 class InstrumentRegistry:

@@ -1,30 +1,14 @@
 """
-Binary Option Pricer for Polymarket 15-Minute BTC Markets — V2
-
-RESEARCH-DRIVEN UPGRADES over V1 (pure Black-Scholes):
-  1. Merton jump-diffusion pricing (20-40% error reduction over BSM)
-     - BTC 15-min returns have kurtosis 15-100; BSM assumes 3
-     - Liquidation cascades cause discontinuous jumps BSM can't model
-     - Compound Poisson jump process captures fat tails
-
-  2. Mean reversion overlay
-     - BTC has negative first-order autocorrelation at 15-min
-     - After >1.5σ move, reversal probability ~55-60%
-     - Asymmetric: negative returns revert faster (3.66% asymmetry)
-
-  3. Turn-of-candle effect
-     - Positive returns of +0.58 bps/min at minutes 0, 15, 30, 45
-     - t-statistics above 9 across all exchanges (Shanaev & Vasenin 2023)
-     - Other minutes have slightly negative average returns
-
-  4. Intraday seasonality
-     - 22:00-23:00 UTC strongest (post-NYSE close)
-     - 03:00-04:00 UTC weakest
-     - Friday strongest day
+Binary Option Pricer V2 — Merton jump-diffusion + statistical overlays.
 
 Maps Polymarket YES/NO tokens to cash-or-nothing binary options:
-  - YES token = Binary Call (pays $1 if BTC finishes above reference price)
-  - NO token  = Binary Put  (pays $1 if BTC finishes below reference price)
+  YES = Binary Call (pays $1 if BTC > strike), NO = Binary Put.
+
+Upgrades over V1 (pure BSM):
+  1. Merton JD pricing (fat tails + jumps)
+  2. Mean reversion overlay (negative autocorrelation at 15-min)
+  3. Turn-of-candle effect (Shanaev & Vasenin 2023)
+  4. Intraday seasonality (QuantPedia / SSRN 4581124)
 """
 
 import math
@@ -33,6 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 from loguru import logger
+from binary_overlays import BinaryOverlaysMixin
 
 
 # ---------------------------------------------------------------------------
@@ -87,41 +72,20 @@ class BinaryOptionPrice:
     skew_adj: float = 0.0
 
     def __repr__(self):
-        return (
-            f"BinaryPrice(YES=${self.yes_fair_value:.4f}, NO=${self.no_fair_value:.4f}, "
-            f"Δ={self.delta:.4f}, Γ={self.gamma:.4f}, Θ={self.theta:.6f}/min, "
-            f"spot={self.spot:.2f}, strike={self.strike:.2f}, "
-            f"vol={self.vol:.1%}, T={self.time_remaining_min:.1f}min, "
-            f"method={self.method})"
-        )
+        return (f"BinaryPrice(YES=${self.yes_fair_value:.4f}, NO=${self.no_fair_value:.4f}, "
+                f"Δ={self.delta:.4f}, vol={self.vol:.1%}, T={self.time_remaining_min:.1f}min, "
+                f"method={self.method})")
 
 
 # ---------------------------------------------------------------------------
 # Pricer
 # ---------------------------------------------------------------------------
 
-class BinaryOptionPricer:
+class BinaryOptionPricer(BinaryOverlaysMixin):
     """
-    Prices Polymarket YES/NO tokens using jump-diffusion + statistical overlays.
+    Prices Polymarket YES/NO tokens using Merton JD + statistical overlays.
 
-    Pricing hierarchy (V2):
-      1. Merton jump-diffusion → base probability (handles fat tails + jumps)
-      2. Mean reversion overlay → shift prob based on recent price action
-      3. Turn-of-candle effect → shift based on minute-of-hour
-      4. Intraday seasonality → shift based on hour-of-day
-
-    Usage:
-        pricer = BinaryOptionPricer()
-        result = pricer.price(
-            spot=66200.0,
-            strike=66000.0,
-            vol=0.65,
-            time_remaining_min=12.0,
-            recent_return=0.003,
-            jump_intensity=1500.0,
-            jump_mean=-0.001,
-            jump_vol=0.004,
-        )
+    Pricing hierarchy: JD base → mean reversion → candle effect → seasonality.
     """
 
     MINUTES_PER_YEAR = 365.25 * 24 * 60  # 525,960
@@ -154,57 +118,47 @@ class BinaryOptionPricer:
     # Main entry point
     # ==================================================================
 
-    def price(
-        self,
-        spot: float,
-        strike: float,
-        vol: float,
-        time_remaining_min: float,
-        # V2: Jump-diffusion parameters (from VolEstimator)
-        jump_intensity: float = 1500.0,
-        jump_mean: float = -0.0008,
-        jump_vol: float = 0.003,
-        # V2: Mean reversion inputs
-        recent_return: Optional[float] = None,
-        recent_return_sigma: Optional[float] = None,
-        # V2: Overlay toggle
-        apply_overlays: bool = True,
-        # V3: Skew-adjusted binary correction (dσ/dK)
-        vol_skew: Optional[float] = None,
-        # V3: Funding rate regime bias
-        funding_bias: float = 0.0,
-    ) -> BinaryOptionPrice:
-        """
-        Price a binary call (YES) and put (NO) using jump-diffusion + overlays.
-        """
+    def _validate_and_prepare(self, spot, strike, vol, time_remaining_min):
+        """Validate inputs and compute T. Returns (T,) or None if intrinsic."""
         if spot <= 0 or strike <= 0:
-            return self._intrinsic_price(spot, strike)
-
+            return None
         vol = max(vol, 0.0)
         T = max(time_remaining_min / self.MINUTES_PER_YEAR, 0.0)
+        if T < 1e-12 or time_remaining_min < 0.05 or vol < 1e-8:
+            return None
+        return T, vol
 
-        if T < 1e-12 or time_remaining_min < 0.05:
+    def price(self, spot: float, strike: float, vol: float, time_remaining_min: float,
+              jump_intensity: float = 1500.0, jump_mean: float = -0.0008,
+              jump_vol: float = 0.003, recent_return: Optional[float] = None,
+              recent_return_sigma: Optional[float] = None, apply_overlays: bool = True,
+              vol_skew: Optional[float] = None, funding_bias: float = 0.0) -> BinaryOptionPrice:
+        """Price a binary call (YES) and put (NO) using jump-diffusion + overlays."""
+        result = self._validate_and_prepare(spot, strike, vol, time_remaining_min)
+        if result is None:
             return self._intrinsic_price(spot, strike)
-        if vol < 1e-8:
-            return self._intrinsic_price(spot, strike)
-
-        # --- Step 1: Merton Jump-Diffusion base probability ---
-        yes_jd, d2_jd = self._merton_jump_diffusion(
-            spot, strike, vol, T, jump_intensity, jump_mean, jump_vol
-        )
-
-        # --- Step 2: BSM for Greeks + comparison ---
+        T, vol = result
+        yes_jd, d2_jd = self._merton_jump_diffusion(spot, strike, vol, T, jump_intensity, jump_mean, jump_vol)
         yes_bsm, d2_bsm, greeks = self._bsm_with_greeks(spot, strike, vol, T)
-
-        yes_base = yes_jd
         jump_adj = yes_jd - yes_bsm
         method = "merton_jd"
-        mr_adj = 0.0
-        candle_adj = 0.0
-        season_adj = 0.0
-        skew_adj_val = 0.0
+        mr_adj, candle_adj, season_adj, skew_adj_val, funding_adj = self._compute_overlays(
+            apply_overlays, recent_return, recent_return_sigma, time_remaining_min, vol_skew, greeks, funding_bias)
+        if apply_overlays: method = "adjusted"
+        adjs = {"jump": jump_adj, "mr": mr_adj, "candle": candle_adj, "season": season_adj, "skew": skew_adj_val}
+        total_adj = mr_adj + candle_adj + season_adj + skew_adj_val + funding_adj
+        yes_fv = max(0.01, min(0.99, yes_jd + total_adj))
+        return self._build_price_result(
+            yes_fv, max(0.01, min(0.99, 1.0 - yes_fv)), greeks, spot, strike, vol,
+            time_remaining_min, d2_jd, method, yes_bsm, adjs)
 
-        # --- Step 3: Statistical overlays ---
+    def _compute_overlays(
+        self, apply_overlays, recent_return, recent_return_sigma,
+        time_remaining_min, vol_skew, greeks, funding_bias,
+    ):
+        """Compute all statistical overlay adjustments."""
+        mr_adj = candle_adj = season_adj = skew_adj_val = 0.0
+
         if apply_overlays:
             if recent_return is not None and recent_return_sigma is not None:
                 mr_adj = self._mean_reversion_adj(
@@ -213,47 +167,31 @@ class BinaryOptionPricer:
             candle_adj = self._candle_effect_adj(time_remaining_min)
             season_adj = self._seasonality_adj()
 
-            # V3: Skew-adjusted binary correction
-            # Binary_adjusted = N(d2) - Vega × dσ/dK
-            # BTC has persistent negative vol skew (OTM puts > OTM calls)
             if vol_skew is not None and greeks["vega"] != 0:
                 skew_adj_val = -greeks["vega"] * vol_skew
-                # Clamp to reasonable range
                 skew_adj_val = max(-0.03, min(0.03, skew_adj_val))
 
-            method = "adjusted"
-
-        # --- Step 4: Funding rate regime bias ---
-        # From FundingRateFilter: crowded longs → negative bias, crowded shorts → positive
         funding_adj = max(-0.02, min(0.02, funding_bias))
+        return mr_adj, candle_adj, season_adj, skew_adj_val, funding_adj
 
-        # --- Combine ---
-        yes_fv = max(0.01, min(0.99,
-            yes_base + mr_adj + candle_adj + season_adj + skew_adj_val + funding_adj
-        ))
-        no_fv = max(0.01, min(0.99, 1.0 - yes_fv))
-
+    def _build_price_result(
+        self, yes_fv, no_fv, greeks, spot, strike, vol,
+        time_remaining_min, d2, method, bsm_base, adjs,
+    ):
+        """Construct the BinaryOptionPrice result."""
         return BinaryOptionPrice(
-            yes_fair_value=yes_fv,
-            no_fair_value=no_fv,
-            delta=greeks["delta"],
-            gamma=greeks["gamma"],
-            theta=greeks["theta_per_min"],
-            vega=greeks["vega"],
-            spot=spot,
-            strike=strike,
-            vol=vol,
-            time_remaining_min=time_remaining_min,
-            d2=d2_jd,
+            yes_fair_value=yes_fv, no_fair_value=no_fv,
+            delta=greeks["delta"], gamma=greeks["gamma"],
+            theta=greeks["theta_per_min"], vega=greeks["vega"],
+            spot=spot, strike=strike, vol=vol,
+            time_remaining_min=time_remaining_min, d2=d2,
             moneyness=spot / strike,
-            implied_prob=yes_fv,
-            method=method,
-            bsm_base=yes_bsm,
-            jump_adjustment=jump_adj,
-            mean_reversion_adj=mr_adj,
-            candle_effect_adj=candle_adj,
-            seasonality_adj=season_adj,
-            skew_adj=skew_adj_val,
+            implied_prob=yes_fv, method=method,
+            bsm_base=bsm_base, jump_adjustment=adjs["jump"],
+            mean_reversion_adj=adjs["mr"],
+            candle_effect_adj=adjs["candle"],
+            seasonality_adj=adjs["season"],
+            skew_adj=adjs["skew"],
         )
 
     # ==================================================================
@@ -261,72 +199,53 @@ class BinaryOptionPricer:
     # ==================================================================
 
     def _merton_jump_diffusion(
-        self,
-        spot: float,
-        strike: float,
-        vol: float,
-        T: float,
-        jump_intensity: float,
-        jump_mean: float,
-        jump_vol: float,
+        self, spot: float, strike: float, vol: float, T: float,
+        jump_intensity: float, jump_mean: float, jump_vol: float,
         num_terms: int = 25,
     ) -> tuple:
-        """
-        Merton jump-diffusion binary option pricing.
-
-        Physical measure:
-          P(S_T > K) = Σ_{n=0}^{N} Poisson(λT, n) × Φ(d_n)
-
-        where:
-          d_n = [ln(S/K) + (-σ²/2 - λm̄)T + nμ_J] / sqrt(σ²T + nσ_J²)
-          m̄ = E[e^J - 1] = exp(μ_J + σ_J²/2) - 1
-
-        Returns (yes_probability, d2_weighted)
-        """
-        lambda_T = jump_intensity * T
+        """Merton jump-diffusion binary option pricing. Returns (yes_probability, d2_weighted)."""
+        lambda_t = jump_intensity * T
         m_bar = math.exp(jump_mean + 0.5 * jump_vol ** 2) - 1.0
-
-        prob_up = 0.0
-        poisson_cumul = 0.0
-        d2_weighted = 0.0
-
-        # Pre-compute log(S/K) once
-        log_moneyness = math.log(spot / strike)
-        base_drift_T = (-0.5 * vol ** 2 - jump_intensity * m_bar) * T
-        base_var_T = vol ** 2 * T
+        log_m = math.log(spot / strike)
+        base_drift = (-0.5 * vol ** 2 - jump_intensity * m_bar) * T
+        base_var = vol ** 2 * T
+        prob_up = poisson_cumul = d2_w = 0.0
 
         for n in range(num_terms):
-            # Poisson weight P(N_T = n)
-            if lambda_T < 1e-15:
-                pw = 1.0 if n == 0 else 0.0
-            else:
-                log_pw = -lambda_T + n * math.log(lambda_T) - math.lgamma(n + 1)
-                pw = math.exp(log_pw)
-
+            pw = self._poisson_weight(lambda_t, n)
             if pw < 1e-15 and poisson_cumul > 0.9999:
                 break
-
             poisson_cumul += pw
+            d_n = self._jump_diffusion_d(log_m, base_drift, base_var, n, jump_mean, jump_vol, spot, strike)
+            prob_up += pw * _norm_cdf(d_n)
+            d2_w += pw * d_n
 
-            # Conditional variance and drift given n jumps
-            total_var = base_var_T + n * jump_vol ** 2
-            drift = base_drift_T + n * jump_mean
-
-            if total_var < 1e-20:
-                d_n = 1e6 if spot > strike else (-1e6 if spot < strike else 0.0)
-            else:
-                d_n = (log_moneyness + drift) / math.sqrt(total_var)
-
-            cond_prob = _norm_cdf(d_n)
-            prob_up += pw * cond_prob
-            d2_weighted += pw * d_n
-
-        # Normalize if truncated early
         if 0 < poisson_cumul < 0.999:
             prob_up /= poisson_cumul
-            d2_weighted /= poisson_cumul
+            d2_w /= poisson_cumul
+        return prob_up, d2_w
 
-        return prob_up, d2_weighted
+    @staticmethod
+    def _poisson_weight(lambda_t: float, n: int) -> float:
+        """Compute Poisson probability P(N_T = n)."""
+        if lambda_t < 1e-15:
+            return 1.0 if n == 0 else 0.0
+        log_pw = -lambda_t + n * math.log(lambda_t) - math.lgamma(n + 1)
+        return math.exp(log_pw)
+
+    @staticmethod
+    def _jump_diffusion_d(log_moneyness, base_drift, base_var,
+                          n, jump_mean, jump_vol, spot, strike) -> float:
+        """Compute d_n for n jumps in Merton model."""
+        total_var = base_var + n * jump_vol ** 2
+        drift = base_drift + n * jump_mean
+        if total_var < 1e-20:
+            if spot > strike:
+                return 1e6
+            elif spot < strike:
+                return -1e6
+            return 0.0
+        return (log_moneyness + drift) / math.sqrt(total_var)
 
     # ==================================================================
     # BSM with Greeks
@@ -360,213 +279,16 @@ class BinaryOptionPricer:
             "theta_per_min": theta_min, "vega": vega,
         }
 
-    # ==================================================================
-    # Statistical overlays
-    # ==================================================================
-
-    def _mean_reversion_adj(
-        self, recent_return: float, recent_sigma: float, t_min: float
-    ) -> float:
-        """
-        Mean reversion overlay. BTC has negative autocorrelation at 15-min.
-        After >1.5σ move, probability of reversal modestly elevated (~55-60%).
-        Asymmetric: negative returns revert faster (3.66% asymmetry).
-        """
-        abs_sig = abs(recent_sigma)
-        if abs_sig < self.MEAN_REVERSION_THRESHOLD_SIGMA:
-            return 0.0
-
-        excess = abs_sig - self.MEAN_REVERSION_THRESHOLD_SIGMA
-        raw = min(excess / 2.0, 1.0) * self.MEAN_REVERSION_STRENGTH
-        time_factor = min(t_min / 10.0, 1.0)
-        strength = raw * time_factor
-
-        if recent_return > 0:
-            # Up move → expect reversion DOWN → lower YES prob
-            return -strength
-        else:
-            # Down move → expect reversion UP → raise YES prob
-            return strength * self.NEGATIVE_REVERSION_MULT
-
-    def _candle_effect_adj(self, time_remaining_min: float) -> float:
-        """
-        Turn-of-candle effect (Shanaev & Vasenin 2023).
-        +0.58 bps/min concentrated at minutes 0, 15, 30, 45 of each hour.
-        """
-        now = datetime.now(timezone.utc)
-        resolve_minute = (now.minute + int(time_remaining_min)) % 60
-
-        if resolve_minute in self.CANDLE_MINUTES:
-            return 0.002   # +0.2% bullish bias at candle boundaries
-        elif resolve_minute % 15 <= 1 or resolve_minute % 15 >= 14:
-            return 0.001   # Partial effect near boundaries
-        else:
-            return -0.0005  # Slight negative at non-boundary minutes
-
-    def _seasonality_adj(self) -> float:
-        """
-        Intraday seasonality (QuantPedia / SSRN 4581124).
-        22:00-23:00 UTC strongest positive, 03:00-04:00 weakest.
-        """
-        now = datetime.now(timezone.utc)
-        bias = self.HOURLY_BIAS.get(now.hour, 0.0)
-
-        # Friday amplification
-        if now.weekday() == 4:
-            bias *= 1.2
-
-        return bias * self.SEASONALITY_SCALE
-
-    # ==================================================================
-    # V3: Vol skew estimation
-    # ==================================================================
-
-    @staticmethod
-    def estimate_btc_vol_skew(
-        spot: float,
-        strike: float,
-        vol: float,
-        time_remaining_min: float,
-    ) -> float:
-        """
-        Estimate dσ/dK (vol skew slope) for BTC at short horizons.
-
-        BTC has a persistent negative vol skew:
-        - OTM puts are more expensive than OTM calls (crash risk premium)
-        - The skew steepens at shorter horizons (0DTE effect)
-        - Research: BTC skew ~-0.1 to -0.3 per 1% moneyness at daily horizons
-
-        For 15-min binary options, the relevant metric is how vol changes
-        as strike moves relative to spot. A higher strike (OTM call) should
-        have lower IV; a lower strike (OTM put) should have higher IV.
-
-        Returns dσ/dK (change in vol per unit change in strike price).
-        Negative = typical BTC skew (OTM puts more expensive).
-        """
-        if spot <= 0 or strike <= 0 or vol <= 0:
-            return 0.0
-
-        moneyness = spot / strike  # >1 means ITM call, <1 means OTM call
-
-        # Base skew slope: -0.15 per 1% moneyness at daily horizon
-        # Steeper at shorter horizons (scale by sqrt(T_daily / T_actual))
-        T_daily = 1.0 / (365.25 * 24 * 60)  # 1 day in years
-        T_actual = max(time_remaining_min, 0.1) / (365.25 * 24 * 60)
-        time_scale = min(3.0, math.sqrt(T_daily / T_actual))
-
-        # BTC base skew: approximately -2.0 per unit moneyness at daily
-        # This means for a 1% OTM call (moneyness 0.99), IV drops ~2%
-        base_skew_per_strike = -2.0 * vol / spot  # Convert to per-dollar
-
-        # Scale by time horizon
-        skew = base_skew_per_strike * time_scale
-
-        # Clamp to prevent extreme adjustments
-        return max(-0.001, min(0.001, skew))
-
-    # ==================================================================
-    # Intrinsic price (edge case)
-    # ==================================================================
-
-    def _intrinsic_price(self, spot: float, strike: float) -> BinaryOptionPrice:
-        if spot > strike:
-            yes_fv, no_fv = 0.99, 0.01
-        elif spot < strike:
-            yes_fv, no_fv = 0.01, 0.99
-        else:
-            yes_fv, no_fv = 0.50, 0.50
-
-        return BinaryOptionPrice(
-            yes_fair_value=yes_fv, no_fair_value=no_fv,
-            delta=0.0, gamma=0.0, theta=0.0, vega=0.0,
-            spot=spot, strike=strike, vol=0.0,
-            time_remaining_min=0.0, d2=0.0,
-            moneyness=spot / strike if strike > 0 else 1.0,
-            implied_prob=yes_fv, method="intrinsic",
-        )
-
-    # ==================================================================
-    # Implied vol (bisection on BSM component — standard practice)
-    # ==================================================================
-
-    def implied_vol(
-        self,
-        market_price: float,
-        spot: float,
-        strike: float,
-        time_remaining_min: float,
-        is_call: bool = True,
-        max_iterations: int = 50,
-        tolerance: float = 1e-6,
-    ) -> float:
-        """
-        Back out implied volatility from market price using bisection.
-        Uses BSM component for IV — the gap between BSM-IV and realized vol
-        IS the Variance Risk Premium signal (~14% annualized for BTC).
-        """
-        if time_remaining_min < 0.1:
-            return 0.0
-
-        T = max(time_remaining_min / self.MINUTES_PER_YEAR, 1e-12)
-        vol_low, vol_high = 0.01, 5.0
-
-        for _ in range(max_iterations):
-            vol_mid = (vol_low + vol_high) / 2.0
-            sqrt_T = math.sqrt(T)
-            vst = vol_mid * sqrt_T
-
-            if vst < 1e-12:
-                vol_low = vol_mid
-                continue
-
-            d2 = (math.log(spot / strike) + (self.r - 0.5 * vol_mid ** 2) * T) / vst
-            p = _norm_cdf(d2) if is_call else _norm_cdf(-d2)
-
-            if abs(p - market_price) < tolerance:
-                return vol_mid
-            if p > market_price:
-                vol_high = vol_mid
-            else:
-                vol_low = vol_mid
-
-        return (vol_low + vol_high) / 2.0
-
-    # ==================================================================
-    # BSM-only pricing (V1 backward compatible)
-    # ==================================================================
-
-    def price_bsm(
-        self, spot: float, strike: float, vol: float, time_remaining_min: float,
-    ) -> BinaryOptionPrice:
-        """Pure BSM pricing for comparison/debugging."""
-        if spot <= 0 or strike <= 0:
-            return self._intrinsic_price(spot, strike)
-
-        vol = max(vol, 0.0)
-        T = max(time_remaining_min / self.MINUTES_PER_YEAR, 0.0)
-
-        if T < 1e-12 or time_remaining_min < 0.05 or vol < 1e-8:
-            return self._intrinsic_price(spot, strike)
-
-        yes_fv, d2, greeks = self._bsm_with_greeks(spot, strike, vol, T)
-        yes_fv = max(0.01, min(0.99, yes_fv))
-        no_fv = max(0.01, min(0.99, 1.0 - yes_fv))
-
-        return BinaryOptionPrice(
-            yes_fair_value=yes_fv, no_fair_value=no_fv,
-            delta=greeks["delta"], gamma=greeks["gamma"],
-            theta=greeks["theta_per_min"], vega=greeks["vega"],
-            spot=spot, strike=strike, vol=vol,
-            time_remaining_min=time_remaining_min, d2=d2,
-            moneyness=spot / strike, implied_prob=yes_fv, method="bsm",
-        )
+    # Overlay/secondary methods inherited from BinaryOverlaysMixin:
+    # _mean_reversion_adj, _candle_effect_adj, _seasonality_adj,
+    # estimate_btc_vol_skew, _intrinsic_price, implied_vol,
+    # _bsm_price_at_vol, price_bsm
 
 
 # ---------------------------------------------------------------------------
 # Singleton
 # ---------------------------------------------------------------------------
 _pricer_instance = None
-
 def get_binary_pricer() -> BinaryOptionPricer:
     global _pricer_instance
     if _pricer_instance is None:

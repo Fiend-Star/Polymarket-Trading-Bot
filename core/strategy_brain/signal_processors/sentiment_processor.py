@@ -58,120 +58,44 @@ class SentimentProcessor(BaseSignalProcessor):
             f"fear<{extreme_fear_threshold}, greed>{extreme_greed_threshold}"
         )
     
-    def process(
-        self,
-        current_price: Decimal,
-        historical_prices: list[Decimal],
-        metadata: Dict[str, Any] = None,
-    ) -> Optional[TradingSignal]:
-        """
-        Generate signal from sentiment data.
-        
-        Args:
-            current_price: Current price
-            historical_prices: Price history (not used here)
-            metadata: Must contain 'sentiment_score' (0-100)
-            
-        Returns:
-            TradingSignal if extreme sentiment detected, None otherwise
-        """
-        if not self.is_enabled:
+    def _classify_sentiment(self, score):
+        """Classify sentiment score into direction, strength, confidence. Returns tuple or None."""
+        if score <= self.extreme_fear:
+            ext = (self.extreme_fear - score) / self.extreme_fear
+            return self._classify_extreme(ext, SignalDirection.BULLISH)
+        elif score >= self.extreme_greed:
+            ext = (score - self.extreme_greed) / (100 - self.extreme_greed)
+            return self._classify_extreme(ext, SignalDirection.BEARISH)
+        elif score < 45:
+            return SignalDirection.BULLISH, SignalStrength.WEAK, 0.55
+        elif score > 55:
+            return SignalDirection.BEARISH, SignalStrength.WEAK, 0.55
+        return None
+
+    @staticmethod
+    def _classify_extreme(extremeness, direction):
+        """Classify extreme sentiment into strength/confidence."""
+        if extremeness >= 0.8:
+            return direction, SignalStrength.VERY_STRONG, 0.85
+        elif extremeness >= 0.5:
+            return direction, SignalStrength.STRONG, 0.75
+        return direction, SignalStrength.MODERATE, 0.65
+
+    def process(self, current_price: Decimal, historical_prices: list,
+                metadata: Dict[str, Any] = None) -> Optional[TradingSignal]:
+        """Generate signal from sentiment data (Fear & Greed Index)."""
+        if not self.is_enabled or not metadata or 'sentiment_score' not in metadata:
             return None
-        
-        if not metadata or 'sentiment_score' not in metadata:
+        score = float(metadata['sentiment_score'])
+        result = self._classify_sentiment(score)
+        if result is None:
             return None
-        
-        sentiment_score = float(metadata['sentiment_score'])
-        
-        # Determine signal based on sentiment
-        if sentiment_score <= self.extreme_fear:
-            # Extreme fear → Contrarian buy
-            direction = SignalDirection.BULLISH
-            signal_type = SignalType.SENTIMENT_SHIFT
-            
-            # More extreme = stronger signal
-            extremeness = (self.extreme_fear - sentiment_score) / self.extreme_fear
-            
-            if extremeness >= 0.8:  # Very extreme
-                strength = SignalStrength.VERY_STRONG
-                confidence = 0.85
-            elif extremeness >= 0.5:
-                strength = SignalStrength.STRONG
-                confidence = 0.75
-            else:
-                strength = SignalStrength.MODERATE
-                confidence = 0.65
-            
-            logger.info(
-                f"Extreme fear detected: score={sentiment_score:.1f} "
-                f"→ Contrarian BULLISH signal"
-            )
-            
-        elif sentiment_score >= self.extreme_greed:
-            # Extreme greed → Contrarian sell
-            direction = SignalDirection.BEARISH
-            signal_type = SignalType.SENTIMENT_SHIFT
-            
-            # More extreme = stronger signal
-            extremeness = (sentiment_score - self.extreme_greed) / (100 - self.extreme_greed)
-            
-            if extremeness >= 0.8:
-                strength = SignalStrength.VERY_STRONG
-                confidence = 0.85
-            elif extremeness >= 0.5:
-                strength = SignalStrength.STRONG
-                confidence = 0.75
-            else:
-                strength = SignalStrength.MODERATE
-                confidence = 0.65
-            
-            logger.info(
-                f"Extreme greed detected: score={sentiment_score:.1f} "
-                f"→ Contrarian BEARISH signal"
-            )
-            
-        elif sentiment_score < 45:
-            # Moderate fear → Mild bullish
-            direction = SignalDirection.BULLISH
-            signal_type = SignalType.SENTIMENT_SHIFT
-            strength = SignalStrength.WEAK
-            confidence = 0.55
-            
-        elif sentiment_score > 55:
-            # Moderate greed → Mild bearish
-            direction = SignalDirection.BEARISH
-            signal_type = SignalType.SENTIMENT_SHIFT
-            strength = SignalStrength.WEAK
-            confidence = 0.55
-            
-        else:
-            # Neutral sentiment → No signal
-            return None
-        
-        # Check minimum confidence
+        direction, strength, confidence = result
         if confidence < self.min_confidence:
             return None
-        
-        # Create signal
-        signal = TradingSignal(
-            timestamp=datetime.now(),
-            source=self.name,
-            signal_type=signal_type,
-            direction=direction,
-            strength=strength,
-            confidence=confidence,
-            current_price=current_price,
-            metadata={
-                "sentiment_score": sentiment_score,
-                "sentiment_classification": metadata.get('sentiment_classification', 'unknown'),
-            }
-        )
-        
-        self._record_signal(signal)
-        
-        logger.debug(
-            f"Generated sentiment signal: {direction.value}, "
-            f"score={signal.score:.1f}"
-        )
-        
+        signal = self._build_and_record(
+            SignalType.SENTIMENT_SHIFT, direction, strength, confidence, current_price,
+            {"sentiment_score": score,
+             "sentiment_classification": metadata.get('sentiment_classification', 'unknown')})
+        logger.info(f"Sentiment signal: {direction.value}, score={score:.1f}, conf={confidence:.2%}")
         return signal

@@ -74,86 +74,90 @@ def display_status(client):
     print("=" * 60 + "\n")
 
 
+def _handle_cli_command(client, command):
+    """Handle a single CLI command argument."""
+    if command in ['sim', 'simulation', 'on']:
+        print("Switching to SIMULATION mode...")
+        set_simulation_mode(client, True)
+        display_status(client)
+
+    elif command in ['live', 'off']:
+        print("\n⚠️  WARNING: Switching to LIVE TRADING mode!")
+        confirm = input("Type 'yes' to confirm: ")
+        if confirm.lower() == 'yes':
+            set_simulation_mode(client, False)
+            display_status(client)
+        else:
+            print("Cancelled.")
+
+    elif command in ['status', 'check']:
+        pass  # Already displayed
+
+    else:
+        print(f"Unknown command: {command}")
+        print("\nUsage:")
+        print("  python redis_control.py sim       - Enable simulation mode")
+        print("  python redis_control.py live      - Enable live trading")
+        print("  python redis_control.py status    - Show current status")
+
+
+def _confirm_live_switch(client):
+    """Prompt user to confirm live trading switch."""
+    print("\n⚠️  WARNING: This will enable LIVE TRADING!")
+    confirm = input("Type 'yes' to confirm: ")
+    if confirm.lower() == 'yes':
+        set_simulation_mode(client, False)
+        display_status(client)
+    else:
+        print("Cancelled.")
+
+
+def _interactive_menu_loop(client):
+    """Run the interactive menu loop."""
+    print("Commands:")
+    print("  1. Enable simulation mode")
+    print("  2. Enable live trading (⚠️ DANGEROUS!)")
+    print("  3. Check status")
+    print("  4. Exit")
+
+    while True:
+        try:
+            choice = input("\nEnter choice (1-4): ").strip()
+
+            if choice == '1':
+                set_simulation_mode(client, True)
+                display_status(client)
+            elif choice == '2':
+                _confirm_live_switch(client)
+            elif choice == '3':
+                display_status(client)
+            elif choice == '4':
+                print("Goodbye!")
+                break
+            else:
+                print("Invalid choice!")
+
+        except KeyboardInterrupt:
+            print("\nGoodbye!")
+            break
+
+
 def main():
     """Main control interface."""
     print("\n" + "=" * 60)
     print("BTC BOT - SIMULATION MODE CONTROL")
     print("=" * 60)
-    
-    # Connect to Redis
+
     client = get_redis_client()
     if not client:
         return
-    
-    # Show current status
+
     display_status(client)
-    
-    # Parse command
+
     if len(sys.argv) > 1:
-        command = sys.argv[1].lower()
-        
-        if command in ['sim', 'simulation', 'on']:
-            print("Switching to SIMULATION mode...")
-            set_simulation_mode(client, True)
-            display_status(client)
-            
-        elif command in ['live', 'off']:
-            print("\n⚠️  WARNING: Switching to LIVE TRADING mode!")
-            confirm = input("Type 'yes' to confirm: ")
-            if confirm.lower() == 'yes':
-                set_simulation_mode(client, False)
-                display_status(client)
-            else:
-                print("Cancelled.")
-                
-        elif command in ['status', 'check']:
-            # Already displayed above
-            pass
-            
-        else:
-            print(f"Unknown command: {command}")
-            print("\nUsage:")
-            print("  python redis_control.py sim       - Enable simulation mode")
-            print("  python redis_control.py live      - Enable live trading")
-            print("  python redis_control.py status    - Show current status")
+        _handle_cli_command(client, sys.argv[1].lower())
     else:
-        # Interactive mode
-        print("Commands:")
-        print("  1. Enable simulation mode")
-        print("  2. Enable live trading (⚠️ DANGEROUS!)")
-        print("  3. Check status")
-        print("  4. Exit")
-        
-        while True:
-            try:
-                choice = input("\nEnter choice (1-4): ").strip()
-                
-                if choice == '1':
-                    set_simulation_mode(client, True)
-                    display_status(client)
-                    
-                elif choice == '2':
-                    print("\n⚠️  WARNING: This will enable LIVE TRADING!")
-                    confirm = input("Type 'yes' to confirm: ")
-                    if confirm.lower() == 'yes':
-                        set_simulation_mode(client, False)
-                        display_status(client)
-                    else:
-                        print("Cancelled.")
-                        
-                elif choice == '3':
-                    display_status(client)
-                    
-                elif choice == '4':
-                    print("Goodbye!")
-                    break
-                    
-                else:
-                    print("Invalid choice!")
-                    
-            except KeyboardInterrupt:
-                print("\nGoodbye!")
-                break
+        _interactive_menu_loop(client)
 
 
 if __name__ == "__main__":

@@ -36,46 +36,17 @@ class NautilusDataEngineWrapper:
     
     def __init__(self):
         """Initialize Nautilus data engine wrapper."""
-        # Clock (used by engine / msgbus / provider)
         self.clock = LiveClock()
-        
-        # Logger – no clock kwarg
         self.logger = Logger("nautilus.data_engine.wrapper")
-        
-        self.msgbus = MessageBus(
-            trader_id=TraderId("TRADER-001"),
-            clock=self.clock,
-        )
-        
-        # Cache – no logger parameter anymore
-        self.cache = Cache(
-            database=None,          # in-memory only
-            # config=CacheConfig(...)  # optional
-        )
-        
-        # Data engine config
-        config = DataEngineConfig(
-            time_bars_timestamp_on_close=False,
-            validate_data_sequence=True,
-        )
-        
-        # The actual data engine
-        self.engine = DataEngine(
-            msgbus=self.msgbus,
-            cache=self.cache,
-            clock=self.clock,
-            config=config,
-        )
-        
-        # Custom provider (created later in start())
+        self.msgbus = MessageBus(trader_id=TraderId("TRADER-001"), clock=self.clock)
+        self.cache = Cache(database=None)
+        config = DataEngineConfig(time_bars_timestamp_on_close=False, validate_data_sequence=True)
+        self.engine = DataEngine(msgbus=self.msgbus, cache=self.cache,
+                                 clock=self.clock, config=config)
         self.data_provider: Optional[CustomDataProvider] = None
-        
-        # Instruments & events
         self.instruments = get_instrument_registry()
         self.event_dispatcher = get_event_dispatcher()
-        
         self._is_running = False
-        
         loguru_logger.info("Initialized Nautilus Data Engine Wrapper")
     
     async def start(self) -> None:

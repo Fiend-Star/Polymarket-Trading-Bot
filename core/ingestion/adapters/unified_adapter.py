@@ -78,54 +78,25 @@ class UnifiedDataAdapter:
         
         logger.info("Initialized Unified Data Adapter")
     
+    async def _connect_source(self, name, factory, connect_args=()):
+        """Connect a single data source. Returns (name, success)."""
+        try:
+            src = factory()
+            setattr(self, name, src)
+            return await (src.connect(*connect_args) if connect_args else src.connect())
+        except Exception as e:
+            logger.error(f"Failed to connect {name}: {e}"); return False
+
     async def connect_all(self) -> Dict[str, bool]:
-        """
-        Connect to all data sources.
-        
-        Returns:
-            Dict of source_name -> connection_status
-        """
+        """Connect to all data sources. Returns {name: connected}."""
         logger.info("Connecting to all data sources...")
-        
-        results = {}
-        
-        # Connect Coinbase
-        try:
-            self.coinbase = CoinbaseDataSource()
-            results["coinbase"] = await self.coinbase.connect()
-        except Exception as e:
-            logger.error(f"Failed to connect Coinbase: {e}")
-            results["coinbase"] = False
-        
-        # Connect Binance
-        try:
-            self.binance = BinanceWebSocketSource()
-            results["binance"] = await self.binance.connect("ticker")
-        except Exception as e:
-            logger.error(f"Failed to connect Binance: {e}")
-            results["binance"] = False
-        
-        # Connect News/Social
-        try:
-            self.news_social = NewsSocialDataSource()
-            results["news_social"] = await self.news_social.connect()
-        except Exception as e:
-            logger.error(f"Failed to connect News/Social: {e}")
-            results["news_social"] = False
-        
-        # Connect Solana
-        try:
-            self.solana = SolanaRPCDataSource()
-            results["solana"] = await self.solana.connect()
-        except Exception as e:
-            logger.error(f"Failed to connect Solana: {e}")
-            results["solana"] = False
-        
-        # Log summary
-        connected = sum(results.values())
-        total = len(results)
-        logger.info(f"Connected to {connected}/{total} data sources")
-        
+        results = {
+            "coinbase": await self._connect_source("coinbase", CoinbaseDataSource),
+            "binance": await self._connect_source("binance", BinanceWebSocketSource, ("ticker",)),
+            "news_social": await self._connect_source("news_social", NewsSocialDataSource),
+            "solana": await self._connect_source("solana", SolanaRPCDataSource),
+        }
+        logger.info(f"Connected {sum(results.values())}/{len(results)} sources")
         return results
     
     async def disconnect_all(self) -> None:
@@ -182,125 +153,63 @@ class UnifiedDataAdapter:
         logger.info(f"Started {len(self._update_tasks)} data streams")
     
     async def _poll_coinbase(self, interval: int = 5) -> None:
-        """
-        Poll Coinbase API for price updates.
-        
-        Args:
-            interval: Seconds between polls
-        """
+        """Poll Coinbase API for price updates."""
         while self._is_running:
             try:
-                # Get current price
                 price = await self.coinbase.get_current_price()
-                
                 if price:
-                    # Get order book for bid/ask
                     book = await self.coinbase.get_order_book(level=1)
-                    
-                    # Get 24h stats
                     stats = await self.coinbase.get_24h_stats()
-                    
-                    # Create normalized data
-                    market_data = MarketData(
-                        timestamp=datetime.now(),
-                        source="coinbase",
-                        symbol="BTC-USD",
-                        price=price,
-                        bid=book["bids"][0]["price"] if book and book["bids"] else None,
-                        ask=book["asks"][0]["price"] if book and book["asks"] else None,
+                    md = MarketData(
+                        timestamp=datetime.now(), source="coinbase", symbol="BTC-USD", price=price,
+                        bid=book["bids"][0]["price"] if book and book.get("bids") else None,
+                        ask=book["asks"][0]["price"] if book and book.get("asks") else None,
                         volume_24h=stats["volume"] if stats else None,
                         high_24h=stats["high"] if stats else None,
-                        low_24h=stats["low"] if stats else None,
-                    )
-                    
-                    # Cache and notify
-                    self._latest_data["coinbase"] = market_data
-                    
-                    if self.on_price_update:
-                        await self.on_price_update(market_data)
-                
+                        low_24h=stats["low"] if stats else None)
+                    self._latest_data["coinbase"] = md
+                    if self.on_price_update: await self.on_price_update(md)
                 await asyncio.sleep(interval)
-                
-            except asyncio.CancelledError:
-                break
+            except asyncio.CancelledError: break
             except Exception as e:
-                logger.error(f"Error polling Coinbase: {e}")
-                await asyncio.sleep(interval)
-    
+                logger.error(f"Coinbase poll error: {e}"); await asyncio.sleep(interval)
+
     async def _stream_binance(self) -> None:
         """Stream real-time data from Binance WebSocket."""
-        async def on_ticker(ticker_data: Dict[str, Any]) -> None:
-            """Handle Binance ticker updates."""
+        async def on_ticker(td: Dict[str, Any]) -> None:
             try:
-                market_data = MarketData(
-                    timestamp=ticker_data["timestamp"],
-                    source="binance",
-                    symbol="BTCUSDT",
-                    price=ticker_data["price"],
-                    volume_24h=ticker_data["volume"],
-                    high_24h=ticker_data["high"],
-                    low_24h=ticker_data["low"],
-                    metadata={
-                        "price_change": ticker_data["price_change"],
-                        "price_change_percent": ticker_data["price_change_percent"],
-                    }
-                )
-                
-                # Cache and notify
-                self._latest_data["binance"] = market_data
-                
-                if self.on_price_update:
-                    await self.on_price_update(market_data)
-                    
+                md = MarketData(
+                    timestamp=td["timestamp"], source="binance", symbol="BTCUSDT",
+                    price=td["price"], volume_24h=td["volume"], high_24h=td["high"],
+                    low_24h=td["low"], metadata={"price_change": td["price_change"],
+                    "price_change_percent": td["price_change_percent"]})
+                self._latest_data["binance"] = md
+                if self.on_price_update: await self.on_price_update(md)
             except Exception as e:
-                logger.error(f"Error processing Binance ticker: {e}")
-        
-        # Set callback and start streaming
+                logger.error(f"Binance ticker error: {e}")
         self.binance.on_price_update = on_ticker
-        
-        try:
-            await self.binance.stream_ticker()
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error(f"Error in Binance stream: {e}")
-    
+        try: await self.binance.stream_ticker()
+        except asyncio.CancelledError: pass
+        except Exception as e: logger.error(f"Binance stream error: {e}")
+
     async def _poll_sentiment(self, interval: int = 300) -> None:
-        """
-        Poll sentiment data.
-        
-        Args:
-            interval: Seconds between polls (default 5 minutes)
-        """
+        """Poll sentiment data every `interval` seconds."""
         while self._is_running:
             try:
-                # Get Fear & Greed Index
-                fg_data = await self.news_social.get_fear_greed_index()
-                
-                if fg_data:
-                    # Create normalized sentiment data
-                    sentiment_data = SentimentData(
-                        timestamp=fg_data["timestamp"],
-                        source="fear_greed_index",
-                        score=float(fg_data["value"]),
-                        classification=fg_data["classification"].lower().replace(" ", "_"),
-                        metadata=fg_data,
-                    )
-                    
-                    # Cache and notify
-                    self._latest_sentiment = sentiment_data
-                    
-                    if self.on_sentiment_update:
-                        await self.on_sentiment_update(sentiment_data)
-                
+                fg = await self.news_social.get_fear_greed_index()
+                if fg:
+                    sd = SentimentData(
+                        timestamp=fg["timestamp"], source="fear_greed_index",
+                        score=float(fg["value"]),
+                        classification=fg["classification"].lower().replace(" ", "_"),
+                        metadata=fg)
+                    self._latest_sentiment = sd
+                    if self.on_sentiment_update: await self.on_sentiment_update(sd)
                 await asyncio.sleep(interval)
-                
-            except asyncio.CancelledError:
-                break
+            except asyncio.CancelledError: break
             except Exception as e:
-                logger.error(f"Error polling sentiment: {e}")
-                await asyncio.sleep(interval)
-    
+                logger.error(f"Sentiment poll error: {e}"); await asyncio.sleep(interval)
+
     def get_latest_price(self, source: Optional[str] = None) -> Optional[Decimal]:
         """
         Get latest price from a specific source or average of all.

@@ -43,211 +43,90 @@ class LearningEngine:
     - Improves over time
     """
     
-    def __init__(
-        self,
-        learning_rate: float = 0.1,
-        min_trades_for_learning: int = 10,
-    ):
-        """
-        Initialize learning engine.
-        
-        Args:
-            learning_rate: How quickly to adjust weights (0-1)
-            min_trades_for_learning: Minimum trades before adjusting
-        """
+    def __init__(self, learning_rate: float = 0.1, min_trades_for_learning: int = 10,
+                 performance_tracker=None, fusion_engine=None):
+        """Initialize learning engine with optional injected dependencies (DIP)."""
         self.learning_rate = learning_rate
         self.min_trades = min_trades_for_learning
-        
-        # Components
-        self.performance = get_performance_tracker()
-        self.fusion = get_fusion_engine()
-        
-        # Signal performance tracking
+        self.performance = performance_tracker or get_performance_tracker()
+        self.fusion = fusion_engine or get_fusion_engine()
         self._signal_performance: Dict[str, SignalPerformance] = {}
-        
-        # Learning history
         self._weight_adjustments: List[Dict[str, Any]] = []
-        
-        logger.info(
-            f"Initialized Learning Engine "
-            f"(learning_rate={learning_rate}, min_trades={min_trades_for_learning})"
-        )
-    
-    def analyze_signal_performance(
-        self,
-        lookback_days: int = 7,
-    ) -> Dict[str, SignalPerformance]:
-        """
-        Analyze performance of each signal source.
-        
-        Args:
-            lookback_days: Number of days to analyze
-            
-        Returns:
-            Performance metrics per signal source
-        """
+        logger.info(f"Learning Engine (lr={learning_rate}, min_trades={min_trades_for_learning})")
+
+    def _group_trades_by_source(self, lookback_days):
+        """Group recent trades by signal source."""
         cutoff = datetime.now() - timedelta(days=lookback_days)
-        trades = self.performance.get_trade_history(
-            limit=1000,
-            start_date=cutoff,
-        )
-        
-        # Group trades by signal source
-        source_trades: Dict[str, List[Trade]] = {}
-        
-        for trade in trades:
-            # Extract signal source from metadata
-            # This assumes trades store which signal triggered them
-            sources = trade.metadata.get("signal_sources", [])
-            
-            for source in sources:
-                if source not in source_trades:
-                    source_trades[source] = []
-                
-                source_trades[source].append(trade)
-        
-        # Calculate performance per source
-        performances = {}
-        
-        for source, source_trade_list in source_trades.items():
-            wins = [t for t in source_trade_list if t.pnl > 0]
-            losses = [t for t in source_trade_list if t.pnl < 0]
-            
-            total = len(source_trade_list)
-            win_count = len(wins)
-            loss_count = len(losses)
-            
-            win_rate = win_count / total if total > 0 else 0.0
-            
-            avg_pnl = sum(t.pnl for t in source_trade_list) / total if total > 0 else Decimal("0")
-            total_pnl = sum(t.pnl for t in source_trade_list)
-            
-            avg_conf = sum(t.signal_confidence for t in source_trade_list) / total if total > 0 else 0.0
-            avg_score = sum(t.signal_score for t in source_trade_list) / total if total > 0 else 0.0
-            
-            perf = SignalPerformance(
-                source_name=source,
-                total_trades=total,
-                winning_trades=win_count,
-                losing_trades=loss_count,
-                win_rate=win_rate,
-                avg_pnl=avg_pnl,
-                total_pnl=total_pnl,
-                avg_confidence=avg_conf,
-                avg_score=avg_score,
-                last_updated=datetime.now(),
-            )
-            
-            performances[source] = perf
-            self._signal_performance[source] = perf
-        
-        logger.info(f"Analyzed performance for {len(performances)} signal sources")
-        
-        return performances
-    
-    def calculate_optimal_weights(
-        self,
-        performances: Dict[str, SignalPerformance],
-    ) -> Dict[str, float]:
-        """
-        Calculate optimal weights based on performance.
-        
-        Args:
-            performances: Signal performance metrics
-            
-        Returns:
-            Optimized weights per signal source
-        """
-        # Simple approach: Weight by win rate and total P&L
+        trades = self.performance.get_trade_history(limit=1000, start_date=cutoff)
+        groups: Dict[str, list] = {}
+        for t in trades:
+            for src in t.metadata.get("signal_sources", []):
+                groups.setdefault(src, []).append(t)
+        return groups
+
+    def _compute_source_perf(self, source, trades):
+        """Compute SignalPerformance for a single source."""
+        n = len(trades)
+        wins = sum(1 for t in trades if t.pnl > 0)
+        losses = sum(1 for t in trades if t.pnl < 0)
+        total_pnl = sum(t.pnl for t in trades)
+        return SignalPerformance(
+            source_name=source, total_trades=n, winning_trades=wins,
+            losing_trades=losses, win_rate=wins / n if n > 0 else 0.0,
+            avg_pnl=total_pnl / n if n > 0 else Decimal("0"), total_pnl=total_pnl,
+            avg_confidence=sum(t.signal_confidence for t in trades) / n if n > 0 else 0.0,
+            avg_score=sum(t.signal_score for t in trades) / n if n > 0 else 0.0,
+            last_updated=datetime.now())
+
+    def analyze_signal_performance(self, lookback_days: int = 7) -> Dict[str, SignalPerformance]:
+        """Analyze performance of each signal source."""
+        groups = self._group_trades_by_source(lookback_days)
+        perfs = {}
+        for src, trades in groups.items():
+            perf = self._compute_source_perf(src, trades)
+            perfs[src] = perf
+            self._signal_performance[src] = perf
+        logger.info(f"Analyzed {len(perfs)} signal sources")
+        return perfs
+
+    def calculate_optimal_weights(self, performances: Dict[str, SignalPerformance]) -> Dict[str, float]:
+        """Calculate optimal weights based on performance."""
         weights = {}
-        
-        for source, perf in performances.items():
-            # Skip if not enough trades
+        for src, perf in performances.items():
             if perf.total_trades < self.min_trades:
-                weights[source] = self.fusion.weights.get(source, 0.1)
-                continue
-            
-            # Calculate performance score
-            # Combines win rate and profitability
-            win_rate_score = perf.win_rate
+                weights[src] = self.fusion.weights.get(src, 0.1); continue
+            wr_score = perf.win_rate
             pnl_score = min(1.0, max(0.0, float(perf.total_pnl / Decimal("100"))))
-            
-            # Weighted combination
-            performance_score = (win_rate_score * 0.6) + (pnl_score * 0.4)
-            
-            # Apply learning rate (gradual adjustment)
-            current_weight = self.fusion.weights.get(source, 0.1)
-            target_weight = performance_score
-            
-            new_weight = current_weight + (target_weight - current_weight) * self.learning_rate
-            
-            # Clamp to reasonable range
-            new_weight = max(0.05, min(0.50, new_weight))
-            
-            weights[source] = new_weight
-        
-        # Normalize weights to sum to 1.0
+            perf_score = wr_score * 0.6 + pnl_score * 0.4
+            cur = self.fusion.weights.get(src, 0.1)
+            weights[src] = max(0.05, min(0.50, cur + (perf_score - cur) * self.learning_rate))
         total = sum(weights.values())
-        if total > 0:
-            weights = {k: v / total for k, v in weights.items()}
-        
-        return weights
-    
-    async def optimize_weights(self) -> Dict[str, float]:
-        """
-        Optimize signal fusion weights based on performance.
-        
-        Returns:
-            New weights
-        """
-        logger.info("=" * 60)
-        logger.info("OPTIMIZING SIGNAL WEIGHTS")
-        logger.info("=" * 60)
-        
-        # Analyze performance
-        performances = self.analyze_signal_performance(lookback_days=7)
-        
-        if not performances:
-            logger.warning("No performance data available for optimization")
-            return self.fusion.weights.copy()
-        
-        # Calculate optimal weights
-        new_weights = self.calculate_optimal_weights(performances)
-        
-        # Log changes
-        logger.info("Weight adjustments:")
-        for source, new_weight in new_weights.items():
-            old_weight = self.fusion.weights.get(source, 0.0)
-            change = new_weight - old_weight
-            
-            logger.info(
-                f"  {source}: {old_weight:.3f} → {new_weight:.3f} "
-                f"({change:+.3f})"
-            )
-        
-        # Apply new weights
-        for source, weight in new_weights.items():
-            self.fusion.set_weight(source, weight)
-        
-        # Record adjustment
+        return {k: v / total for k, v in weights.items()} if total > 0 else weights
+
+    def _record_adjustment(self, new_weights, performances):
+        """Record weight adjustment for audit trail."""
         self._weight_adjustments.append({
             "timestamp": datetime.now(),
             "old_weights": self.fusion.weights.copy(),
             "new_weights": new_weights.copy(),
-            "performances": {
-                source: {
-                    "win_rate": perf.win_rate,
-                    "total_pnl": float(perf.total_pnl),
-                    "trades": perf.total_trades,
-                }
-                for source, perf in performances.items()
-            },
-        })
-        
-        logger.info("✓ Weights optimized successfully")
-        
-        return new_weights
-    
+            "performances": {s: {"win_rate": p.win_rate, "total_pnl": float(p.total_pnl),
+                                 "trades": p.total_trades} for s, p in performances.items()}})
+
+    async def optimize_weights(self) -> Dict[str, float]:
+        """Optimize signal fusion weights based on recent performance."""
+        logger.info("=" * 60 + " OPTIMIZING WEIGHTS " + "=" * 60)
+        perfs = self.analyze_signal_performance(lookback_days=7)
+        if not perfs:
+            logger.warning("No performance data"); return self.fusion.weights.copy()
+        new_w = self.calculate_optimal_weights(perfs)
+        for src, w in new_w.items():
+            old = self.fusion.weights.get(src, 0.0)
+            logger.info(f"  {src}: {old:.3f} → {w:.3f} ({w - old:+.3f})")
+            self.fusion.set_weight(src, w)
+        self._record_adjustment(new_w, perfs)
+        logger.info("✓ Weights optimized")
+        return new_w
+
     def get_signal_rankings(self) -> List[Dict[str, Any]]:
         """
         Get signals ranked by performance.

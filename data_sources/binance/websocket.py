@@ -83,170 +83,74 @@ class BinanceWebSocketSource:
             await self.websocket.close()
             logger.info("Disconnected from Binance WebSocket")
     
+    async def _stream_loop(self, stream_name, parser, callback_attr):
+        """Generic streaming loop: connect, parse messages, invoke callback."""
+        await self.connect(stream_name)
+        try:
+            while self._is_running and self.websocket:
+                msg = await self.websocket.recv()
+                data = json.loads(msg)
+                parsed = parser(data)
+                if "price" in parsed:
+                    self._last_price = parsed["price"]
+                if "timestamp" in parsed:
+                    self._last_update = parsed["timestamp"]
+                cb = getattr(self, callback_attr, None)
+                if cb:
+                    await cb(parsed)
+        except websockets.exceptions.ConnectionClosed:
+            logger.warning(f"Binance {stream_name} connection closed")
+        except Exception as e:
+            logger.error(f"Error in Binance {stream_name}: {e}")
+        finally:
+            await self.disconnect()
+
+    def _parse_ticker(self, data):
+        """Parse 24hr ticker message."""
+        return {
+            "timestamp": datetime.fromtimestamp(data["E"] / 1000), "symbol": data["s"],
+            "price": Decimal(data["c"]), "open": Decimal(data["o"]),
+            "high": Decimal(data["h"]), "low": Decimal(data["l"]),
+            "volume": Decimal(data["v"]), "quote_volume": Decimal(data["q"]),
+            "price_change": Decimal(data["p"]), "price_change_percent": Decimal(data["P"])}
+
+    def _parse_trade(self, data):
+        """Parse individual trade message."""
+        return {
+            "timestamp": datetime.fromtimestamp(data["T"] / 1000), "trade_id": data["t"],
+            "price": Decimal(data["p"]), "quantity": Decimal(data["q"]),
+            "buyer_is_maker": data["m"], "side": "sell" if data["m"] else "buy"}
+
+    def _parse_orderbook(self, data):
+        """Parse order book depth message."""
+        parse_levels = lambda levels: [{"price": Decimal(l[0]), "quantity": Decimal(l[1])} for l in levels]
+        return {"timestamp": datetime.now(), "last_update_id": data.get("lastUpdateId"),
+                "bids": parse_levels(data.get("bids", [])), "asks": parse_levels(data.get("asks", []))}
+
+    def _parse_kline(self, data):
+        """Parse kline/candlestick message."""
+        k = data["k"]
+        return {"timestamp": datetime.fromtimestamp(k["t"] / 1000),
+                "open": Decimal(k["o"]), "high": Decimal(k["h"]),
+                "low": Decimal(k["l"]), "close": Decimal(k["c"]),
+                "volume": Decimal(k["v"]), "is_closed": k["x"]}
+
     async def stream_ticker(self) -> None:
-        """
-        Stream 24hr ticker updates.
-        
-        Calls on_price_update callback with ticker data.
-        """
-        await self.connect("ticker")
-        
-        try:
-            while self._is_running and self.websocket:
-                message = await self.websocket.recv()
-                data = json.loads(message)
-                
-                # Parse ticker data
-                ticker = {
-                    "timestamp": datetime.fromtimestamp(data["E"] / 1000),
-                    "symbol": data["s"],
-                    "price": Decimal(data["c"]),  # Current price
-                    "open": Decimal(data["o"]),
-                    "high": Decimal(data["h"]),
-                    "low": Decimal(data["l"]),
-                    "volume": Decimal(data["v"]),
-                    "quote_volume": Decimal(data["q"]),
-                    "price_change": Decimal(data["p"]),
-                    "price_change_percent": Decimal(data["P"]),
-                }
-                
-                self._last_price = ticker["price"]
-                self._last_update = ticker["timestamp"]
-                
-                logger.debug(f"Binance BTC: ${ticker['price']:,.2f} ({ticker['price_change_percent']:+.2f}%)")
-                
-                # Call callback if registered
-                if self.on_price_update:
-                    await self.on_price_update(ticker)
-                    
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning("Binance WebSocket connection closed")
-        except Exception as e:
-            logger.error(f"Error in Binance ticker stream: {e}")
-        finally:
-            await self.disconnect()
-    
+        """Stream 24hr ticker updates."""
+        await self._stream_loop("ticker", self._parse_ticker, "on_price_update")
+
     async def stream_trades(self) -> None:
-        """
-        Stream individual trades.
-        
-        Calls on_trade callback with trade data.
-        """
-        await self.connect("trade")
-        
-        try:
-            while self._is_running and self.websocket:
-                message = await self.websocket.recv()
-                data = json.loads(message)
-                
-                # Parse trade data
-                trade = {
-                    "timestamp": datetime.fromtimestamp(data["T"] / 1000),
-                    "trade_id": data["t"],
-                    "price": Decimal(data["p"]),
-                    "quantity": Decimal(data["q"]),
-                    "buyer_is_maker": data["m"],  # True if buyer is maker
-                    "side": "sell" if data["m"] else "buy",
-                }
-                
-                self._last_price = trade["price"]
-                self._last_update = trade["timestamp"]
-                
-                logger.debug(f"Binance trade: {trade['side'].upper()} {trade['quantity']} @ ${trade['price']:,.2f}")
-                
-                # Call callback if registered
-                if self.on_trade:
-                    await self.on_trade(trade)
-                    
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning("Binance WebSocket connection closed")
-        except Exception as e:
-            logger.error(f"Error in Binance trade stream: {e}")
-        finally:
-            await self.disconnect()
-    
+        """Stream individual trades."""
+        await self._stream_loop("trade", self._parse_trade, "on_trade")
+
     async def stream_orderbook(self, depth: str = "5") -> None:
-        """
-        Stream order book depth updates.
-        
-        Args:
-            depth: "5", "10", or "20" levels
-            
-        Calls on_orderbook callback with order book data.
-        """
-        await self.connect(f"depth{depth}")
-        
-        try:
-            while self._is_running and self.websocket:
-                message = await self.websocket.recv()
-                data = json.loads(message)
-                
-                # Parse order book
-                orderbook = {
-                    "timestamp": datetime.now(),
-                    "last_update_id": data.get("lastUpdateId"),
-                    "bids": [
-                        {"price": Decimal(b[0]), "quantity": Decimal(b[1])}
-                        for b in data.get("bids", [])
-                    ],
-                    "asks": [
-                        {"price": Decimal(a[0]), "quantity": Decimal(a[1])}
-                        for a in data.get("asks", [])
-                    ],
-                }
-                
-                if orderbook["bids"]:
-                    best_bid = orderbook["bids"][0]["price"]
-                    best_ask = orderbook["asks"][0]["price"] if orderbook["asks"] else Decimal("0")
-                    
-                    logger.debug(f"Binance order book: Bid ${best_bid:,.2f} / Ask ${best_ask:,.2f}")
-                
-                # Call callback if registered
-                if self.on_orderbook:
-                    await self.on_orderbook(orderbook)
-                    
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning("Binance WebSocket connection closed")
-        except Exception as e:
-            logger.error(f"Error in Binance orderbook stream: {e}")
-        finally:
-            await self.disconnect()
-    
+        """Stream order book depth updates."""
+        await self._stream_loop(f"depth{depth}", self._parse_orderbook, "on_orderbook")
+
     async def stream_klines(self, interval: str = "1m") -> None:
-        """
-        Stream candlestick data.
-        
-        Args:
-            interval: "1m", "5m", "15m", "1h", "4h", "1d", etc.
-        """
-        await self.connect(f"kline_{interval}")
-        
-        try:
-            while self._is_running and self.websocket:
-                message = await self.websocket.recv()
-                data = json.loads(message)
-                
-                k = data["k"]  # Kline data
-                
-                candle = {
-                    "timestamp": datetime.fromtimestamp(k["t"] / 1000),
-                    "open": Decimal(k["o"]),
-                    "high": Decimal(k["h"]),
-                    "low": Decimal(k["l"]),
-                    "close": Decimal(k["c"]),
-                    "volume": Decimal(k["v"]),
-                    "is_closed": k["x"],  # True if candle is closed
-                }
-                
-                logger.debug(f"Binance kline ({interval}): O:{candle['open']} H:{candle['high']} L:{candle['low']} C:{candle['close']}")
-                
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning("Binance WebSocket connection closed")
-        except Exception as e:
-            logger.error(f"Error in Binance kline stream: {e}")
-        finally:
-            await self.disconnect()
-    
+        """Stream candlestick data."""
+        await self._stream_loop(f"kline_{interval}", self._parse_kline, None)
+
     @property
     def last_price(self) -> Optional[Decimal]:
         """Get last received price."""

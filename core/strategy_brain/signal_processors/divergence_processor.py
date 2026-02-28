@@ -88,166 +88,84 @@ class PriceDivergenceProcessor(BaseSignalProcessor):
             f"extreme_fade={extreme_prob_threshold:.0%}/{low_prob_threshold:.0%}"
         )
 
-    def process(
-        self,
-        current_price: Decimal,      # Polymarket UP probability (0.0–1.0)
-        historical_prices: list,
-        metadata: Dict[str, Any] = None,
-    ) -> Optional[TradingSignal]:
-        """
-        Generate signal from spot momentum vs Polymarket probability.
+    def _make_signal(self, direction, strength, confidence, current_price, meta):
+        """Build, record, and return a TradingSignal."""
+        signal = TradingSignal(
+            timestamp=datetime.now(), source=self.name,
+            signal_type=SignalType.PRICE_DIVERGENCE, direction=direction,
+            strength=strength, confidence=confidence,
+            current_price=current_price, metadata=meta)
+        self._record_signal(signal)
+        return signal
 
-        metadata keys used:
-          - spot_price (float): current Coinbase BTC-USD price
-          - momentum (float): pre-computed 5-period ROC of polymarket prices
-        """
-        if not self.is_enabled:
-            return None
-
-        if not metadata:
-            return None
-
-        poly_prob = float(current_price)  # e.g. 0.49 = 49% chance BTC goes Up
-
+    def _update_spot_history(self, metadata):
+        """Update spot price history and compute spot momentum."""
         spot_price = metadata.get('spot_price')
         poly_momentum = float(metadata.get('momentum', 0.0))
-
-        # --- Update spot price history for momentum ---
         if spot_price is not None:
             self._spot_history.append(float(spot_price))
             if len(self._spot_history) > self._max_spot_history:
                 self._spot_history.pop(0)
-
-        # --- Compute spot momentum ---
         spot_momentum = 0.0
         if spot_price is not None and len(self._spot_history) >= 3:
-            # Compare latest spot to 3 readings ago
             oldest = self._spot_history[-min(3, len(self._spot_history))]
             spot_momentum = (float(spot_price) - oldest) / oldest
         elif spot_price is None:
-            # Fall back to polymarket price momentum if no spot available
             spot_momentum = poly_momentum
+        return spot_price, spot_momentum
 
-        logger.info(
-            f"PriceDivergence: poly_prob={poly_prob:.3f}, "
-            f"spot_momentum={spot_momentum:+.4f} ({spot_momentum*100:+.2f}%), "
-            f"spot_price={'${:,.2f}'.format(spot_price) if spot_price else 'N/A'}"
-        )
+    def _check_extreme_fade(self, poly_prob, spot_momentum, current_price):
+        """Check for extreme probability fade signal."""
+        if poly_prob >= self.extreme_prob_threshold and spot_momentum <= 0.001:
+            ext = (poly_prob - self.extreme_prob_threshold) / (1.0 - self.extreme_prob_threshold)
+            conf = min(0.80, self.min_confidence + ext * 0.25)
+            strength = SignalStrength.STRONG if ext > 0.5 else SignalStrength.MODERATE
+            logger.info(f"BEARISH fade: poly Up {poly_prob:.0%} with weak momentum, conf={conf:.2%}")
+            return self._make_signal(SignalDirection.BEARISH, strength, conf, current_price,
+                                     {"signal_type": "extreme_prob_fade_down", "poly_prob": poly_prob,
+                                      "spot_momentum": spot_momentum, "extremeness": ext})
+        if poly_prob <= self.low_prob_threshold and spot_momentum >= -0.001:
+            ext = (self.low_prob_threshold - poly_prob) / self.low_prob_threshold
+            conf = min(0.80, self.min_confidence + ext * 0.25)
+            strength = SignalStrength.STRONG if ext > 0.5 else SignalStrength.MODERATE
+            logger.info(f"BULLISH fade: poly Down {1-poly_prob:.0%} with weak neg momentum, conf={conf:.2%}")
+            return self._make_signal(SignalDirection.BULLISH, strength, conf, current_price,
+                                     {"signal_type": "extreme_prob_fade_up", "poly_prob": poly_prob,
+                                      "spot_momentum": spot_momentum, "extremeness": ext})
+        return None
 
-        # =====================================================================
-        # SIGNAL 1: EXTREME PROBABILITY FADE
-        # If the market has already priced in a strong move, fade it.
-        # =====================================================================
-        if poly_prob >= self.extreme_prob_threshold:
-            # Market >68% confident BTC goes Up — but at interval open this
-            # is extreme and tends to revert. Fade to DOWN unless momentum
-            # strongly confirms the move.
-            if spot_momentum <= 0.001:  # momentum not strongly confirming Up
-                extremeness = (poly_prob - self.extreme_prob_threshold) / (1.0 - self.extreme_prob_threshold)
-                confidence = min(0.80, self.min_confidence + extremeness * 0.25)
-                strength = SignalStrength.STRONG if extremeness > 0.5 else SignalStrength.MODERATE
+    def _check_momentum_mispricing(self, poly_prob, spot_momentum, current_price):
+        """Check for momentum mispricing signal."""
+        if not (0.35 <= poly_prob <= 0.65 and abs(spot_momentum) >= self.momentum_threshold):
+            return None
+        ms = abs(spot_momentum) / self.momentum_threshold
+        conf = min(0.78, 0.55 + min(ms - 1, 2) * 0.08)
+        if conf < self.min_confidence:
+            return None
+        if ms >= 3: strength = SignalStrength.STRONG
+        elif ms >= 2: strength = SignalStrength.MODERATE
+        else: strength = SignalStrength.WEAK
+        direction = SignalDirection.BULLISH if spot_momentum > 0 else SignalDirection.BEARISH
+        logger.info(f"{direction.value} momentum: spot {spot_momentum:+.3%}, poly {poly_prob:.0%}, conf={conf:.2%}")
+        return self._make_signal(direction, strength, conf, current_price,
+                                 {"signal_type": "momentum_mispricing", "poly_prob": poly_prob,
+                                  "spot_momentum": spot_momentum, "momentum_strength": ms})
 
-                signal = TradingSignal(
-                    timestamp=datetime.now(),
-                    source=self.name,
-                    signal_type=SignalType.PRICE_DIVERGENCE,
-                    direction=SignalDirection.BEARISH,
-                    strength=strength,
-                    confidence=confidence,
-                    current_price=current_price,
-                    metadata={
-                        "signal_type": "extreme_prob_fade_down",
-                        "poly_prob": poly_prob,
-                        "spot_momentum": spot_momentum,
-                        "extremeness": extremeness,
-                    }
-                )
-                self._record_signal(signal)
-                logger.info(
-                    f"Generated BEARISH fade signal: poly Up prob too high "
-                    f"({poly_prob:.0%}) with weak momentum → fade DOWN, "
-                    f"confidence={confidence:.2%}"
-                )
-                return signal
+    def process(self, current_price: Decimal, historical_prices: list,
+                metadata: Dict[str, Any] = None) -> Optional[TradingSignal]:
+        """Generate signal from spot momentum vs Polymarket probability."""
+        if not self.is_enabled or not metadata:
+            return None
+        poly_prob = float(current_price)
+        spot_price, spot_momentum = self._update_spot_history(metadata)
+        logger.info(f"PriceDivergence: poly_prob={poly_prob:.3f}, spot_momentum={spot_momentum:+.4f}, "
+                    f"spot={'${:,.2f}'.format(spot_price) if spot_price else 'N/A'}")
 
-        elif poly_prob <= self.low_prob_threshold:
-            # Market >68% confident BTC goes Down — fade to UP unless momentum confirms
-            if spot_momentum >= -0.001:  # not strongly falling
-                extremeness = (self.low_prob_threshold - poly_prob) / self.low_prob_threshold
-                confidence = min(0.80, self.min_confidence + extremeness * 0.25)
-                strength = SignalStrength.STRONG if extremeness > 0.5 else SignalStrength.MODERATE
-
-                signal = TradingSignal(
-                    timestamp=datetime.now(),
-                    source=self.name,
-                    signal_type=SignalType.PRICE_DIVERGENCE,
-                    direction=SignalDirection.BULLISH,
-                    strength=strength,
-                    confidence=confidence,
-                    current_price=current_price,
-                    metadata={
-                        "signal_type": "extreme_prob_fade_up",
-                        "poly_prob": poly_prob,
-                        "spot_momentum": spot_momentum,
-                        "extremeness": extremeness,
-                    }
-                )
-                self._record_signal(signal)
-                logger.info(
-                    f"Generated BULLISH fade signal: poly Down prob too high "
-                    f"({1-poly_prob:.0%}) with weak negative momentum → fade UP, "
-                    f"confidence={confidence:.2%}"
-                )
-                return signal
-
-        # =====================================================================
-        # SIGNAL 2: MOMENTUM MISPRICING
-        # Polymarket probability near 50% but spot has strong directional move.
-        # The market hasn't priced in the momentum yet → trade with momentum.
-        # Only fires when poly_prob is between 35-65% (no strong lean already).
-        # =====================================================================
-        if 0.35 <= poly_prob <= 0.65 and abs(spot_momentum) >= self.momentum_threshold:
-            # Strong spot momentum but Polymarket still near 50/50 → edge
-            momentum_strength = abs(spot_momentum) / self.momentum_threshold  # multiplier
-            confidence = min(0.78, 0.55 + min(momentum_strength - 1, 2) * 0.08)
-            
-            if momentum_strength >= 3:
-                strength = SignalStrength.STRONG
-            elif momentum_strength >= 2:
-                strength = SignalStrength.MODERATE
-            else:
-                strength = SignalStrength.WEAK
-
-            if confidence < self.min_confidence:
-                return None
-
-            direction = SignalDirection.BULLISH if spot_momentum > 0 else SignalDirection.BEARISH
-
-            signal = TradingSignal(
-                timestamp=datetime.now(),
-                source=self.name,
-                signal_type=SignalType.PRICE_DIVERGENCE,
-                direction=direction,
-                strength=strength,
-                confidence=confidence,
-                current_price=current_price,
-                metadata={
-                    "signal_type": "momentum_mispricing",
-                    "poly_prob": poly_prob,
-                    "spot_momentum": spot_momentum,
-                    "momentum_strength": momentum_strength,
-                }
-            )
-            self._record_signal(signal)
-            logger.info(
-                f"Generated {direction.value.upper()} momentum signal: "
-                f"spot moved {spot_momentum:+.3%} but poly still at {poly_prob:.0%}, "
-                f"confidence={confidence:.2%}"
-            )
-            return signal
-
-        logger.debug(
-            f"PriceDivergence: no signal — prob={poly_prob:.2f}, "
-            f"momentum={spot_momentum:+.4f} (below threshold or already priced in)"
-        )
+        sig = self._check_extreme_fade(poly_prob, spot_momentum, current_price)
+        if sig:
+            return sig
+        sig = self._check_momentum_mispricing(poly_prob, spot_momentum, current_price)
+        if sig:
+            return sig
+        logger.debug(f"PriceDivergence: no signal — prob={poly_prob:.2f}, momentum={spot_momentum:+.4f}")
         return None

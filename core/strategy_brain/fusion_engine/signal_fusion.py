@@ -63,109 +63,68 @@ class SignalFusionEngine:
         self.weights[processor_name] = weight
         logger.debug(f"Set weight for {processor_name}: {weight:.2f}")
 
-    def fuse_signals(
-        self,
-        signals: List[TradingSignal],
-        min_signals: int = 1,
-        min_score: float = 50.0,
-    ) -> Optional[FusedSignal]:
-        if not signals:
-            logger.debug("No signals to fuse")
+    def _filter_recent(self, signals, min_signals):
+        """Filter to recent signals. Returns list or None."""
+        now = datetime.now()
+        recent = [s for s in signals if (now - s.timestamp) < timedelta(minutes=5)]
+        if len(recent) < min_signals:
             return None
-        
-        if len(signals) < min_signals:
-            logger.debug(f"Not enough signals: {len(signals)} < {min_signals}")
+        return recent
+
+    def _calculate_contributions(self, signals):
+        """Calculate bullish/bearish weighted contributions."""
+        bull = bear = 0.0
+        for s in signals:
+            w = self.weights.get(s.source, self.weights["default"])
+            sf = (s.strength.value if s.strength else 2) / 4.0
+            c = min(1.0, max(0.0, s.confidence))
+            contrib = w * c * sf
+            d = str(s.direction).upper()
+            if "BULLISH" in d: bull += contrib
+            elif "BEARISH" in d: bear += contrib
+        return bull, bear
+
+    def _build_fused(self, recent, bull, bear, min_score):
+        """Build FusedSignal from contributions. Returns signal or None."""
+        total = bull + bear
+        if total < 0.0001:
             return None
-        
-        current_time = datetime.now()
-        recent_signals = [
-            s for s in signals
-            if (current_time - s.timestamp) < timedelta(minutes=5)
-        ]
-        
-        if len(recent_signals) < min_signals:
-            logger.debug(f"Not enough recent signals: {len(recent_signals)}")
-            return None
-        
-        bullish_contrib = 0.0
-        bearish_contrib = 0.0
-        
-        for signal in recent_signals:
-            weight = self.weights.get(signal.source, self.weights["default"])
-            
-            strength_val = signal.strength.value if signal.strength else 2
-            strength_factor = strength_val / 4.0
-            
-            conf = min(1.0, max(0.0, signal.confidence))
-            
-            contribution = weight * conf * strength_factor
-            
-            logger.debug(
-                f"Signal {signal.source}: dir={signal.direction}, "
-                f"strength={signal.strength.name if signal.strength else 'MISSING'}, "
-                f"conf={conf:.3f}, weight={weight:.2f}, str_factor={strength_factor:.3f}, "
-                f"contrib={contribution:.6f}"
-            )
-            
-            # FIXED: string-based direction check (your direction is likely str, not enum)
-            direction_str = str(signal.direction).upper()
-            if "BULLISH" in direction_str:
-                bullish_contrib += contribution
-                logger.debug(f"  → ADDED to BULLISH → current: {bullish_contrib:.6f}")
-            elif "BEARISH" in direction_str:
-                bearish_contrib += contribution
-                logger.debug(f"  → ADDED to BEARISH → current: {bearish_contrib:.6f}")
-            else:
-                logger.warning(f"Ignored unknown direction: {signal.direction!r}")
-        
-        total_contrib = bullish_contrib + bearish_contrib
-        logger.debug(f"Final: bullish={bullish_contrib:.6f} | bearish={bearish_contrib:.6f} | total={total_contrib:.6f}")
-        
-        if total_contrib < 0.0001:
-            logger.warning(f"Extremely weak total contribution: {total_contrib:.8f} → fusion skipped")
-            return None
-        
-        if bullish_contrib >= bearish_contrib:
-            direction = SignalDirection.BULLISH if "BULLISH" in str(SignalDirection.BULLISH) else "BULLISH"
-            dominant = bullish_contrib
+        if bull >= bear:
+            direction = SignalDirection.BULLISH
+            dominant = bull
         else:
-            direction = SignalDirection.BEARISH if "BEARISH" in str(SignalDirection.BEARISH) else "BEARISH"
-            dominant = bearish_contrib
-        
-        consensus_score = (dominant / total_contrib) * 100 if total_contrib > 0 else 0.0
-        
-        avg_conf = sum(s.confidence for s in recent_signals) / len(recent_signals) if recent_signals else 0.0
-        
-        if consensus_score < min_score:
-            logger.debug(f"Consensus score too low: {consensus_score:.1f} < {min_score}")
+            direction = SignalDirection.BEARISH
+            dominant = bear
+        score = (dominant / total) * 100
+        if score < min_score:
             return None
-        
-        fused = FusedSignal(
-            timestamp=current_time,
-            direction=direction,
-            confidence=avg_conf,
-            score=consensus_score,
-            signals=recent_signals,
-            weights=self.weights.copy(),
-            metadata={
-                "bullish_contrib": round(bullish_contrib, 4),
-                "bearish_contrib": round(bearish_contrib, 4),
-                "total_contrib": round(total_contrib, 4),
-                "num_bullish": sum(1 for s in recent_signals if "BULLISH" in str(s.direction).upper()),
-                "num_bearish": sum(1 for s in recent_signals if "BEARISH" in str(s.direction).upper()),
-            }
-        )
-        
+        avg_conf = sum(s.confidence for s in recent) / len(recent)
+        return FusedSignal(
+            timestamp=datetime.now(), direction=direction, confidence=avg_conf,
+            score=score, signals=recent, weights=self.weights.copy(),
+            metadata={"bullish_contrib": round(bull, 4), "bearish_contrib": round(bear, 4),
+                      "total_contrib": round(total, 4),
+                      "num_bullish": sum(1 for s in recent if "BULLISH" in str(s.direction).upper()),
+                      "num_bearish": sum(1 for s in recent if "BEARISH" in str(s.direction).upper())})
+
+    def fuse_signals(self, signals: List[TradingSignal], min_signals: int = 1,
+                     min_score: float = 50.0) -> Optional[FusedSignal]:
+        """Fuse multiple signals into a single consensus signal."""
+        if not signals:
+            return None
+        recent = self._filter_recent(signals, min_signals)
+        if not recent:
+            return None
+        bull, bear = self._calculate_contributions(recent)
+        fused = self._build_fused(recent, bull, bear, min_score)
+        if not fused:
+            return None
         self._fusions_performed += 1
         self._signal_history.append(fused)
         if len(self._signal_history) > self._max_history:
             self._signal_history.pop(0)
-        
-        logger.info(
-            f"Fused {len(recent_signals)} signals → {direction} "
-            f"(score={consensus_score:.1f}, conf={avg_conf:.1%})"
-        )
-        
+        logger.info(f"Fused {len(recent)} signals → {fused.direction} "
+                    f"(score={fused.score:.1f}, conf={fused.confidence:.1%})")
         return fused
     
     def get_recent_fusions(self, limit: int = 10) -> List[FusedSignal]:

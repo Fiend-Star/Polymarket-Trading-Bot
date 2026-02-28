@@ -47,12 +47,44 @@ except ImportError:
 
 
 # =============================================================================
-# Constants
+# Constants (shared with backtest_v3.py)
 # =============================================================================
 BINANCE_MARK_PRICE_URL = "https://fapi.binance.com/fapi/v1/premiumIndex"
 BINANCE_FUNDING_RATE_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
 UPDATE_INTERVAL_SEC = 300  # Poll every 5 minutes
 CACHE_TTL_SEC = 300
+
+FUNDING_EXTREME_THRESHOLD = 0.0005   # 0.05% per 8h
+FUNDING_HIGH_THRESHOLD    = 0.0002   # 0.02% per 8h
+FUNDING_MAX_BIAS          = 0.02     # Max probability adjustment ±2%
+
+
+# =============================================================================
+# Standalone classifier (SRP: shared by live filter AND backtest)
+# =============================================================================
+
+def classify_funding(rate: float, extreme: float = FUNDING_EXTREME_THRESHOLD,
+                     high: float = FUNDING_HIGH_THRESHOLD,
+                     max_bias: float = FUNDING_MAX_BIAS) -> tuple:
+    """
+    Classify a funding rate into regime + compute mean-reversion bias.
+
+    Returns:
+        (classification: str, mean_reversion_bias: float)
+
+    Used by both FundingRateFilter (live) and backtest_v3 (historical).
+    """
+    if rate > extreme:
+        return "EXTREME_POSITIVE", -max_bias
+    elif rate > high:
+        scale = (rate - high) / (extreme - high)
+        return "HIGH_POSITIVE", -(0.005 + scale * 0.015)
+    elif rate < -extreme:
+        return "EXTREME_NEGATIVE", +max_bias
+    elif rate < -high:
+        scale = (-rate - high) / (extreme - high)
+        return "HIGH_NEGATIVE", (0.005 + scale * 0.015)
+    return "NEUTRAL", 0.0
 
 
 # =============================================================================
@@ -193,20 +225,35 @@ class FundingRateFilter:
         index_price = float(data.get("indexPrice", 0))
         next_funding_time = int(data.get("nextFundingTime", 0))
 
-        funding_pct = funding_rate * 100  # e.g., 0.0001 → 0.01%
+        classification, bias = self._classify(funding_rate)
+        regime = self._build_regime(
+            funding_rate, mark_price, index_price,
+            next_funding_time, classification, bias,
+        )
 
-        # Basis = (mark - index) / index
+        with self._lock:
+            self._regime = regime
+            self._last_fetch = time.time()
+            self._fetch_count += 1
+
+        logger.info(
+            f"Funding rate: {funding_rate:+.6f} ({regime.funding_rate_pct:+.4f}%) → "
+            f"{classification}, bias={bias:+.3f}, basis={regime.basis_bps:+.1f}bps"
+        )
+        return regime
+
+    def _build_regime(self, funding_rate, mark_price, index_price,
+                      next_funding_time, classification, bias):
+        """Build a FundingRegime from parsed data."""
+        funding_pct = funding_rate * 100
         basis_bps = 0.0
         if index_price > 0:
             basis_bps = (mark_price - index_price) / index_price * 10000
 
-        # Classify regime
-        classification, bias = self._classify(funding_rate)
-
-        regime = FundingRegime(
+        return FundingRegime(
             funding_rate=funding_rate,
             funding_rate_pct=funding_pct,
-            predicted_rate=None,  # Could fetch from predicted endpoint
+            predicted_rate=None,
             classification=classification,
             mean_reversion_bias=bias,
             index_price=index_price,
@@ -216,34 +263,11 @@ class FundingRateFilter:
             last_update=time.time(),
         )
 
-        with self._lock:
-            self._regime = regime
-            self._last_fetch = time.time()
-            self._fetch_count += 1
-
-        logger.info(
-            f"Funding rate: {funding_rate:+.6f} ({funding_pct:+.4f}%) → "
-            f"{classification}, bias={bias:+.3f}, basis={basis_bps:+.1f}bps"
-        )
-
-        return regime
 
     def _classify(self, rate: float) -> tuple:
-        """Classify funding rate into regime + compute mean-reversion bias."""
-        if rate > self.extreme_threshold:
-            # Crowded long → expect reversal DOWN
-            return "EXTREME_POSITIVE", -self.max_bias
-        elif rate > self.high_threshold:
-            scale = (rate - self.high_threshold) / (self.extreme_threshold - self.high_threshold)
-            return "HIGH_POSITIVE", -self.max_bias * 0.5 * scale
-        elif rate < -self.extreme_threshold:
-            # Crowded short → expect reversal UP
-            return "EXTREME_NEGATIVE", +self.max_bias
-        elif rate < -self.high_threshold:
-            scale = (abs(rate) - self.high_threshold) / (self.extreme_threshold - self.high_threshold)
-            return "HIGH_NEGATIVE", +self.max_bias * 0.5 * scale
-        else:
-            return "NEUTRAL", 0.0
+        """Delegate to shared classify_funding() with instance thresholds."""
+        return classify_funding(rate, self.extreme_threshold,
+                                self.high_threshold, self.max_bias)
 
     def should_update(self) -> bool:
         """Check if it's time to re-fetch."""

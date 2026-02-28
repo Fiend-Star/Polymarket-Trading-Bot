@@ -1,6 +1,11 @@
 """
 Risk Engine
-Manages position sizing, risk limits, and portfolio constraints
+Manages position sizing, risk limits, and portfolio constraints.
+
+SRP: RiskEngine validates risk limits and tracks positions.
+     RiskAlertEmitter handles alert creation and notification (separate concern).
+
+DIP: Consumers should depend on IRiskEngine protocol (see interfaces.py).
 """
 from decimal import Decimal
 from datetime import datetime
@@ -44,6 +49,35 @@ class PositionRisk:
     metadata: Dict[str, Any]
 
 
+# ── SRP-extracted: Alert Emitter ─────────────────────────────────────────────
+
+class RiskAlertEmitter:
+    """
+    SRP: Sole responsibility is creating, storing, and querying risk alerts.
+    Separated from RiskEngine so risk validation logic is independent of
+    notification/monitoring infrastructure.
+    """
+
+    def __init__(self):
+        self._alerts: List[Dict[str, Any]] = []
+
+    def emit(self, alert_type: str, message: str, risk_level: RiskLevel):
+        """Create and store a risk alert."""
+        self._alerts.append({
+            "timestamp": datetime.now(), "type": alert_type,
+            "message": message, "risk_level": risk_level.value})
+        logger.warning(f"[{risk_level.value.upper()}] {alert_type}: {message}")
+
+    def recent_count(self, seconds: int = 3600) -> int:
+        """Count alerts within the last `seconds`."""
+        now = datetime.now()
+        return sum(1 for a in self._alerts if (now - a["timestamp"]).seconds < seconds)
+
+    @property
+    def all_alerts(self) -> List[Dict[str, Any]]:
+        return list(self._alerts)
+
+
 class RiskEngine:
     """
     Risk management engine.
@@ -55,276 +89,99 @@ class RiskEngine:
     - Loss limits
     """
     
-    def __init__(
-        self,
-        limits: Optional[RiskLimits] = None,
-    ):
-        """
-        Initialize risk engine.
-        
-        Args:
-            limits: Risk limits configuration
-        """
-        # Default conservative limits with $1 max per trade
+    def __init__(self, limits: Optional[RiskLimits] = None,
+                 alert_emitter: Optional[RiskAlertEmitter] = None):
+        """Initialize risk engine with limits and optional alert emitter (DIP)."""
         self.limits = limits or RiskLimits(
-            max_position_size=Decimal("1.0"),  # $1 max per position
-            max_total_exposure=Decimal("10.0"),  # $10 total
-            max_positions=5,
-            max_drawdown_pct=0.15,  # 15% max drawdown
-            max_loss_per_day=Decimal("5.0"),  # $5 daily loss limit
-            max_leverage=1.0,
-        )
-        
-        # Track positions
+            max_position_size=Decimal("1.0"), max_total_exposure=Decimal("10.0"),
+            max_positions=5, max_drawdown_pct=0.15,
+            max_loss_per_day=Decimal("5.0"), max_leverage=1.0)
         self._positions: Dict[str, PositionRisk] = {}
-        
-        # Track daily statistics
         self._daily_pnl = Decimal("0")
         self._daily_trades = 0
-        self._peak_balance = Decimal("1000.0")  # Starting balance
-        self._current_balance = Decimal("1000.0")
-        
-        # Alerts
-        self._alerts: List[Dict[str, Any]] = []
-        
-        logger.info(
-            f"Initialized Risk Engine: "
-            f"max_position=${self.limits.max_position_size}, "
-            f"max_exposure=${self.limits.max_total_exposure}"
-        )
-    
-    def validate_new_position(
-        self,
-        size: Decimal,
-        direction: str,
-        current_price: Decimal,
-    ) -> tuple[bool, Optional[str]]:
-        """
-        Validate if new position is allowed.
-        
-        Args:
-            size: Position size in USD
-            direction: "long" or "short"
-            current_price: Current market price
-            
-        Returns:
-            (is_valid, error_message)
-        """
-        # Check position size limit ($1 max)
+        self._peak_balance = self._current_balance = Decimal("1000.0")
+        self._alerts = alert_emitter or RiskAlertEmitter()
+        logger.info(f"Risk Engine: max_pos=${self.limits.max_position_size}, "
+                    f"max_exp=${self.limits.max_total_exposure}")
+
+    def validate_new_position(self, size: Decimal, direction: str,
+                              current_price: Decimal) -> tuple[bool, Optional[str]]:
+        """Validate if new position is within risk limits. Returns (is_valid, error)."""
         if size > self.limits.max_position_size:
-            return False, f"Position size ${size} exceeds max ${self.limits.max_position_size}"
-        
-        # Check max positions
+            return False, f"Size ${size} exceeds max ${self.limits.max_position_size}"
         if len(self._positions) >= self.limits.max_positions:
             return False, f"Max positions reached ({self.limits.max_positions})"
-        
-        # Check total exposure
-        current_exposure = self.get_total_exposure()
-        new_exposure = current_exposure + size
-        
-        if new_exposure > self.limits.max_total_exposure:
-            return False, (
-                f"Total exposure ${new_exposure} would exceed max ${self.limits.max_total_exposure}"
-            )
-        
-        # Check daily loss limit
+        new_exp = self.get_total_exposure() + size
+        if new_exp > self.limits.max_total_exposure:
+            return False, f"Exposure ${new_exp} exceeds max ${self.limits.max_total_exposure}"
         if self._daily_pnl < -self.limits.max_loss_per_day:
             return False, f"Daily loss limit reached (${abs(self._daily_pnl)})"
-        
-        # Check drawdown
-        drawdown = self.get_current_drawdown()
-        if drawdown > self.limits.max_drawdown_pct:
-            return False, f"Drawdown {drawdown:.1%} exceeds max {self.limits.max_drawdown_pct:.1%}"
-        
+        dd = self.get_current_drawdown()
+        if dd > self.limits.max_drawdown_pct:
+            return False, f"Drawdown {dd:.1%} exceeds max {self.limits.max_drawdown_pct:.1%}"
         return True, None
-    
-    def calculate_position_size(
-        self,
-        signal_confidence: float,
-        signal_score: float,
-        current_price: Decimal,
-        risk_percent: float = 0.02,
-    ) -> Decimal:
-        """
-        Calculate optimal position size with $1 cap.
-        
-        Args:
-            signal_confidence: Signal confidence (0.0-1.0)
-            signal_score: Signal score (0-100)
-            current_price: Current market price
-            risk_percent: Percentage of capital to risk
-            
-        Returns:
-            Position size in USD (capped at $1.00)
-        """
-        # Base position size (% of capital)
-        risk_amount = self._current_balance * Decimal(str(risk_percent))
-        
-        # Scale by signal strength
-        strength_multiplier = Decimal(str(signal_confidence)) * Decimal(str(signal_score / 100))
-        
-        # Calculate position size
-        position_size = risk_amount * strength_multiplier
-        
-        # ENFORCE $1 MAXIMUM
-        if position_size > Decimal("1.0"):
-            logger.info(f"Capping position size from ${float(position_size):.2f} to $1.00")
-            position_size = Decimal("1.0")
-        
-        # Ensure at least $1 (for simulation, in live you might want higher minimum)
-        position_size = max(position_size, Decimal("1.0"))
-        
-        logger.info(
-            f"Calculated position size: ${position_size:.2f} "
-            f"(confidence={signal_confidence:.2%}, score={signal_score:.1f})"
-        )
-        
-        return position_size
-    
-    def add_position(
-        self,
-        position_id: str,
-        size: Decimal,
-        entry_price: Decimal,
-        direction: str,
-        stop_loss: Optional[Decimal] = None,
-        take_profit: Optional[Decimal] = None,
-    ) -> None:
-        """
-        Add a new position to track.
-        
-        Args:
-            position_id: Unique position ID
-            size: Position size in USD
-            entry_price: Entry price
-            direction: "long" or "short"
-            stop_loss: Stop loss price
-            take_profit: Take profit price
-        """
-        position = PositionRisk(
-            position_id=position_id,
-            current_size=size,
-            entry_price=entry_price,
-            current_price=entry_price,
-            unrealized_pnl=Decimal("0"),
-            risk_level=RiskLevel.LOW,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            time_held=0.0,
-            metadata={
-                "direction": direction,
-                "entry_time": datetime.now(),
-            }
-        )
-        
-        self._positions[position_id] = position
+
+    def calculate_position_size(self, signal_confidence: float, signal_score: float,
+                                current_price: Decimal, risk_percent: float = 0.02) -> Decimal:
+        """Calculate position size capped at $1.00."""
+        risk_amt = self._current_balance * Decimal(str(risk_percent))
+        strength = Decimal(str(signal_confidence)) * Decimal(str(signal_score / 100))
+        size = risk_amt * strength
+        size = max(min(size, Decimal("1.0")), Decimal("1.0"))
+        logger.info(f"Position size: ${size:.2f} (conf={signal_confidence:.2%}, score={signal_score:.1f})")
+        return size
+
+    def add_position(self, position_id: str, size: Decimal, entry_price: Decimal,
+                     direction: str, stop_loss: Optional[Decimal] = None,
+                     take_profit: Optional[Decimal] = None) -> None:
+        """Add a new position to track."""
+        self._positions[position_id] = PositionRisk(
+            position_id=position_id, current_size=size,
+            entry_price=entry_price, current_price=entry_price,
+            unrealized_pnl=Decimal("0"), risk_level=RiskLevel.LOW,
+            stop_loss=stop_loss, take_profit=take_profit, time_held=0.0,
+            metadata={"direction": direction, "entry_time": datetime.now()})
         self._daily_trades += 1
-        
         logger.info(f"Added position: {position_id} (${size:.2f} @ ${entry_price:.2f})")
-    
-    def update_position(
-        self,
-        position_id: str,
-        current_price: Decimal,
-    ) -> Optional[PositionRisk]:
-        """
-        Update position with current market price.
-        
-        Args:
-            position_id: Position ID
-            current_price: Current market price
-            
-        Returns:
-            Updated position risk or None
-        """
+
+    def _compute_pnl_pct(self, position, price):
+        """Compute PnL percentage for a position at given price."""
+        d = position.metadata.get("direction", "long")
+        if d == "long":
+            return (price - position.entry_price) / position.entry_price
+        return (position.entry_price - price) / position.entry_price
+
+    def update_position(self, position_id: str, current_price: Decimal) -> Optional[PositionRisk]:
+        """Update position with current price. Returns updated position or None."""
         if position_id not in self._positions:
             return None
-        
-        position = self._positions[position_id]
-        position.current_price = current_price
-        
-        # Calculate P&L
-        direction = position.metadata.get("direction", "long")
-        
-        if direction == "long":
-            pnl_pct = (current_price - position.entry_price) / position.entry_price
-        else:  # short
-            pnl_pct = (position.entry_price - current_price) / position.entry_price
-        
-        position.unrealized_pnl = position.current_size * pnl_pct
-        
-        # Update time held
-        entry_time = position.metadata.get("entry_time", datetime.now())
-        position.time_held = (datetime.now() - entry_time).total_seconds()
-        
-        # Assess risk level
-        position.risk_level = self._assess_risk_level(position)
-        
-        # Check if stop loss or take profit hit
-        if position.stop_loss and self._check_stop_loss(position, current_price):
-            self._create_alert(
-                "STOP_LOSS",
-                f"Stop loss hit for {position_id}",
-                RiskLevel.HIGH
-            )
-        
-        if position.take_profit and self._check_take_profit(position, current_price):
-            self._create_alert(
-                "TAKE_PROFIT",
-                f"Take profit hit for {position_id}",
-                RiskLevel.LOW
-            )
-        
-        return position
-    
-    def remove_position(
-        self,
-        position_id: str,
-        exit_price: Decimal,
-    ) -> Optional[Decimal]:
-        """
-        Remove position and record P&L.
-        
-        Args:
-            position_id: Position ID
-            exit_price: Exit price
-            
-        Returns:
-            Realized P&L or None
-        """
+        pos = self._positions[position_id]
+        pos.current_price = current_price
+        pos.unrealized_pnl = pos.current_size * self._compute_pnl_pct(pos, current_price)
+        entry_time = pos.metadata.get("entry_time", datetime.now())
+        pos.time_held = (datetime.now() - entry_time).total_seconds()
+        pos.risk_level = self._assess_risk_level(pos)
+        if pos.stop_loss and self._check_stop_loss(pos, current_price):
+            self._create_alert("STOP_LOSS", f"Stop loss hit: {position_id}", RiskLevel.HIGH)
+        if pos.take_profit and self._check_take_profit(pos, current_price):
+            self._create_alert("TAKE_PROFIT", f"Take profit hit: {position_id}", RiskLevel.LOW)
+        return pos
+
+    def remove_position(self, position_id: str, exit_price: Decimal) -> Optional[Decimal]:
+        """Remove position, record P&L. Returns realized P&L or None."""
         if position_id not in self._positions:
             return None
-        
-        position = self._positions[position_id]
-        
-        # Calculate final P&L
-        direction = position.metadata.get("direction", "long")
-        
-        if direction == "long":
-            pnl_pct = (exit_price - position.entry_price) / position.entry_price
-        else:
-            pnl_pct = (position.entry_price - exit_price) / position.entry_price
-        
-        realized_pnl = position.current_size * pnl_pct
-        
-        # Update balance and daily P&L
-        self._current_balance += realized_pnl
-        self._daily_pnl += realized_pnl
-        
-        # Update peak balance
+        pos = self._positions[position_id]
+        pnl_pct = self._compute_pnl_pct(pos, exit_price)
+        realized = pos.current_size * pnl_pct
+        self._current_balance += realized
+        self._daily_pnl += realized
         if self._current_balance > self._peak_balance:
             self._peak_balance = self._current_balance
-        
-        # Remove position
         del self._positions[position_id]
-        
-        logger.info(
-            f"Closed position: {position_id} "
-            f"P&L: ${realized_pnl:+.2f} ({pnl_pct:+.2%})"
-        )
-        
-        return realized_pnl
-    
+        logger.info(f"Closed: {position_id} P&L=${realized:+.2f} ({pnl_pct:+.2%})")
+        return realized
+
     def _assess_risk_level(self, position: PositionRisk) -> RiskLevel:
         """Assess risk level of a position."""
         pnl_pct = position.unrealized_pnl / position.current_size if position.current_size > 0 else 0
@@ -363,18 +220,9 @@ class RiskEngine:
             return current_price <= position.take_profit
     
     def _create_alert(self, alert_type: str, message: str, risk_level: RiskLevel) -> None:
-        """Create a risk alert."""
-        alert = {
-            "timestamp": datetime.now(),
-            "type": alert_type,
-            "message": message,
-            "risk_level": risk_level.value,
-        }
-        
-        self._alerts.append(alert)
-        
-        logger.warning(f"[{risk_level.value.upper()}] {alert_type}: {message}")
-    
+        """Delegate alert creation to RiskAlertEmitter (SRP)."""
+        self._alerts.emit(alert_type, message, risk_level)
+
     def get_total_exposure(self) -> Decimal:
         """Get total current exposure across all positions."""
         return sum(pos.current_size for pos in self._positions.values())
@@ -419,7 +267,7 @@ class RiskEngine:
                 "trades": self._daily_trades,
                 "pnl": float(self._daily_pnl),
             },
-            "alerts": len([a for a in self._alerts if (datetime.now() - a["timestamp"]).seconds < 3600]),
+            "alerts": self._alerts.recent_count(3600),
         }
     
     def reset_daily_stats(self) -> None:
