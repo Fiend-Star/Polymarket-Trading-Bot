@@ -35,12 +35,10 @@ USAGE IN BOT:
 
 import asyncio
 import json
-import math
-import time
 import threading
+import time
 from collections import deque
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from typing import Optional, Callable, Deque, Dict
 
 from loguru import logger

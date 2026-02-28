@@ -4,10 +4,8 @@ Enhanced patch for Polymarket gamma_markets.py and provider.py
 - Forces load_all_async to use Gamma API with time filters
 """
 
-import os
-from typing import Any, Dict, List, Tuple, Union
 import logging
-import asyncio
+from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
 

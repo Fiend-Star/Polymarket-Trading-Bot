@@ -1,10 +1,9 @@
 # import_dashboard_fixed.py
-import requests
 import json
-from pathlib import Path
 import sys
 from pathlib import Path
- 
+
+import requests
 
 # Add project to path
 project_root = Path(__file__).parent

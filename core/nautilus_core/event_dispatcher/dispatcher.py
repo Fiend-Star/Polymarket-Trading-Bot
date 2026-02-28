@@ -2,10 +2,11 @@
 Event Dispatcher
 Routes market events to appropriate strategies and components
 """
-from typing import Dict, List, Callable, Any
-from enum import Enum
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
+from typing import Dict, List, Callable, Any
+
 from loguru import logger
 
 

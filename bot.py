@@ -135,6 +135,9 @@ USE_FUNDING_FILTER = os.getenv("USE_FUNDING_FILTER", "true").lower() == "true"
 LATE_WINDOW_ENABLED = os.getenv("LATE_WINDOW_ENABLED", "true").lower() == "true"
 SHADOW_MODE_ONLY = os.getenv("SHADOW_MODE_ONLY", "false").lower() == "true"
 
+# V3: Gamma Scalping Config
+GAMMA_EXIT_PROFIT_PCT = float(os.getenv("GAMMA_EXIT_PROFIT_PCT", "0.04"))  # 4% profit threshold for late exit
+GAMMA_EXIT_TIME_MINS = float(os.getenv("GAMMA_EXIT_TIME_MINS", "3.0"))     # Active threshold in final 3 minutes
 
 # =============================================================================
 # Data classes
@@ -1181,6 +1184,7 @@ class IntegratedBTCStrategy(Strategy):
             # =========================================================
             try:
                 await self._refresh_cached_data()
+                await self._manage_open_positions()
 
                 # V3.3: Record strike if not yet set.
                 # Priority: boundary snapshot > Chainlink deque > current Chainlink
@@ -1289,7 +1293,10 @@ class IntegratedBTCStrategy(Strategy):
                 self.price_history.pop(0)
 
             self._last_bid_ask = (bid_decimal, ask_decimal)
-            self._tick_buffer.append({'ts': now, 'price': mid_price})
+
+            # Append both a normalized 'price' (spot if available, else mid) and explicit 'spot_price'
+            spot_for_tick = float(self._cached_spot_price) if self._cached_spot_price is not None else float(mid_price)
+            self._tick_buffer.append({'ts': now, 'price': spot_for_tick, 'spot_price': self._cached_spot_price})
 
             # Stability gate
             if not self._market_stable:
@@ -1617,7 +1624,23 @@ class IntegratedBTCStrategy(Strategy):
             return
 
         # Step 12: Execute
-        logger.info(f"Position size: ${POSITION_SIZE_USD} | Direction: {direction.upper()}")
+        # Determine position size via Risk Engine (use detector's kelly fraction)
+        try:
+            # signal.score may not exist; use confidence*100 as fallback score
+            signal_score = getattr(signal, 'score', signal.confidence * 100)
+            position_size_decimal = self.risk_engine.calculate_position_size(
+                signal_confidence=signal.confidence,
+                signal_score=signal_score,
+                current_price=Decimal(str(current_price)),
+                time_remaining_mins=time_remaining_min,
+                kelly_fraction=getattr(signal, 'kelly_fraction', 0.0),
+            )
+            position_size_usd = float(position_size_decimal)
+        except Exception:
+            # Fallback to configured static size
+            position_size_usd = float(POSITION_SIZE_USD)
+
+        logger.info(f"Position size: ${position_size_usd:.2f} | Direction: {direction.upper()}")
 
         mock_signal = SimpleNamespace(
             direction="BULLISH" if direction == "long" else "BEARISH",
@@ -1632,13 +1655,13 @@ class IntegratedBTCStrategy(Strategy):
 
         if is_simulation or SHADOW_MODE_ONLY:
             if SHADOW_MODE_ONLY and not is_simulation:
-                logger.warning(f"👻 [SHADOW MODE] Paper trading {direction.upper()} | Size: ${POSITION_SIZE_USD}")
-            await self._record_paper_trade(mock_signal, POSITION_SIZE_USD, current_price, direction)
+                logger.warning(f"👻 [SHADOW MODE] Paper trading {direction.upper()} | Size: ${position_size_usd}")
+            await self._record_paper_trade(mock_signal, position_size_usd, current_price, direction)
         else:
             if USE_LIMIT_ORDERS:
-                await self._place_limit_order(mock_signal, POSITION_SIZE_USD, current_price, direction)
+                await self._place_limit_order(mock_signal, position_size_usd, current_price, direction)
             else:
-                await self._place_real_order(mock_signal, POSITION_SIZE_USD, current_price, direction)
+                await self._place_real_order(mock_signal, position_size_usd, current_price, direction)
 
         # Track entry for exit monitoring
         self._active_entry = {
@@ -1915,9 +1938,30 @@ class IntegratedBTCStrategy(Strategy):
             # V3 FIX: Place at best bid to GUARANTEE maker.
             # At the bid, our order rests in the book = maker (0% fee).
             # V2 placed at mid-spread, which crossed to the ask = taker (10%).
-            limit_price = token_bid
+            # --- DYNAMIC EXECUTION ROUTING (Choice A) ---
+            edge = getattr(signal, 'edge', 0.0)
+            if edge == 0.0 and hasattr(signal, 'confidence'):
+                # Principled heuristic calculation:
+                # Maps confidence (0.50 to 1.0) linearly to an assumed edge (0% to 25%)
+                # Rationale: A purely heuristic signal lacks a priced edge. We assume a
+                # 100% confidence signal implies a maximum expected VRP/edge of ~25% in 15m markets.
+                edge = max(0.0, float(signal.confidence - 0.50) * 0.50)
 
-            # Clamp
+            if edge > 0.10:
+                # CRITICAL EDGE: Cross the spread. Eat the taker fee to guarantee fill.
+                limit_price = token_ask
+                logger.info(f"⚡ CRITICAL EDGE ({edge:.1%}): Crossing spread to guarantee fill.")
+            elif edge > 0.04 or signal.confidence > 0.70:
+                # STRONG EDGE: Penny the bid to jump the queue (Maker status likely)
+                limit_price = token_bid + Decimal("0.001")
+                limit_price = min(limit_price, token_ask - Decimal("0.001")) # Don't cross ask
+                logger.info(f"🎯 STRONG EDGE ({edge:.1%}): Pennying the bid (+0.001) to jump queue.")
+            else:
+                # STANDARD EDGE: Rest passively at the bid (Pure Maker)
+                limit_price = token_bid
+                logger.info(f"🛡️ STANDARD EDGE ({edge:.1%}): Resting passively at best bid.")
+
+            # Clamp bounds
             limit_price = max(Decimal("0.01"), min(Decimal("0.99"), limit_price))
 
             # Calculate token quantity from position size
@@ -2187,6 +2231,60 @@ class IntegratedBTCStrategy(Strategy):
 
             await asyncio.sleep(60)  # F&G only updates daily, 60s is plenty
 
+    async def _manage_open_positions(self):
+        """
+        Continuously monitor positions and execute Gamma Scalp exits.
+        """
+        now_ts = datetime.now(timezone.utc).timestamp()
+
+        for pos in self._open_positions:
+            if pos.resolved:
+                continue
+
+            try:
+                instrument = self.cache.instrument(pos.instrument_id)
+                if not instrument:
+                    continue
+
+                quote = self.cache.quote_tick(pos.instrument_id)
+                if not quote:
+                    continue
+                # If long, sell at the BID to exit immediately
+                current_exit_price = float(quote.bid_price.as_decimal())
+            except Exception:
+                continue
+
+            # Calculate Unrealized PnL
+            pnl_pct = (current_exit_price - pos.entry_price) / pos.entry_price
+
+            end_ts = pos.market_end_time.timestamp()
+            mins_remaining = max(0.0, (end_ts - now_ts) / 60.0)
+
+            # GAMMA SCALP LOGIC using defined constants
+            if pnl_pct >= TAKE_PROFIT_PCT or (
+                    mins_remaining < GAMMA_EXIT_TIME_MINS and pnl_pct > GAMMA_EXIT_PROFIT_PCT):
+                logger.info(
+                    f"💰 GAMMA SCALP EXIT: {pos.market_slug} | "
+                    f"PnL: +{pnl_pct:.1%} | T-Minus: {mins_remaining:.1f}m"
+                )
+
+                # Fetch dynamic precision from the instrument
+                precision = instrument.size_precision
+
+                # Create an IOC Market order to close
+                qty = Quantity(float(pos.size_usd / pos.entry_price), precision=precision)
+                order = self.order_factory.market(
+                    instrument_id=pos.instrument_id,
+                    order_side=OrderSide.SELL,
+                    quantity=qty,
+                    client_order_id=ClientOrderId(f"EXIT-{pos.order_id}"),
+                    time_in_force=TimeInForce.IOC,
+                )
+                self.submit_order(order)
+                pos.resolved = True
+                pos.exit_price = current_exit_price
+                pos.pnl = pos.size_usd * pnl_pct
+
     def on_stop(self):
         logger.info("Integrated BTC strategy V3.1 stopped")
         logger.info(f"Total paper trades: {len(self.paper_trades)}")
@@ -2365,3 +2463,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

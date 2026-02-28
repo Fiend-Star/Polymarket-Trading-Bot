@@ -4,8 +4,9 @@ Handles WebSocket connections with auto-reconnection and error handling
 """
 import asyncio
 from datetime import datetime, timedelta
-from typing import Optional, Callable, Any
 from enum import Enum
+from typing import Optional, Callable
+
 from loguru import logger
 
 

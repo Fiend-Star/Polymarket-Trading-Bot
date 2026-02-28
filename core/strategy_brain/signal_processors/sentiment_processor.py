@@ -2,13 +2,14 @@
 Sentiment Signal Processor
 Generates signals based on market sentiment (Fear & Greed Index)
 """
-from decimal import Decimal
-from datetime import datetime
-from typing import Optional, Dict, Any
-from loguru import logger
-
 import os
 import sys
+from datetime import datetime
+from decimal import Decimal
+from typing import Optional, Dict, Any
+
+from loguru import logger
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 

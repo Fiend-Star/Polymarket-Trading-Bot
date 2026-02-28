@@ -1,14 +1,13 @@
 import asyncio
-from datetime import datetime
-import typer
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
-from rich.live import Live
-from loguru import logger
 import os
 # Import data sources
 import sys
+
+import typer
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from data_sources.coinbase.adapter import CoinbaseDataSource

@@ -13,12 +13,14 @@ FIX: Original threshold was 15% deviation, designed for dollar prices.
        - Also detect VELOCITY (fast moves in the last 3 ticks)
        - Mean reversion logic is still correct: spike up → BEARISH, spike down → BULLISH
 """
-from decimal import Decimal
-from datetime import datetime
-from typing import Optional, Dict, Any
-from loguru import logger
 import os
 import sys
+from datetime import datetime
+from decimal import Decimal
+from typing import Optional, Dict, Any
+
+from loguru import logger
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 

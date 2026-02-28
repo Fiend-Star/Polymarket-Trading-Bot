@@ -4,7 +4,6 @@ View and analyze simulation trades
 """
 import json
 from datetime import datetime
-from pathlib import Path
 
 
 def load_paper_trades():

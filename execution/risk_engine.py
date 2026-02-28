@@ -2,11 +2,12 @@
 Risk Engine
 Manages position sizing, risk limits, and portfolio constraints
 """
-from decimal import Decimal
-from datetime import datetime
-from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
 from enum import Enum
+from typing import Optional, Dict, Any, List
+
 from loguru import logger
 
 
@@ -137,50 +138,84 @@ class RiskEngine:
             return False, f"Drawdown {drawdown:.1%} exceeds max {self.limits.max_drawdown_pct:.1%}"
         
         return True, None
-    
+
     def calculate_position_size(
-        self,
-        signal_confidence: float,
-        signal_score: float,
-        current_price: Decimal,
-        risk_percent: float = 0.02,
+            self,
+            signal_confidence: float,
+            signal_score: float,
+            current_price: Decimal,
+            time_remaining_mins: float = 15.0,
+            risk_percent: float = 0.05,  # Max 5% of current balance per trade
+            kelly_fraction: float = 0.5,  # Half-Kelly for safety
     ) -> Decimal:
         """
-        Calculate optimal position size with $1 cap.
-        
-        Args:
-            signal_confidence: Signal confidence (0.0-1.0)
-            signal_score: Signal score (0-100)
-            current_price: Current market price
-            risk_percent: Percentage of capital to risk
-            
-        Returns:
-            Position size in USD (capped at $1.00)
+        Calculate optimal position size using Time-Adjusted Fractional Kelly.
+        Incorporates signal_score to modulate confidence quality.
         """
-        # Base position size (% of capital)
-        risk_amount = self._current_balance * Decimal(str(risk_percent))
-        
-        # Scale by signal strength
-        strength_multiplier = Decimal(str(signal_confidence)) * Decimal(str(signal_score / 100))
-        
-        # Calculate position size
-        position_size = risk_amount * strength_multiplier
-        
-        # ENFORCE $1 MAXIMUM
-        if position_size > Decimal("1.0"):
-            logger.info(f"Capping position size from ${float(position_size):.2f} to $1.00")
-            position_size = Decimal("1.0")
-        
-        # Ensure at least $1 (for simulation, in live you might want higher minimum)
+        # Base max risk amount based on current balance
+        base_risk_amount = self._current_balance * Decimal(str(risk_percent))
+
+        # Combine confidence, score, and Kelly fraction
+        # signal_score (0-100) acts as a quality multiplier (normalized to 0-1)
+        score_multiplier = Decimal(str(signal_score / 100.0))
+        strength_multiplier = Decimal(str(signal_confidence)) * score_multiplier * Decimal(str(kelly_fraction))
+
+        # GAMMA PENALTY: Reduce size aggressively in the final 5 minutes
+        time_factor = Decimal("1.0")
+        if time_remaining_mins < 5.0:
+            time_factor = Decimal(str(max(0.1, time_remaining_mins / 5.0)))
+
+        # Calculate theoretical size
+        position_size = base_risk_amount * strength_multiplier * time_factor
+
+        # STRUCTURAL CAPS:
+        if position_size > self.limits.max_position_size:
+            position_size = self.limits.max_position_size
+
+        current_exposure = self.get_total_exposure()
+        if current_exposure + position_size > self.limits.max_total_exposure:
+            position_size = max(Decimal("0"), self.limits.max_total_exposure - current_exposure)
+
+        # Ensure at least exchange minimum
         position_size = max(position_size, Decimal("1.0"))
-        
+
         logger.info(
-            f"Calculated position size: ${position_size:.2f} "
-            f"(confidence={signal_confidence:.2%}, score={signal_score:.1f})"
+            f"Calculated Kelly position size: ${position_size:.2f} "
+            f"(conf={signal_confidence:.0%}, score={signal_score:.1f}, time_factor={time_factor:.2f})"
         )
-        
+
         return position_size
     
+    def calculate_arbitrage_size(self, risk_percent: float = 0.05) -> Decimal:
+        """
+        Bypasses Kelly and Gamma decay for near-deterministic late-window snipes.
+        Maxes out the allowable risk budget while enforcing structural limits.
+
+        Args:
+            risk_percent: fraction of current balance to risk in an arbitrage (default 5%)
+        Returns:
+            position size in USD as Decimal (at least exchange minimum of $1.0)
+        """
+        try:
+            position_size = self._current_balance * Decimal(str(risk_percent))
+        except Exception:
+            # Safety fallback
+            position_size = Decimal("1.0")
+
+        # Enforce per-position cap
+        if position_size > self.limits.max_position_size:
+            position_size = self.limits.max_position_size
+
+        # Enforce total exposure cap
+        current_exposure = self.get_total_exposure()
+        if current_exposure + position_size > self.limits.max_total_exposure:
+            # allocate the remaining exposure
+            remaining = self.limits.max_total_exposure - current_exposure
+            position_size = max(Decimal("0"), remaining)
+
+        # Ensure at least the exchange minimum of $1
+        return max(position_size, Decimal("1.0"))
+
     def add_position(
         self,
         position_id: str,

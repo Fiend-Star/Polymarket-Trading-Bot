@@ -3,14 +3,15 @@
 Main strategy that coordinates signal processing and trading decisions
 """
 import asyncio
-from decimal import Decimal
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
-from collections import deque
-from loguru import logger
 import os
-
 import sys
+from collections import deque
+from datetime import datetime, timedelta
+from decimal import Decimal
+from typing import Optional, List, Dict, Any
+
+from loguru import logger
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 

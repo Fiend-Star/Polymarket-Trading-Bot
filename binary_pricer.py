@@ -28,10 +28,10 @@ Maps Polymarket YES/NO tokens to cash-or-nothing binary options:
 """
 
 import math
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
+
 from loguru import logger
 
 
@@ -516,10 +516,9 @@ class BinaryOptionPricer:
             return 0.0
 
         T = max(time_remaining_min / self.MINUTES_PER_YEAR, 1e-12)
-        # V3.2: Cap at 200% (was 500%). IV hitting the upper bound is a
-        # numerical failure, not a real vol estimate. 200% is still extremely
-        # generous for 15-min BTC options.
-        vol_low, vol_high = 0.01, 2.0
+        # INCREASE BOUNDS: 15-minute intraday vol can easily exceed 1000% annualized
+        # during liquidation wicks. Capping at 2.0 (200%) causes false failures.
+        vol_low, vol_high = 0.01, 15.0  # Raised from 2.0 to 15.0 (1500% vol)
         sqrt_T = math.sqrt(T)
 
         def _bsm_price(vol: float) -> float:

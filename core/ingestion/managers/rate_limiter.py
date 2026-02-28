@@ -3,9 +3,10 @@ Rate Limiter
 Prevents exceeding API rate limits
 """
 import asyncio
+from collections import deque
 from datetime import datetime, timedelta
 from typing import Dict, Optional
-from collections import deque
+
 from loguru import logger
 
 

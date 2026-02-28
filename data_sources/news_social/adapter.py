@@ -3,8 +3,9 @@ News and Social Media Data Source
 Aggregates sentiment and news related to BTC
 """
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, List, Dict, Any
+
 import httpx
 from loguru import logger
 

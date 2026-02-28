@@ -3,28 +3,22 @@ Grafana Metrics Exporter
 Exports trading metrics in Prometheus format for Grafana
 """
 import asyncio
-from datetime import datetime
-from decimal import Decimal
-from typing import Dict, Any, Optional
+import os
+import sys
+import threading
+import urllib.parse
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+from loguru import logger
 from prometheus_client import (
     Counter,
     Gauge,
     Histogram,
-    Summary,
-    start_http_server,
     REGISTRY,
     generate_latest,
     CONTENT_TYPE_LATEST,
-    CollectorRegistry,
-    multiprocess,
 )
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
-import urllib.parse
-from loguru import logger
 
-import os
-import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from monitoring.performance_tracker import get_performance_tracker

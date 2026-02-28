@@ -2,13 +2,14 @@
 Signal Fusion Engine
 Combines multiple signals with weighted voting
 """
-from typing import List, Dict, Optional, Any
-from datetime import datetime, timedelta
+import os
+import sys
 from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Any
+
 from loguru import logger
 
-import os 
-import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from core.strategy_brain.signal_processors.base_processor import (
@@ -88,12 +89,25 @@ class SignalFusionEngine:
             logger.debug(f"Not enough recent signals: {len(recent_signals)}")
             return None
         
+        # --- DYNAMIC REGIME WEIGHTING ---
+        current_weights = self.weights.copy()
+        # Find if we have an extreme velocity signal
+        velocity_signal = next((s for s in recent_signals if s.source == "TickVelocity"), None)
+        if velocity_signal and velocity_signal.strength in [SignalStrength.STRONG, SignalStrength.VERY_STRONG]:
+            # MARKET REGIME: High Volatility / Breakout
+            # The order book is likely ghost-liquidity. Slash its weight, boost velocity.
+            logger.info("🌪️ HIGH VELOCITY REGIME: Dynamically shifting weights.")
+            current_weights["OrderBookImbalance"] *= 0.25  # Slash by 75%
+            current_weights["TickVelocity"] *= 1.50        # Boost by 50%
+            current_weights["PriceDivergence"] *= 1.25     # Boost by 25%
+
         bullish_contrib = 0.0
         bearish_contrib = 0.0
         
         for signal in recent_signals:
-            weight = self.weights.get(signal.source, self.weights["default"])
-            
+            # Use the dynamically adjusted weights, not self.weights
+            weight = current_weights.get(signal.source, current_weights["default"])
+
             strength_val = signal.strength.value if signal.strength else 2
             strength_factor = strength_val / 4.0
             
@@ -127,10 +141,10 @@ class SignalFusionEngine:
             return None
         
         if bullish_contrib >= bearish_contrib:
-            direction = SignalDirection.BULLISH if "BULLISH" in str(SignalDirection.BULLISH) else "BULLISH"
+            direction = SignalDirection.BULLISH
             dominant = bullish_contrib
         else:
-            direction = SignalDirection.BEARISH if "BEARISH" in str(SignalDirection.BEARISH) else "BEARISH"
+            direction = SignalDirection.BEARISH
             dominant = bearish_contrib
         
         consensus_score = (dominant / total_contrib) * 100 if total_contrib > 0 else 0.0

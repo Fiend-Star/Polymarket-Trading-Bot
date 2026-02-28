@@ -61,7 +61,6 @@ from vol_estimator import VolEstimator
 from mispricing_detector import (
     MispricingDetector,
     polymarket_taker_fee,
-    kelly_fraction,
 )
 
 # ── V3.1: Funding rate filter (optional — uses Binance historical) ──────────

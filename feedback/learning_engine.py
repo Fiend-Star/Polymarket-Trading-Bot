@@ -2,15 +2,15 @@
 Learning Engine
 Learns from trading performance to optimize strategy weights
 """
-import asyncio
-from decimal import Decimal
-from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
-from dataclasses import dataclass
-from loguru import logger
-
 import os
 import sys
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from decimal import Decimal
+from typing import Dict, Any, List
+
+from loguru import logger
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from monitoring.performance_tracker import get_performance_tracker, Trade

@@ -6,8 +6,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional, Dict, Any
 from enum import Enum
+from typing import Optional, Dict, Any
 
 
 class SignalType(Enum):

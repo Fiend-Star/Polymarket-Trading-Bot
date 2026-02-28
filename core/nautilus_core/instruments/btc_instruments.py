@@ -2,11 +2,12 @@
 BTC Instrument Definitions for NautilusTrader
 """
 from decimal import Decimal
+
+from loguru import logger
+from nautilus_trader.model.currencies import USDC, BTC
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import CryptoPerpetual
-from nautilus_trader.model.objects import Price, Quantity, Money
-from nautilus_trader.model.currencies import USDC, BTC
-from loguru import logger
+from nautilus_trader.model.objects import Price, Quantity
 
 
 def create_btc_polymarket_instrument() -> CryptoPerpetual:

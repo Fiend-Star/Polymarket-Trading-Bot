@@ -1,12 +1,12 @@
-import os
 import asyncio
 import math
+import os
+from datetime import datetime, timezone
 from decimal import Decimal
-from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
-from loguru import logger
-from dotenv import load_dotenv
 
+from dotenv import load_dotenv
+from loguru import logger
 from nautilus_trader.adapters.polymarket import POLYMARKET
 from nautilus_trader.adapters.polymarket import (
     PolymarketDataClientConfig,
@@ -25,9 +25,9 @@ from nautilus_trader.config import (
     TradingNodeConfig,
 )
 from nautilus_trader.live.node import TradingNode
-from nautilus_trader.model.enums import OrderSide, OrderType, TimeInForce
-from nautilus_trader.model.objects import Quantity, Price
+from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId
+from nautilus_trader.model.objects import Quantity, Price
 from nautilus_trader.trading.strategy import Strategy
 
 load_dotenv()

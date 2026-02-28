@@ -2,12 +2,12 @@
 Performance Tracker
 Tracks and analyzes trading performance metrics
 """
-import asyncio
-from decimal import Decimal
-from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
-from dataclasses import dataclass, field
 from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from decimal import Decimal
+from typing import Dict, Any, List, Optional
+
 from loguru import logger
 
 

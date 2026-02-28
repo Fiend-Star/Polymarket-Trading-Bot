@@ -11,18 +11,16 @@ Tests:
 Run this after Phase 3 tests pass.
 """
 import asyncio
-from decimal import Decimal
+import os
+import sys
 from datetime import datetime
+from decimal import Decimal
+
 import typer
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
-from loguru import logger
+from rich.table import Table
 
-
-import os
-
-import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from core.strategy_brain.signal_processors.spike_detector import SpikeDetectionProcessor

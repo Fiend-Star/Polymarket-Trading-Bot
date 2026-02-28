@@ -39,7 +39,6 @@ INTEGRATION:
 """
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
-from collections import deque
 from typing import Optional, Dict, Any, List
 from loguru import logger
 
@@ -127,9 +126,14 @@ class TickVelocityProcessor(BaseSignalProcessor):
             return None
 
         now = datetime.now(timezone.utc)
-        curr = float(current_price)
+        # 1. EXTRACT BTC SPOT (Not the option price)
+        btc_spot_now = metadata.get("spot_price")
+        if not btc_spot_now:
+            logger.debug("TickVelocity: No spot price in metadata.")
+            return None
 
-        # Get historical prices from the buffer
+        # 2. Get historical spot prices from the buffer 
+        # (Ensure bot.py is appending spot_price to the tick_buffer dicts!)
         price_60s = self._get_price_at(tick_buffer, 60, now)
         price_30s = self._get_price_at(tick_buffer, 30, now)
 
@@ -137,22 +141,21 @@ class TickVelocityProcessor(BaseSignalProcessor):
             logger.debug("TickVelocity: no historical ticks in 60s window")
             return None
 
-        # Compute velocities
-        vel_60s = ((curr - price_60s) / price_60s) if price_60s else None
-        vel_30s = ((curr - price_30s) / price_30s) if price_30s else None
+        # 3. Compute velocities based on the UNDERLYING ASSET, not the lagging option
+        vel_60s = ((btc_spot_now - price_60s) / price_60s) if price_60s else None
+        vel_30s = ((btc_spot_now - price_30s) / price_30s) if price_30s else None
 
         # Compute acceleration (is the move speeding up?)
         acceleration = 0.0
         if vel_60s is not None and vel_30s is not None:
-            # First half velocity = 60s vel - 30s vel (approximation)
             vel_first_30s = vel_60s - vel_30s
             acceleration = vel_30s - vel_first_30s  # positive = accelerating
 
+        # Logging for velocity and acceleration
+        vel_60s_str = f"{vel_60s*100:+.3f}%" if vel_60s is not None else "N/A"
+        vel_30s_str = f"{vel_30s*100:+.3f}%" if vel_30s is not None else "N/A"
         logger.info(
-            f"TickVelocity: curr={curr:.4f}, "
-            f"vel_60s={vel_60s*100:+.3f}% " if vel_60s else "vel_60s=N/A "
-            f"vel_30s={vel_30s*100:+.3f}% " if vel_30s else "vel_30s=N/A "
-            f"accel={acceleration*100:+.4f}%"
+            f"TickVelocity: vel_60s={vel_60s_str} vel_30s={vel_30s_str} accel={acceleration*100:+.4f}%"
         )
 
         # Use best available velocity for signal decision

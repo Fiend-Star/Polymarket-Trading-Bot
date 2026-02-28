@@ -3,15 +3,15 @@ Polymarket Client - Production Implementation
 Real API integration with Polymarket CLOB
 """
 import os
-import asyncio
-from decimal import Decimal
 from datetime import datetime
+from decimal import Decimal
 from typing import Optional, Dict, Any, List
-from loguru import logger
 
+from loguru import logger
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType as PolyOrderType
+from py_clob_client.clob_types import OrderArgs
 from py_clob_client.order_builder.constants import BUY, SELL
+
 POLYMARKET_AVAILABLE = True
 
 

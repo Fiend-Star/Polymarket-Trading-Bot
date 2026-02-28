@@ -2,23 +2,21 @@
 Custom Data Provider for NautilusTrader
 Bridges our ingestion layer to Nautilus data engine
 """
-import asyncio
+import os
+import sys
+from collections import defaultdict
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional, List
-from collections import defaultdict
+from typing import Optional
 
-from nautilus_trader.model.data import QuoteTick, TradeTick, Bar, BarType
-from nautilus_trader.model.identifiers import InstrumentId, TradeId
-from nautilus_trader.model.enums import AggressorSide, BarAggregation, PriceType
-from nautilus_trader.model.objects import Price, Quantity
-from nautilus_trader.common.component import LiveClock, Logger
-from nautilus_trader.common.providers import InstrumentProvider
-from nautilus_trader.data.engine import DataEngine
 from loguru import logger as loguru_logger
-import os
+from nautilus_trader.common.component import LiveClock, Logger
+from nautilus_trader.data.engine import DataEngine
+from nautilus_trader.model.data import QuoteTick, TradeTick
+from nautilus_trader.model.enums import AggressorSide
+from nautilus_trader.model.identifiers import InstrumentId, TradeId
+from nautilus_trader.model.objects import Price, Quantity
 
-import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from core.ingestion.adapters.unified_adapter import UnifiedDataAdapter, MarketData

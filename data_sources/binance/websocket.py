@@ -2,11 +2,11 @@
 Binance WebSocket Data Source
 Real-time BTC price streaming from Binance
 """
-import asyncio
 import json
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable
+
 import websockets
 from loguru import logger
 

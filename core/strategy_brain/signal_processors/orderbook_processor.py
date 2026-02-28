@@ -34,14 +34,15 @@ SIGNAL LOGIC:
   We also check WALL detection: a single order > 20% of total book
   volume indicates a large player taking a strong position.
 """
-import httpx
-from decimal import Decimal
-from datetime import datetime
-from typing import Optional, Dict, Any, List
-from loguru import logger
-
 import os
 import sys
+from datetime import datetime
+from decimal import Decimal
+from typing import Optional, Dict, Any, List
+
+import httpx
+from loguru import logger
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from core.strategy_brain.signal_processors.base_processor import (
@@ -84,6 +85,11 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
 
         # HTTP client created fresh per request (synchronous, safe in Nautilus event loop)
         self._cache: Optional[Dict] = None
+
+        # --- VOLUME EMA TRACKER FOR DYNAMIC SKEW DETECTION ---
+        self._volume_ema: Optional[float] = None
+        self._ema_alpha = 0.1  # Fast-adapting EMA
+        # ---------------------------------------------------
 
         logger.info(
             f"Initialized Order Book Imbalance Processor: "
@@ -169,7 +175,46 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
                 )
                 return None
 
+            # --- UPDATE EMA ---
+            if self._volume_ema is None:
+                self._volume_ema = total_volume
+            else:
+                self._volume_ema = (total_volume * self._ema_alpha) + (self._volume_ema * (1 - self._ema_alpha))
+
             imbalance = (bid_volume - ask_volume) / total_volume
+
+            # --- DYNAMIC SPOOF FILTER ---
+            # Trigger if volume spikes to > 2.5x the recent average AND book is > $5k
+            is_volume_spike = total_volume > (self._volume_ema * 2.5) and total_volume > 5000.0
+
+            top_bid = float(bids[0].get("price", 0)) if bids else 0
+            top_ask = float(asks[0].get("price", 0)) if asks else 0
+            spread = top_ask - top_bid
+
+            if is_volume_spike and spread > 0.03:
+                logger.warning(
+                    f"🚨 SPOOF DETECTED: Volume spike to ${total_volume:.1f} "
+                    f"(Avg: ${self._volume_ema:.1f}) with wide spread (${spread:.3f})."
+                )
+                return None
+
+            bid_wall = self._detect_wall(bids, total_volume)
+            ask_wall = self._detect_wall(asks, total_volume)
+
+            # --- DYNAMIC WALL INVERSION ---
+            # If an ask wall suddenly appears causing the volume spike, front-run the squeeze.
+            if ask_wall and ask_volume > (bid_volume * 4) and is_volume_spike:
+                logger.warning("🚨 MASSIVE ASK WALL SPOOF DETECTED. Inverting signal to BULLISH.")
+                return TradingSignal(
+                    timestamp=datetime.now(),
+                    source=self.name,
+                    signal_type=SignalType.VOLUME_SURGE,
+                    direction=SignalDirection.BULLISH,
+                    strength=SignalStrength.VERY_STRONG,
+                    confidence=0.85,  # High confidence for spoof inversion
+                    current_price=current_price,
+                    metadata={"reason": "Inverted massive ask wall spoof"}
+                )
 
             logger.info(
                 f"OrderBook: bids=${bid_volume:.1f}, asks=${ask_volume:.1f}, "

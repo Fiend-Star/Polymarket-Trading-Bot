@@ -27,8 +27,8 @@ USAGE:
     # regime.mean_reversion_bias = -0.02  # Subtract from YES probability
 """
 
-import time
 import threading
+import time
 from dataclasses import dataclass
 from typing import Optional
 

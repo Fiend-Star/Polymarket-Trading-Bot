@@ -2,10 +2,10 @@
 Solana RPC Data Source
 Connects to Solana blockchain for on-chain BTC/crypto data
 """
-import asyncio
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
+
 import httpx
 from loguru import logger
 

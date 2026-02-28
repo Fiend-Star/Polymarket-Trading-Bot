@@ -2,16 +2,16 @@
 Execution Engine
 Manages order placement, fills, and position lifecycle
 """
-import asyncio
-from decimal import Decimal
-from datetime import datetime
-from typing import Optional, Dict, Any, List, Callable
-from dataclasses import dataclass
-from enum import Enum
-from loguru import logger
-
 import os
 import sys
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+from enum import Enum
+from typing import Optional, Dict, Any, List, Callable
+
+from loguru import logger
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from execution.risk_engine import get_risk_engine, RiskEngine

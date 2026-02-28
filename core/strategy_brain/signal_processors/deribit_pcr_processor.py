@@ -32,14 +32,15 @@ API USED (completely free, no auth required):
     - instrument_name (e.g. BTC-20FEB26-95000-P = Put, -C = Call)
     - days to expiry (parsed from instrument name)
 """
-import httpx
-from decimal import Decimal
-from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List, Tuple
-from loguru import logger
-
 import os
 import sys
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Optional, Dict, Any
+
+import httpx
+from loguru import logger
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from core.strategy_brain.signal_processors.base_processor import (

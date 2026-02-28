@@ -2,14 +2,12 @@
 Nautilus Data Engine Wrapper
 Simplifies interaction with NautilusTrader's data engine
 """
-from typing import Optional
-import sys
 import os
+import sys
+from typing import Optional
 
 # Make core imports work from this subfolder
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-
-from datetime import datetime
 
 from nautilus_trader.config import DataEngineConfig
 from nautilus_trader.data.engine import DataEngine

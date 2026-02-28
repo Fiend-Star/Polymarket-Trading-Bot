@@ -28,10 +28,10 @@ Typical BTC 15-min realized vol: 40-100% annualized
 import math
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
-from loguru import logger
 
+from loguru import logger
 
 # ---------------------------------------------------------------------------
 # Constants

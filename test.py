@@ -3,10 +3,11 @@ Test script to directly query Gamma API for BTC markets.
 Run this separately to debug the API response.
 """
 
-import httpx
 import asyncio
 from datetime import datetime, timezone, timedelta
-import json
+
+import httpx
+
 
 async def test_gamma_api():
     """Test different filtering approaches with Gamma API."""

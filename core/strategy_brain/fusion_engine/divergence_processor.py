@@ -2,13 +2,14 @@
 Price Divergence Signal Processor
 Detects when Polymarket price diverges from spot exchanges
 """
-from decimal import Decimal
+import os
+import sys
 from datetime import datetime
+from decimal import Decimal
 from typing import Optional, Dict, Any
+
 from loguru import logger
 
-import os 
-import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 

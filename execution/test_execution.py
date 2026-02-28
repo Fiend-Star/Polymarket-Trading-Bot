@@ -12,20 +12,18 @@ Tests:
 Run this after Phase 4 tests pass.
 """
 import asyncio
-from decimal import Decimal
-from datetime import datetime
-import typer
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
-from loguru import logger
-
 import os
 import sys
+from decimal import Decimal
+
+import typer
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from execution.risk_engine import get_risk_engine, RiskLimits
+from execution.risk_engine import get_risk_engine
 from execution.execution_engine import get_execution_engine
 from execution.polymarket_client import get_polymarket_client
 from core.strategy_brain.signal_processors.base_processor import SignalDirection

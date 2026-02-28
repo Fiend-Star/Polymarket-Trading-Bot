@@ -41,6 +41,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional
 from loguru import logger
+from datetime import datetime
 
 from binary_pricer import BinaryOptionPricer, BinaryOptionPrice, get_binary_pricer
 from vol_estimator import VolEstimator, VolEstimate, get_vol_estimator
@@ -410,15 +411,14 @@ class MispricingDetector:
         edge_pct = abs_edge / trade_price if trade_price > 0 else 0.0
 
         # ---- Step 5: Fee calculation — V2 CRITICAL FIX ----
-        if use_maker:
-            fee_rate = self.maker_fee  # 0%
-        else:
-            # V2: Nonlinear Polymarket taker fee
-            fee_rate = polymarket_taker_fee(trade_price)
+        # FORCE TAKER FEE FOR EV CALCULATION:
+        # We always evaluate EV against the worst-case Taker fee (~1.56%).
+        # If we manage to execute as Maker (0%), that is bonus alpha.
+        fee_rate = polymarket_taker_fee(trade_price)
 
         num_tokens = position_size_usd / trade_price if trade_price > 0 else 0
         expected_pnl = abs_edge * num_tokens
-        fee_cost = fee_rate * num_tokens * trade_price  # Correct nonlinear fee
+        fee_cost = fee_rate * num_tokens * trade_price
         net_expected_pnl = expected_pnl - fee_cost
 
         # ---- Step 6: Kelly criterion sizing ----
@@ -428,7 +428,9 @@ class MispricingDetector:
             use_half_kelly=self.use_half_kelly,
             max_fraction=self.max_kelly_fraction,
         )
-        kelly_bet = kf * self.bankroll
+        # REMOVE `kelly_bet = kf * self.bankroll`
+        # Let the Risk Engine handle the USD conversion.
+        kelly_bet = 0.0
 
         # ---- Step 7: Tradeability decision ----
         # V2: More nuanced than V1's simple threshold check
@@ -502,8 +504,8 @@ class MispricingDetector:
             fee_cost=fee_cost,
             net_expected_pnl=net_expected_pnl,
             is_tradeable=is_tradeable,
-            kelly_fraction=kf,
-            kelly_bet_usd=kelly_bet,
+            kelly_fraction=kf,          # We pass the pure fraction
+            kelly_bet_usd=0.0,          # Deprecated, Risk Engine handles this now
             pricing_method=model.method,
         )
 

@@ -2,9 +2,10 @@
 Redis Control Script for BTC Bot Simulation Mode
 Toggle between simulation and live trading without restarting
 """
-import redis
-import sys
 import os
+import sys
+
+import redis
 from dotenv import load_dotenv
 
 load_dotenv()

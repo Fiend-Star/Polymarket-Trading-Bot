@@ -11,22 +11,20 @@ Tests:
 Run this after Phase 1 tests pass.
 """
 import asyncio
+import os
+import sys
 from datetime import datetime
 from decimal import Decimal
+
 import typer
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
-from rich.progress import track
-from loguru import logger
+from rich.table import Table
 
-import os
-
-import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from core.ingestion.adapters.unified_adapter import UnifiedDataAdapter, MarketData
-from core.ingestion.managers.websocket_manager import WebSocketManager, ConnectionState
+from core.ingestion.managers.websocket_manager import WebSocketManager
 from core.ingestion.managers.rate_limiter import get_rate_limiter
 from core.ingestion.validators.data_validator import get_validator
 

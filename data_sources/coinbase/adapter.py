@@ -2,10 +2,10 @@
 Coinbase Data Source Adapter
 Fetches BTC price data from Coinbase Pro API
 """
-import asyncio
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional, List, Dict, Any
+
 import httpx
 from loguru import logger
 

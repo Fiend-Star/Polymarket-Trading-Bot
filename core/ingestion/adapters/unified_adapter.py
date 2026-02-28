@@ -3,15 +3,15 @@ Unified Data Adapter
 Provides single interface to all external data sources
 """
 import asyncio
+import os
+import sys
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional, Dict, Any, List, Callable
-from dataclasses import dataclass, field
+
 from loguru import logger
 
-import os
-
-import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 

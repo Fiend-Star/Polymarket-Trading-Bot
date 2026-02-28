@@ -12,16 +12,14 @@ Tests:
 Run this after Phase 2 tests pass.
 """
 import asyncio
-from datetime import datetime
+import os
+import sys
+
 import typer
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
-from loguru import logger
+from rich.table import Table
 
-import os
-
-import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from core.nautilus_core.instruments.btc_instruments import get_instrument_registry
