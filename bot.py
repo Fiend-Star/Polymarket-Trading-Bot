@@ -1261,10 +1261,14 @@ class IntegratedBTCStrategy(Strategy):
                         if self._strike_defer_start is None:
                             self._strike_defer_start = time.time()
                         defer_elapsed = time.time() - self._strike_defer_start
-                        logger.debug(
-                            f"Strike deferred — waiting for verified boundary/Gamma API "
-                            f"({defer_elapsed:.0f}s elapsed)"
-                        )
+                        
+                        # Throttle log to every 30s
+                        if getattr(self, "_last_defer_log", 0) < time.time() - 25:
+                            logger.debug(
+                                f"Strike deferred — waiting for verified boundary/Gamma API "
+                                f"({defer_elapsed:.0f}s elapsed)"
+                            )
+                            self._last_defer_log = time.time()
 
             except Exception as e:
                 logger.debug(f"Cache refresh error: {e}")
