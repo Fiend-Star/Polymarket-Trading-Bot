@@ -741,12 +741,12 @@ class RTDSConnector:
         else:
             self._avg_latency_ms = float(latency)
 
-        # Log every tick for diagnostics to trace boundary timing precisely
-        logger.debug(
-            f"RTDS Chainlink tick #{self._chainlink_msg_count}: "
-            f"price=${price:,.2f}, source_ts={source_ts}, latency={latency}ms, "
-            f"avg_lat={self._avg_latency_ms:.0f}ms"
-        )
+        if self._chainlink_msg_count % 100 == 0:
+            logger.debug(
+                f"RTDS Chainlink: {self._chainlink_msg_count} ticks, "
+                f"price=${price:,.2f}, latency={latency}ms, "
+                f"avg_lat={self._avg_latency_ms:.0f}ms"
+            )
 
     # ==================================================================
     # Stats
