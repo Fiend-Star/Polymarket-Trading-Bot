@@ -511,7 +511,10 @@ class BinaryOptionPricer:
             return 0.0
 
         T = max(time_remaining_min / self.MINUTES_PER_YEAR, 1e-12)
-        vol_low, vol_high = 0.01, 5.0
+        # V3.2: Cap at 200% (was 500%). IV hitting the upper bound is a
+        # numerical failure, not a real vol estimate. 200% is still extremely
+        # generous for 15-min BTC options.
+        vol_low, vol_high = 0.01, 2.0
         sqrt_T = math.sqrt(T)
 
         def _bsm_price(vol: float) -> float:
@@ -551,6 +554,16 @@ class BinaryOptionPricer:
             p = _bsm_price(vol_mid)
 
             if abs(p - market_price) < tolerance:
+                # V3.2: Boundary guard — if bisection "converged" to the upper
+                # bound, it's a numerical failure (no finite vol explains the
+                # price), not a genuine IV.
+                if vol_mid > vol_high * 0.99:
+                    logger.warning(
+                        f"IV bisection hit upper bound ({vol_high:.0%}): "
+                        f"vol={vol_mid:.4f}, spot={spot:.2f}, strike={strike:.2f}, "
+                        f"T={time_remaining_min:.1f}min — marking untradeable"
+                    )
+                    return None
                 return vol_mid
 
             if price_decreasing:
@@ -579,6 +592,14 @@ class BinaryOptionPricer:
                 f"best={final_p:.4f}, vol={final_vol:.4f}, "
                 f"spot={spot:.2f}, strike={strike:.2f}, T={time_remaining_min:.1f}min "
                 f"— likely strike mismatch"
+            )
+            return None
+
+        # V3.2: Final boundary guard (for the case where loop exhausted iterations)
+        if final_vol > vol_high * 0.99:
+            logger.warning(
+                f"IV bisection converged to upper bound ({vol_high:.0%}): "
+                f"vol={final_vol:.4f} — marking untradeable"
             )
             return None
         return final_vol

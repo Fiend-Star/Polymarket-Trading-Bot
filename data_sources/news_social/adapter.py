@@ -44,7 +44,7 @@ class NewsSocialDataSource:
         """
         try:
             self.session = httpx.AsyncClient(
-                timeout=30.0,
+                timeout=8.0,
                 headers={"User-Agent": "PolymarketBot/1.0"}
             )
             
@@ -72,30 +72,35 @@ class NewsSocialDataSource:
         Returns:
             Dict with value, classification, and timestamp
         """
-        try:
-            response = await self.session.get(self.sentiment_api_url)
-            response.raise_for_status()
-            
-            data = response.json()
-            current = data["data"][0]
-            
-            sentiment = {
-                "timestamp": datetime.fromtimestamp(int(current["timestamp"])),
-                "value": int(current["value"]),  # 0-100
-                "classification": current["value_classification"],  # "Extreme Fear", "Fear", etc.
-                "time_until_update": current.get("time_until_update"),
-            }
-            
-            self._last_sentiment = sentiment
-            
-            if sentiment['value'] != self._last_logged_fg_value:
-                logger.debug(f"Fear & Greed Index: {sentiment['value']} ({sentiment['classification']})")
-                self._last_logged_fg_value = sentiment['value']
-            return sentiment
-            
-        except Exception as e:
-            logger.error(f"Error fetching Fear & Greed Index: {e}")
-            return None
+        for attempt in range(3):
+            try:
+                response = await self.session.get(self.sentiment_api_url)
+                response.raise_for_status()
+                
+                data = response.json()
+                current = data["data"][0]
+                
+                sentiment = {
+                    "timestamp": datetime.fromtimestamp(int(current["timestamp"])),
+                    "value": int(current["value"]),  # 0-100
+                    "classification": current["value_classification"],  # "Extreme Fear", "Fear", etc.
+                    "time_until_update": current.get("time_until_update"),
+                }
+                
+                self._last_sentiment = sentiment
+                
+                if sentiment['value'] != self._last_logged_fg_value:
+                    logger.debug(f"Fear & Greed Index: {sentiment['value']} ({sentiment['classification']})")
+                    self._last_logged_fg_value = sentiment['value']
+                return sentiment
+                
+            except Exception as e:
+                logger.warning(f"Error fetching Fear & Greed Index (attempt {attempt+1}/3): {e}")
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (2**attempt))
+                
+        logger.error("Failed to fetch Fear & Greed Index after 3 attempts.")
+        return self._last_sentiment
     
     async def get_crypto_news(
         self,

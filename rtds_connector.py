@@ -61,6 +61,11 @@ RECONNECT_DELAY_SEC = 5.0
 MAX_RECONNECT_ATTEMPTS = 50
 PRICE_HISTORY_MAXLEN = 500  # Last N price observations per feed
 
+# V3.2: Staleness detection — if a price feed's VALUE hasn't changed
+# in this many ms, treat it as frozen/stale (even if ticks keep arriving
+# with the same value).  Prevents phantom divergence signals.
+STALE_PRICE_THRESHOLD_MS = 30_000  # 30 seconds
+
 
 # =============================================================================
 # Data classes
@@ -136,6 +141,12 @@ class RTDSConnector:
         self._chainlink_ts: int = 0
         self._binance_price: float = 0.0
         self._binance_ts: int = 0
+
+        # V3.2: Track when price VALUE last changed (not just when a tick arrived)
+        self._binance_last_changed_price: float = 0.0
+        self._binance_last_changed_ts: int = 0
+        self._chainlink_last_changed_price: float = 0.0
+        self._chainlink_last_changed_ts: int = 0
 
         # Price histories
         self._chainlink_ticks: Deque[PriceTick] = deque(maxlen=PRICE_HISTORY_MAXLEN)
@@ -341,18 +352,24 @@ class RTDSConnector:
     def get_divergence(self) -> DivergenceSignal:
         """
         Compute Binance-Chainlink price divergence.
-        
+
         When Binance leads Chainlink significantly, it suggests directional
         pressure that the settlement oracle hasn't reflected yet.
         This is a simplified proxy for order flow imbalance:
         - If Binance >> Chainlink → buying pressure → BTC likely going up
         - If Binance << Chainlink → selling pressure → BTC likely going down
+
+        V3.2: Staleness guard — if either feed's VALUE hasn't changed in
+        STALE_PRICE_THRESHOLD_MS, the divergence is phantom (frozen feed)
+        and we return NEUTRAL.
         """
         with self._lock:
             bn_px = self._binance_price
             cl_px = self._chainlink_price
             bn_ts = self._binance_ts
             cl_ts = self._chainlink_ts
+            bn_changed_ts = self._binance_last_changed_ts
+            cl_changed_ts = self._chainlink_last_changed_ts
 
         if bn_px <= 0 or cl_px <= 0:
             return DivergenceSignal(
@@ -363,6 +380,25 @@ class RTDSConnector:
 
         now_ms = int(time.time() * 1000)
         staleness = max(now_ms - bn_ts, now_ms - cl_ts) if bn_ts and cl_ts else 999999
+
+        # V3.2: Staleness guard — detect frozen price feeds
+        bn_value_age = (now_ms - bn_changed_ts) if bn_changed_ts > 0 else 999999
+        cl_value_age = (now_ms - cl_changed_ts) if cl_changed_ts > 0 else 999999
+
+        if bn_value_age > STALE_PRICE_THRESHOLD_MS or cl_value_age > STALE_PRICE_THRESHOLD_MS:
+            stale_source = "Binance" if bn_value_age > cl_value_age else "Chainlink"
+            stale_age_sec = max(bn_value_age, cl_value_age) / 1000.0
+            logger.warning(
+                f"⚠ Divergence STALE: {stale_source} price unchanged for "
+                f"{stale_age_sec:.0f}s — treating as NEUTRAL"
+            )
+            signal = DivergenceSignal(
+                binance_price=bn_px, chainlink_price=cl_px,
+                divergence_bps=0.0, direction="NEUTRAL",
+                is_significant=False, staleness_ms=max(bn_value_age, cl_value_age),
+            )
+            self._last_divergence = signal
+            return signal
 
         divergence_bps = (bn_px - cl_px) / cl_px * 10000.0
 
@@ -618,6 +654,14 @@ class RTDSConnector:
         )
 
         with self._lock:
+            # V3.2: Track when price VALUE actually changes (not just new tick)
+            if price != self._binance_price:
+                self._binance_last_changed_price = price
+                self._binance_last_changed_ts = received_ts
+            elif self._binance_last_changed_ts == 0:
+                # First tick — initialize
+                self._binance_last_changed_price = price
+                self._binance_last_changed_ts = received_ts
             self._binance_price = price
             self._binance_ts = received_ts
         self._binance_ticks.append(tick)
@@ -649,6 +693,13 @@ class RTDSConnector:
         )
 
         with self._lock:
+            # V3.2: Track when price VALUE actually changes
+            if price != self._chainlink_price:
+                self._chainlink_last_changed_price = price
+                self._chainlink_last_changed_ts = received_ts
+            elif self._chainlink_last_changed_ts == 0:
+                self._chainlink_last_changed_price = price
+                self._chainlink_last_changed_ts = received_ts
             self._chainlink_price = price
             self._chainlink_ts = received_ts
 

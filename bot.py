@@ -630,14 +630,13 @@ class IntegratedBTCStrategy(Strategy):
 
     async def _refresh_cached_data(self):
         """
-        V3.1: Fetch BTC spot + sentiment, cache thread-safely.
-        Priority: RTDS Chainlink (settlement oracle) > RTDS Binance > Coinbase (fallback)
+        V3.2: Fetch BTC spot + funding CONCURRENTLY.
+        Sentiment (F&G) is now handled autonomously by a background thread.
+        Each source has its own 5s timeout so one dead API can't block others.
         """
         spot = None
-        sentiment = None
-        sentiment_class = None
 
-        # V3.1: Prefer RTDS Chainlink (THE settlement oracle) over Coinbase
+        # RTDS Chainlink — in-memory, instant
         if self.rtds and self.rtds.chainlink_btc_price > 0 and self.rtds.chainlink_age_ms < 30000:
             spot = self.rtds.chainlink_btc_price
             # Log divergence if significant
@@ -652,38 +651,46 @@ class IntegratedBTCStrategy(Strategy):
         elif self.rtds and self.rtds.binance_btc_price > 0 and self.rtds.binance_age_ms < 30000:
             # V3.2: RTDS Binance as intermediate fallback (Chainlink feed may be silent)
             spot = self.rtds.binance_btc_price
-        elif self._coinbase_source:
+            
+        # Concurrent I/O fetches
+        async def _fetch_coinbase():
+            if spot is not None or not self._coinbase_source:
+                return None
             try:
-                coinbase_spot = await self._coinbase_source.get_current_price()
-                if coinbase_spot:
-                    spot = float(coinbase_spot)
-                    # Feed vol estimator from Coinbase fallback
-                    self.vol_estimator.add_price(spot)
-            except Exception as e:
-                logger.debug(f"Coinbase refresh failed: {e}")
+                result = await asyncio.wait_for(
+                    self._coinbase_source.get_current_price(), timeout=5.0
+                )
+                if result:
+                    price = float(result)
+                    self.vol_estimator.add_price(price)
+                    return price
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.debug(f"Coinbase refresh error: {e}")
+            return None
 
-        if self._news_source:
+        async def _fetch_funding():
+            if not self.funding_filter or not self.funding_filter.should_update():
+                return
             try:
-                fg = await self._news_source.get_fear_greed_index()
-                if fg and "value" in fg:
-                    sentiment = float(fg["value"])
-                    sentiment_class = fg.get("classification", "")
-            except Exception as e:
-                logger.debug(f"Sentiment refresh failed: {e}")
+                await asyncio.wait_for(
+                    self.funding_filter.update(), timeout=5.0
+                )
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.debug(f"Funding update error: {e}")
 
-        # V3.1: Update funding rate periodically
-        if self.funding_filter and self.funding_filter.should_update():
-            try:
-                self.funding_filter.update_sync()
-            except Exception as e:
-                logger.debug(f"Funding rate update failed: {e}")
+        results = await asyncio.gather(
+            _fetch_coinbase(),
+            _fetch_funding(),
+            return_exceptions=True,
+        )
+
+        coinbase_price = results[0] if not isinstance(results[0], Exception) else None
 
         with self._cache_lock:
             if spot is not None:
                 self._cached_spot_price = spot
-            if sentiment is not None:
-                self._cached_sentiment = sentiment
-                self._cached_sentiment_class = sentiment_class
+            elif coinbase_price is not None:
+                self._cached_spot_price = coinbase_price
 
     def _get_cached_data(self) -> dict:
         """Read cached market data (thread-safe). Called from trading decision."""
@@ -770,6 +777,9 @@ class IntegratedBTCStrategy(Strategy):
 
         if self.grafana_exporter:
             threading.Thread(target=self._start_grafana_sync, daemon=True).start()
+            
+        # V3.2 FIX: Dedicated background thread for News polling
+        self.news_thread = self._start_news_polling()
 
         logger.info(f"V3.1 active — {len(self.price_history)} price points cached")
 
@@ -2214,6 +2224,43 @@ class IntegratedBTCStrategy(Strategy):
                 self._grafana_loop.close()
             except Exception:
                 pass
+
+    def _start_news_polling(self):
+        """Start news/sentiment polling in a dedicated background thread."""
+        def _run():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(self._news_poll_loop())
+            except Exception as e:
+                logger.error(f"News polling thread error: {e}")
+            finally:
+                loop.close()
+
+        t = threading.Thread(target=_run, daemon=True, name="news-poller")
+        t.start()
+        logger.info("News/sentiment poller started in background thread")
+        return t
+
+    async def _news_poll_loop(self):
+        """Poll sentiment every 60s in its own thread/loop."""
+        from data_sources.news_social.adapter import NewsSocialDataSource
+        news_src = NewsSocialDataSource()
+        await news_src.connect()
+
+        while True:
+            try:
+                fg = await asyncio.wait_for(
+                    news_src.get_fear_greed_index(), timeout=8.0
+                )
+                if fg and "value" in fg:
+                    with self._cache_lock:
+                        self._cached_sentiment = float(fg["value"])
+                        self._cached_sentiment_class = fg.get("classification", "")
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.debug(f"News poll error: {e}")
+
+            await asyncio.sleep(60)  # F&G only updates daily, 60s is plenty
 
     def on_stop(self):
         logger.info("Integrated BTC strategy V3.1 stopped")
