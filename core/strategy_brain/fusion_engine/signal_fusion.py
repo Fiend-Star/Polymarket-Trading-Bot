@@ -45,10 +45,11 @@ class FusedSignal:
 class SignalFusionEngine:
     def __init__(self):
         self.weights = {
-            "SpikeDetection":    0.40,
-            "PriceDivergence":   0.30,
-            "SentimentAnalysis": 0.20,
-            "default":           0.10,
+            "OrderBookImbalance": 0.40,
+            "TickVelocity":      0.30,
+            "PriceDivergence":   0.20,
+            "SpikeDetection":    0.10,
+            "default":           0.00,
         }
         
         self._signal_history: List[FusedSignal] = []

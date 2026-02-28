@@ -72,11 +72,9 @@ def _get_gamma_session() -> requests.Session:
 
 # Signal processors (kept as confirmation signals in V3)
 from core.strategy_brain.signal_processors.spike_detector import SpikeDetectionProcessor
-from core.strategy_brain.signal_processors.sentiment_processor import SentimentProcessor
 from core.strategy_brain.signal_processors.divergence_processor import PriceDivergenceProcessor
 from core.strategy_brain.signal_processors.orderbook_processor import OrderBookImbalanceProcessor
 from core.strategy_brain.signal_processors.tick_velocity_processor import TickVelocityProcessor
-from core.strategy_brain.signal_processors.deribit_pcr_processor import DeribitPCRProcessor
 from core.strategy_brain.fusion_engine.signal_fusion import get_fusion_engine
 from execution.risk_engine import get_risk_engine
 from monitoring.performance_tracker import get_performance_tracker
@@ -394,10 +392,6 @@ class IntegratedBTCStrategy(Strategy):
             spike_threshold=float(os.getenv("SPIKE_THRESHOLD", "0.05")),
             lookback_periods=20,
         )
-        self.sentiment_processor = SentimentProcessor(
-            extreme_fear_threshold=25,
-            extreme_greed_threshold=75,
-        )
         self.divergence_processor = PriceDivergenceProcessor(
             divergence_threshold=float(os.getenv("DIVERGENCE_THRESHOLD", "0.05")),
         )
@@ -409,21 +403,13 @@ class IntegratedBTCStrategy(Strategy):
             velocity_threshold_60s=0.015,
             velocity_threshold_30s=0.010,
         )
-        self.deribit_pcr_processor = DeribitPCRProcessor(
-            bullish_pcr_threshold=1.20,
-            bearish_pcr_threshold=0.70,
-            max_days_to_expiry=2,
-            cache_seconds=300,
-        )
 
         # Fusion engine (kept for confirmation and heuristic fallback)
         self.fusion_engine = get_fusion_engine()
-        self.fusion_engine.set_weight("OrderBookImbalance", 0.30)
-        self.fusion_engine.set_weight("TickVelocity", 0.25)
-        self.fusion_engine.set_weight("PriceDivergence", 0.18)
-        self.fusion_engine.set_weight("SpikeDetection", 0.12)
-        self.fusion_engine.set_weight("DeribitPCR", 0.10)
-        self.fusion_engine.set_weight("SentimentAnalysis", 0.05)
+        self.fusion_engine.set_weight("OrderBookImbalance", 0.40)
+        self.fusion_engine.set_weight("TickVelocity", 0.30)
+        self.fusion_engine.set_weight("PriceDivergence", 0.20)
+        self.fusion_engine.set_weight("SpikeDetection", 0.10)
 
         # Risk / Performance / Learning
         self.risk_engine = get_risk_engine()
@@ -1556,12 +1542,6 @@ class IntegratedBTCStrategy(Strategy):
         # V3.1: Compute vol skew + pass funding bias
         # V3.4 FIX: Pass `vol_skew` from genuine Deribit data instead of synthetic formula
         vol_skew = 0.0
-        if getattr(self, "deribit_pcr", None) and self.deribit_pcr._cached_result:
-            pcr = self.deribit_pcr._cached_result.get("short_pcr", 1.0)
-            # PCR > 1 (puts expensive) -> negative skew. 
-            # e.g. PCR = 1.2 -> skew = -0.02
-            vol_skew = -0.10 * (pcr - 1.0)
-            vol_skew = max(-0.10, min(0.05, vol_skew))
 
         signal = self.mispricing_detector.detect(
             yes_market_price=yes_price,
@@ -1803,14 +1783,6 @@ class IntegratedBTCStrategy(Strategy):
             )
             if tv_signal:
                 signals.append(tv_signal)
-
-        pcr_signal = self.deribit_pcr_processor.process(
-            current_price=current_price,
-            historical_prices=self.price_history,
-            metadata=processed_metadata,
-        )
-        if pcr_signal:
-            signals.append(pcr_signal)
 
         return signals
 
