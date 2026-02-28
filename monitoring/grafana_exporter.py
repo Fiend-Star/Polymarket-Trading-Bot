@@ -201,7 +201,8 @@ class GrafanaMetricsExporter:
         self._is_running = False
         self._server = None
         self._thread = None
-        
+        self._update_task = None  # Reference to _update_loop task
+
         logger.info(f"Initialized Grafana Metrics Exporter (port {port})")
     
     def _setup_metrics(self) -> None:
@@ -341,8 +342,6 @@ class GrafanaMetricsExporter:
                 # Update counters if needed
                 pass
             
-            logger.debug("Metrics updated successfully")
-            
         except Exception as e:
             logger.error(f"Error updating metrics: {e}")
     
@@ -365,9 +364,9 @@ class GrafanaMetricsExporter:
 
             self._is_running = True
             
-            # Start update loop
-            asyncio.create_task(self._update_loop())
-            
+            # Start update loop — keep a reference to prevent GC
+            self._update_task = asyncio.create_task(self._update_loop())
+
         except Exception as e:
             logger.error(f"Failed to start metrics server: {e}")
     
@@ -388,6 +387,15 @@ class GrafanaMetricsExporter:
         """Stop metrics server."""
         self._is_running = False
         
+        # Cancel the update loop task
+        if self._update_task and not self._update_task.done():
+            self._update_task.cancel()
+            try:
+                await self._update_task
+            except asyncio.CancelledError:
+                pass
+            self._update_task = None
+
         if self._server:
             self._server.shutdown()
             self._server.server_close()

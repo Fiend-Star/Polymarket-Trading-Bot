@@ -104,7 +104,7 @@ else:
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-QUOTE_STABILITY_REQUIRED = 3
+QUOTE_STABILITY_REQUIRED = int(os.getenv("QUOTE_STABILITY_REQUIRED", "5"))
 QUOTE_MIN_SPREAD = 0.001
 MARKET_INTERVAL_SECONDS = 900
 
@@ -126,6 +126,7 @@ TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.30"))
 CUT_LOSS_PCT = float(os.getenv("CUT_LOSS_PCT", "-0.50"))
 VOL_METHOD = os.getenv("VOL_METHOD", "ewma")
 DEFAULT_VOL = float(os.getenv("DEFAULT_VOL", "0.65"))
+BANKROLL_USD = float(os.getenv("BANKROLL_USD", "20.0"))
 
 # V3.1: RTDS + Funding Rate Config
 USE_RTDS = os.getenv("USE_RTDS", "true").lower() == "true"
@@ -346,12 +347,13 @@ class IntegratedBTCStrategy(Strategy):
         self.vol_estimator = get_vol_estimator()
         self.mispricing_detector = get_mispricing_detector(
             maker_fee=0.00,
-            taker_fee=0.10,
+            taker_fee=0.02,         # V2: ~2% default, overridden by nonlinear formula (was 10%!)
             min_edge_cents=MIN_EDGE_CENTS,
             min_edge_after_fees=0.005,
             take_profit_pct=TAKE_PROFIT_PCT,
             cut_loss_pct=CUT_LOSS_PCT,
             vol_method=VOL_METHOD,
+            bankroll=BANKROLL_USD,
         )
 
         # Strike price (BTC at market open) — reset each market
@@ -576,19 +578,22 @@ class IntegratedBTCStrategy(Strategy):
             # Sort oldest-first so vol estimator sees them in chronological order
             candles.sort(key=lambda c: c[0])
 
-            fed = 0
+            # Build (timestamp, price) list for preseed
+            # Uses preseed_historical() to properly insert bars even if RTDS
+            # has already set _last_bar_time to the current minute
+            price_pairs = []
             for candle in candles:
                 try:
                     ts, low, high, open_p, close, volume = candle
-                    price = float(close)
-                    self.vol_estimator.add_price(price, float(ts))
-                    fed += 1
+                    price_pairs.append((float(ts), float(close)))
                 except (ValueError, IndexError, TypeError):
                     continue
 
+            self.vol_estimator.preseed_historical(price_pairs)
+
             vol = self.vol_estimator.get_vol(VOL_METHOD)
             logger.info(
-                f"✓ Vol estimator pre-seeded: {fed} candles → "
+                f"✓ Vol estimator pre-seeded: {len(price_pairs)} candles → "
                 f"RV={vol.annualized_vol:.1%} ({vol.method}), "
                 f"confidence={vol.confidence:.0%}"
             )
@@ -1515,8 +1520,15 @@ class IntegratedBTCStrategy(Strategy):
 
         # Step 2: Check if we can run the quant model
         if btc_spot is None or self._btc_strike_price is None:
-            logger.warning(f"No BTC spot or strike — falling back to heuristic signals")
-            await self._make_trading_decision_heuristic(current_price, cached, is_simulation)
+            if is_simulation:
+                logger.warning(f"No BTC spot or strike — falling back to heuristic signals (SIMULATION)")
+                await self._make_trading_decision_heuristic(current_price, cached, is_simulation)
+            else:
+                logger.warning(
+                    f"No BTC spot or strike — SKIPPING trade (live mode requires quant model). "
+                    f"spot={'$'+f'{btc_spot:,.2f}' if btc_spot else 'None'}, "
+                    f"strike={'$'+f'{self._btc_strike_price:,.2f}' if self._btc_strike_price else 'None'}"
+                )
             return
 
         # Step 3: Calculate time remaining
@@ -1934,11 +1946,14 @@ class IntegratedBTCStrategy(Strategy):
             # Clamp
             limit_price = max(Decimal("0.01"), min(Decimal("0.99"), limit_price))
 
-            # Calculate token quantity
+            # Calculate token quantity from position size
             token_qty = float(position_size / limit_price)
             precision = instrument.size_precision
             token_qty = round(token_qty, precision)
-            token_qty = max(token_qty, 5.0)
+
+            # Use exchange minimum, NOT hardcoded 5.0
+            min_qty = float(getattr(instrument, 'min_quantity', None) or Decimal("0.01"))
+            token_qty = max(token_qty, min_qty)
 
             logger.info("=" * 80)
             logger.info(f"LIMIT ORDER @ BID (MAKER, 0% FEE)")
@@ -2031,9 +2046,10 @@ class IntegratedBTCStrategy(Strategy):
             trade_price = float(current_price)
             max_usd_amount = float(position_size)
             precision = instrument.size_precision
-            min_qty_val = float(getattr(instrument, 'min_quantity', None) or 5.0)
-            token_qty = max(min_qty_val, 5.0)
+            min_qty_val = float(getattr(instrument, 'min_quantity', None) or Decimal("0.01"))
+            token_qty = max_usd_amount / trade_price if trade_price > 0 else min_qty_val
             token_qty = round(token_qty, precision)
+            token_qty = max(token_qty, min_qty_val)
 
             qty = Quantity(token_qty, precision=precision)
             timestamp_ms = int(time.time() * 1000)
@@ -2145,12 +2161,20 @@ class IntegratedBTCStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def _start_grafana_sync(self):
+        """Start Grafana exporter in a dedicated event loop that stays alive."""
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(self.grafana_exporter.start())
+            self._grafana_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._grafana_loop)
+            self._grafana_loop.run_until_complete(self.grafana_exporter.start())
+            # Keep loop alive so the _update_loop task continues running
+            self._grafana_loop.run_forever()
         except Exception as e:
-            logger.error(f"Failed to start Grafana: {e}")
+            logger.error(f"Grafana exporter stopped: {e}")
+        finally:
+            try:
+                self._grafana_loop.close()
+            except Exception:
+                pass
 
     def on_stop(self):
         logger.info("Integrated BTC strategy V3.1 stopped")
@@ -2196,8 +2220,18 @@ class IntegratedBTCStrategy(Strategy):
 
         if self.grafana_exporter:
             try:
-                loop = asyncio.new_event_loop()
-                loop.run_until_complete(self.grafana_exporter.stop())
+                grafana_loop = getattr(self, '_grafana_loop', None)
+                if grafana_loop and grafana_loop.is_running():
+                    # Schedule stop() coroutine on the Grafana loop, then stop the loop
+                    async def _shutdown_grafana():
+                        await self.grafana_exporter.stop()
+                        grafana_loop.stop()
+                    asyncio.run_coroutine_threadsafe(_shutdown_grafana(), grafana_loop)
+                else:
+                    # Loop already stopped — just clean up
+                    loop = asyncio.new_event_loop()
+                    loop.run_until_complete(self.grafana_exporter.stop())
+                    loop.close()
             except Exception:
                 pass
 

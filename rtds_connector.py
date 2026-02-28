@@ -164,6 +164,9 @@ class RTDSConnector:
         self._avg_latency_ms = 0.0
         self._last_divergence: Optional[DivergenceSignal] = None
 
+        # V3.4: Track whether server supports Chainlink symbol filter
+        self._chainlink_filter_supported = True  # Optimistic; falls back if 400
+
         logger.info(
             f"Initialized RTDS Connector: endpoint={RTDS_WS_URL}, "
             f"divergence_threshold={divergence_threshold_bps}bps, "
@@ -477,9 +480,16 @@ class RTDSConnector:
                                 _resub_pending = True
                                 _resub_after = time.time() + 10.0
                             elif '"statusCode":400' in msg.data and "failed validation" in msg.data:
-                                logger.warning("RTDS: Subscription validation error (400) — will retry in 5s")
-                                _resub_pending = True
-                                _resub_after = time.time() + 5.0
+                                # V3.4: Server rejected filter — disable and retry
+                                if self._chainlink_filter_supported:
+                                    self._chainlink_filter_supported = False
+                                    logger.warning("RTDS: Chainlink filter rejected (400) — falling back to unfiltered, retrying in 3s")
+                                    _resub_pending = True
+                                    _resub_after = time.time() + 3.0
+                                else:
+                                    logger.warning("RTDS: Subscription validation error (400) — will retry in 5s")
+                                    _resub_pending = True
+                                    _resub_after = time.time() + 5.0
 
                         # V3.3: Retry subscriptions after rate-limit cooldown
                         if _resub_pending and time.time() >= _resub_after:
@@ -504,14 +514,18 @@ class RTDSConnector:
     async def _subscribe(self, ws):
         """Subscribe to Binance + Chainlink BTC price feeds.
 
-        V3.3: Send both subscriptions in a SINGLE WebSocket message to reduce
-        the chance of 429 rate-limits.  Use ``type: "update"`` for both feeds
-        (the wildcard ``"*"`` sometimes triggers a 400 regex validation error).
-        Chainlink subscription is catch-all (no filter) — we filter for btc/usd
-        in ``_handle_message``.
+        V3.4: Filter Chainlink to btc/usd only when server supports it.
+        Falls back to unfiltered (client-side filtering) on 400 validation error.
         """
         # Small delay after connect to avoid immediate rate-limit
         await asyncio.sleep(0.5)
+
+        chainlink_sub = {
+            "topic": "crypto_prices_chainlink",
+            "type": "update",
+        }
+        if self._chainlink_filter_supported:
+            chainlink_sub["filters"] = json.dumps({"symbol": "btc/usd"})
 
         combined_sub = {
             "action": "subscribe",
@@ -521,15 +535,12 @@ class RTDSConnector:
                     "type": "update",
                     "filters": json.dumps({"symbol": "btcusdt"}),
                 },
-                {
-                    "topic": "crypto_prices_chainlink",
-                    "type": "update",
-                },
+                chainlink_sub,
             ],
         }
         await ws.send_json(combined_sub)
-        logger.info("RTDS: Subscribed to crypto_prices (Binance btcusdt)")
-        logger.info("RTDS: Subscribed to crypto_prices_chainlink (btc/usd) — SETTLEMENT ORACLE")
+        filter_note = "btc/usd only" if self._chainlink_filter_supported else "all symbols, client-filtered"
+        logger.info(f"RTDS: Subscribed to crypto_prices (btcusdt) + crypto_prices_chainlink ({filter_note})")
 
     def _handle_message(self, raw: str):
         """Parse and route an incoming RTDS message."""
@@ -542,8 +553,8 @@ class RTDSConnector:
         payload = data.get("payload")
         self._total_messages += 1
 
-        # V3.2: Log first 5 messages for format diagnostics
-        if self._total_messages <= 5:
+        # V3.4: Log first 2 messages for format diagnostics
+        if self._total_messages <= 2:
             raw_preview = raw[:500] if len(raw) > 500 else raw
             logger.info(
                 f"RTDS msg #{self._total_messages}: topic='{topic}', "

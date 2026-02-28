@@ -220,6 +220,54 @@ class VolEstimator:
         for ts, price in prices:
             self.add_price(price, ts)
 
+    def preseed_historical(self, prices: List[Tuple[float, float]]):
+        """
+        Ingest historical price data (e.g. Coinbase candles) into the vol
+        estimator, even if RTDS ticks have already set _last_bar_time to
+        the current minute.
+
+        Saves the current state, clears the bar buffer, feeds all historical
+        data oldest-first, then re-appends any recent bars that were evicted.
+        This ensures historical bars are properly created.
+
+        Args:
+            prices: List of (timestamp_seconds, price) tuples, sorted
+                    oldest-first.
+        """
+        if not prices:
+            return
+
+        # Save current bars from RTDS that may have arrived before preseed
+        saved_bars = list(self._bars)
+
+        # Reset to allow historical ingestion
+        self._bars.clear()
+        self._last_bar_time = 0.0
+
+        # Feed historical data — bars will be created properly
+        for ts, price in prices:
+            self.add_price(price, ts)
+
+        historical_count = len(self._bars)
+
+        # Re-append any recent bars that came from RTDS (after the historical window)
+        # Only add bars that are newer than what we just ingested
+        newest_historical = self._last_bar_time
+        for bar in saved_bars:
+            if bar.timestamp > newest_historical:
+                bar_boundary = int(bar.timestamp / self.resample_interval_sec) * self.resample_interval_sec
+                if bar_boundary > self._last_bar_time:
+                    self._bars.append(bar)
+                    self._last_bar_time = bar_boundary
+
+        # Invalidate cache so next get_vol() computes fresh
+        self._cached_vol = None
+
+        logger.info(
+            f"Vol preseed: {len(prices)} candles → {historical_count} bars "
+            f"(+ {len(self._bars) - historical_count} recent RTDS bars restored)"
+        )
+
     def set_simulated_time(self, ts: Optional[float]):
         """Set simulated time for backtesting. Pass None to use real time."""
         self._simulated_time = ts
