@@ -101,6 +101,9 @@ class FundingRateFilter:
         self._last_fetch: float = 0.0
         self._fetch_count: int = 0
 
+        # Persistent HTTP session for connection reuse
+        self._http_session = None
+
         logger.info(
             f"Initialized FundingRateFilter: {symbol}, "
             f"extreme={extreme_threshold:.4%}, high={high_threshold:.4%}, "
@@ -129,30 +132,30 @@ class FundingRateFilter:
             basis_bps=0.0, next_funding_time=0, last_update=0,
         )
 
+    def _get_http_session(self):
+        """Return a persistent HTTP session (httpx.Client or requests.Session)."""
+        if self._http_session is None:
+            if hasattr(httpx, 'Client'):
+                self._http_session = httpx.Client(timeout=10.0)
+            else:
+                # requests fallback — create a Session
+                self._http_session = httpx.Session()
+        return self._http_session
+
     def update_sync(self) -> Optional[FundingRegime]:
         """Synchronous funding rate fetch (for non-async contexts)."""
         if not HTTPX_AVAILABLE:
             return None
 
         try:
-            if hasattr(httpx, 'Client'):
-                # httpx
-                with httpx.Client(timeout=10.0) as client:
-                    resp = client.get(
-                        BINANCE_MARK_PRICE_URL,
-                        params={"symbol": self.symbol},
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-            else:
-                # requests fallback
-                resp = httpx.get(
-                    BINANCE_MARK_PRICE_URL,
-                    params={"symbol": self.symbol},
-                    timeout=10.0,
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            client = self._get_http_session()
+            resp = client.get(
+                BINANCE_MARK_PRICE_URL,
+                params={"symbol": self.symbol},
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
             return self._process_response(data)
 
@@ -161,27 +164,14 @@ class FundingRateFilter:
             return None
 
     async def update(self) -> Optional[FundingRegime]:
-        """Async funding rate fetch."""
+        """Async funding rate fetch — delegates to sync with persistent session."""
         if not HTTPX_AVAILABLE:
             return None
 
         try:
-            if hasattr(httpx, 'AsyncClient'):
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.get(
-                        BINANCE_MARK_PRICE_URL,
-                        params={"symbol": self.symbol},
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-            else:
-                # Fallback to sync in thread
-                import asyncio
-                loop = asyncio.get_event_loop()
-                return await loop.run_in_executor(None, self.update_sync)
-
-            return self._process_response(data)
-
+            import asyncio
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self.update_sync)
         except Exception as e:
             logger.warning(f"Async funding rate fetch failed: {e}")
             return None
@@ -257,6 +247,15 @@ class FundingRateFilter:
             "funding_rate": self._regime.funding_rate if self._regime else None,
             "basis_bps": self._regime.basis_bps if self._regime else None,
         }
+
+    def close(self):
+        """Close the persistent HTTP session."""
+        if self._http_session is not None:
+            try:
+                self._http_session.close()
+            except Exception:
+                pass
+            self._http_session = None
 
 
 # =============================================================================

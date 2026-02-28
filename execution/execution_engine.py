@@ -120,7 +120,7 @@ class ExecutionEngine:
         self._filled_orders = 0
         self._rejected_orders = 0
         
-        mode = "DRY RUN" if dry_run else "LIVE"
+        mode = "DRY RUN — simulation only, Nautilus handles live execution" if dry_run else "LIVE"
         logger.info(f"Initialized Execution Engine [{mode}]")
     
     async def execute_signal(
@@ -518,7 +518,13 @@ class ExecutionEngine:
 _execution_engine_instance = None
 
 def get_execution_engine() -> ExecutionEngine:
-    """Get singleton execution engine."""
+    """Get singleton execution engine.
+
+    NOTE: In live mode, the Nautilus PolymarketLiveExecClient handles
+    ALL real order routing. This ExecutionEngine is only used for
+    simulation/paper-trading risk checks. Any risk checks here do NOT
+    protect live trades routed through Nautilus.
+    """
     global _execution_engine_instance
     if _execution_engine_instance is None:
         _execution_engine_instance = ExecutionEngine(dry_run=True)

@@ -57,6 +57,18 @@ from nautilus_trader.model.data import QuoteTick
 from dotenv import load_dotenv
 from loguru import logger
 import redis
+import requests
+
+# Persistent HTTP session for Gamma API calls (reuses TCP/TLS connections)
+_gamma_session: Optional[requests.Session] = None
+
+def _get_gamma_session() -> requests.Session:
+    """Return a module-level persistent requests.Session for Gamma API."""
+    global _gamma_session
+    if _gamma_session is None:
+        _gamma_session = requests.Session()
+        _gamma_session.headers.update({"Accept": "application/json"})
+    return _gamma_session
 
 # Signal processors (kept as confirmation signals in V3)
 from core.strategy_brain.signal_processors.spike_detector import SpikeDetectionProcessor
@@ -92,7 +104,7 @@ else:
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-QUOTE_STABILITY_REQUIRED = 3
+QUOTE_STABILITY_REQUIRED = int(os.getenv("QUOTE_STABILITY_REQUIRED", "5"))
 QUOTE_MIN_SPREAD = 0.001
 MARKET_INTERVAL_SECONDS = 900
 
@@ -114,6 +126,7 @@ TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.30"))
 CUT_LOSS_PCT = float(os.getenv("CUT_LOSS_PCT", "-0.50"))
 VOL_METHOD = os.getenv("VOL_METHOD", "ewma")
 DEFAULT_VOL = float(os.getenv("DEFAULT_VOL", "0.65"))
+BANKROLL_USD = float(os.getenv("BANKROLL_USD", "20.0"))
 
 # V3.1: RTDS + Funding Rate Config
 USE_RTDS = os.getenv("USE_RTDS", "true").lower() == "true"
@@ -122,6 +135,7 @@ RTDS_LATE_WINDOW_MIN_BPS = float(os.getenv("RTDS_LATE_WINDOW_MIN_BPS", "3.0"))
 RTDS_DIVERGENCE_THRESHOLD_BPS = float(os.getenv("RTDS_DIVERGENCE_THRESHOLD_BPS", "5.0"))
 USE_FUNDING_FILTER = os.getenv("USE_FUNDING_FILTER", "true").lower() == "true"
 LATE_WINDOW_ENABLED = os.getenv("LATE_WINDOW_ENABLED", "true").lower() == "true"
+SHADOW_MODE_ONLY = os.getenv("SHADOW_MODE_ONLY", "false").lower() == "true"
 
 
 # =============================================================================
@@ -185,6 +199,54 @@ def init_redis():
         return redis_client
     except Exception as e:
         logger.warning(f"Redis connection failed: {e}")
+        return None
+
+
+# =============================================================================
+# V3.2: Fetch authoritative strike ("price to beat") from Gamma API
+# =============================================================================
+
+def fetch_price_to_beat(slug: str, timeout: float = 5.0) -> Optional[float]:
+    """
+    Fetch the authoritative 'priceToBeat' for a BTC 15-min UpDown market.
+
+    Polymarket stores the exact Chainlink BTC/USD price at eventStartTime in
+    the event metadata field ``priceToBeat``.  This is the REAL strike that
+    determines resolution — NOT the Chainlink price we capture ourselves.
+
+    Path: GET /markets?slug=<slug>  →  events[0].eventMetadata.priceToBeat
+    """
+    try:
+        session = _get_gamma_session()
+        r = session.get(
+            "https://gamma-api.polymarket.com/markets",
+            params={"slug": slug},
+            timeout=timeout,
+        )
+        if r.status_code != 200:
+            logger.debug(f"Gamma API returned {r.status_code} for slug={slug}")
+            return None
+
+        data = r.json()
+        if not data:
+            return None
+
+        market = data[0]
+        events = market.get("events", [])
+        if not events:
+            return None
+
+        metadata = events[0].get("eventMetadata")
+        if not metadata or not isinstance(metadata, dict):
+            return None
+
+        ptb = metadata.get("priceToBeat")
+        if ptb is not None:
+            return float(ptb)
+
+        return None
+    except Exception as e:
+        logger.debug(f"fetch_price_to_beat({slug}) failed: {e}")
         return None
 
 
@@ -277,6 +339,7 @@ class IntegratedBTCStrategy(Strategy):
         self._news_source = None
         self._coinbase_source = None
         self._data_sources_initialized = False
+        self._aiohttp_session: Optional[object] = None  # Reusable aiohttp session
 
         # =====================================================================
         # V3: Quantitative pricing model
@@ -285,17 +348,20 @@ class IntegratedBTCStrategy(Strategy):
         self.vol_estimator = get_vol_estimator()
         self.mispricing_detector = get_mispricing_detector(
             maker_fee=0.00,
-            taker_fee=0.10,
+            taker_fee=0.02,         # V2: ~2% default, overridden by nonlinear formula (was 10%!)
             min_edge_cents=MIN_EDGE_CENTS,
             min_edge_after_fees=0.005,
             take_profit_pct=TAKE_PROFIT_PCT,
             cut_loss_pct=CUT_LOSS_PCT,
             vol_method=VOL_METHOD,
+            bankroll=BANKROLL_USD,
         )
 
         # Strike price (BTC at market open) — reset each market
         self._btc_strike_price: Optional[float] = None
         self._strike_recorded = False
+        self._strike_defer_start: Optional[float] = None  # V3.2: When we started deferring
+        self._strike_source: str = ""  # V3.3: "ptb", "chainlink_boundary", "chainlink_current", "binance", "coinbase"
 
         # Active entry for exit monitoring
         self._active_entry: Optional[dict] = None
@@ -398,6 +464,27 @@ class IntegratedBTCStrategy(Strategy):
     # Helpers
     # ------------------------------------------------------------------
 
+    def _register_upcoming_boundaries(self):
+        """
+        Pre-register upcoming 15-min boundaries with the RTDS connector.
+
+        The connector's Chainlink tick handler will then capture the price
+        at each boundary in real-time (zero extra latency — captured inline
+        as ticks arrive, not fetched retroactively).
+        """
+        if not self.rtds or not self.all_btc_instruments:
+            return
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        registered = 0
+        for inst in self.all_btc_instruments:
+            ts = inst['market_timestamp']
+            # Register boundaries that are within the next 30 minutes
+            if -60 <= (ts - now_ts) <= 1800:
+                self.rtds.register_boundary(ts)
+                registered += 1
+        if registered:
+            logger.info(f"✓ Pre-registered {registered} boundary snapshots with RTDS")
+
     def _seconds_to_next_15min_boundary(self) -> float:
         now_ts = datetime.now(timezone.utc).timestamp()
         next_boundary = (math.floor(now_ts / MARKET_INTERVAL_SECONDS) + 1) * MARKET_INTERVAL_SECONDS
@@ -452,6 +539,13 @@ class IntegratedBTCStrategy(Strategy):
 
         self._data_sources_initialized = True
 
+    async def _get_aiohttp_session(self):
+        """Return a persistent aiohttp session (creates one if needed)."""
+        import aiohttp
+        if self._aiohttp_session is None or self._aiohttp_session.closed:
+            self._aiohttp_session = aiohttp.ClientSession()
+        return self._aiohttp_session
+
     async def _preseed_vol_estimator(self):
         """
         V3.1 FIX: Fetch recent Coinbase 1-min candles to warm up vol estimator
@@ -469,13 +563,13 @@ class IntegratedBTCStrategy(Strategy):
         params = {"granularity": 60}  # 1-min candles, returns last 300 by default
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status != 200:
-                        logger.warning(f"Coinbase candles API returned {resp.status}")
-                        return
+            session = await self._get_aiohttp_session()
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Coinbase candles API returned {resp.status}")
+                    return
 
-                    candles = await resp.json()
+                candles = await resp.json()
 
             if not candles or not isinstance(candles, list):
                 logger.warning("No candle data returned from Coinbase")
@@ -485,19 +579,22 @@ class IntegratedBTCStrategy(Strategy):
             # Sort oldest-first so vol estimator sees them in chronological order
             candles.sort(key=lambda c: c[0])
 
-            fed = 0
+            # Build (timestamp, price) list for preseed
+            # Uses preseed_historical() to properly insert bars even if RTDS
+            # has already set _last_bar_time to the current minute
+            price_pairs = []
             for candle in candles:
                 try:
                     ts, low, high, open_p, close, volume = candle
-                    price = float(close)
-                    self.vol_estimator.add_price(price, float(ts))
-                    fed += 1
+                    price_pairs.append((float(ts), float(close)))
                 except (ValueError, IndexError, TypeError):
                     continue
 
+            self.vol_estimator.preseed_historical(price_pairs)
+
             vol = self.vol_estimator.get_vol(VOL_METHOD)
             logger.info(
-                f"✓ Vol estimator pre-seeded: {fed} candles → "
+                f"✓ Vol estimator pre-seeded: {len(price_pairs)} candles → "
                 f"RV={vol.annualized_vol:.1%} ({vol.method}), "
                 f"confidence={vol.confidence:.0%}"
             )
@@ -524,22 +621,28 @@ class IntegratedBTCStrategy(Strategy):
                 await self._coinbase_source.disconnect()
             except Exception:
                 pass
+        if self._aiohttp_session and not self._aiohttp_session.closed:
+            try:
+                await self._aiohttp_session.close()
+            except Exception:
+                pass
+            self._aiohttp_session = None
         self._data_sources_initialized = False
 
     async def _refresh_cached_data(self):
         """
-        V3.1: Fetch BTC spot + sentiment, cache thread-safely.
-        Priority: RTDS Chainlink (settlement oracle) > RTDS Binance > Coinbase (fallback)
+        V3.2: Fetch BTC spot + funding CONCURRENTLY.
+        Sentiment (F&G) is now handled autonomously by a background thread.
+        Each source has its own 5s timeout so one dead API can't block others.
         """
         spot = None
-        sentiment = None
-        sentiment_class = None
 
-        # V3.1: Prefer RTDS Chainlink (THE settlement oracle) over Coinbase
+        # RTDS Chainlink — in-memory, instant
         if self.rtds and self.rtds.chainlink_btc_price > 0 and self.rtds.chainlink_age_ms < 30000:
             spot = self.rtds.chainlink_btc_price
             # Log divergence if significant
-            if self.rtds.binance_btc_price > 0:
+            # V3.4 FIX: Check Binance staleness before logging divergence
+            if self.rtds.binance_btc_price > 0 and self.rtds.binance_age_ms < 60000:
                 div = self.rtds.get_divergence()
                 if div.is_significant:
                     logger.info(
@@ -547,38 +650,49 @@ class IntegratedBTCStrategy(Strategy):
                         f"Chainlink=${div.chainlink_price:,.2f} ({div.divergence_bps:+.1f}bps) "
                         f"→ {div.direction}"
                     )
-        elif self._coinbase_source:
+        elif self.rtds and self.rtds.binance_btc_price > 0 and self.rtds.binance_age_ms < 60000:
+            # V3.2: RTDS Binance as intermediate fallback (Chainlink feed may be silent)
+            spot = self.rtds.binance_btc_price
+            
+        # Concurrent I/O fetches
+        async def _fetch_coinbase():
+            if spot is not None or not self._coinbase_source:
+                return None
             try:
-                coinbase_spot = await self._coinbase_source.get_current_price()
-                if coinbase_spot:
-                    spot = float(coinbase_spot)
-                    # Feed vol estimator from Coinbase fallback
-                    self.vol_estimator.add_price(spot)
-            except Exception as e:
-                logger.debug(f"Coinbase refresh failed: {e}")
+                result = await asyncio.wait_for(
+                    self._coinbase_source.get_current_price(), timeout=5.0
+                )
+                if result:
+                    price = float(result)
+                    self.vol_estimator.add_price(price)
+                    return price
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.debug(f"Coinbase refresh error: {e}")
+            return None
 
-        if self._news_source:
+        async def _fetch_funding():
+            if not self.funding_filter or not self.funding_filter.should_update():
+                return
             try:
-                fg = await self._news_source.get_fear_greed_index()
-                if fg and "value" in fg:
-                    sentiment = float(fg["value"])
-                    sentiment_class = fg.get("classification", "")
-            except Exception as e:
-                logger.debug(f"Sentiment refresh failed: {e}")
+                await asyncio.wait_for(
+                    self.funding_filter.update(), timeout=5.0
+                )
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.debug(f"Funding update error: {e}")
 
-        # V3.1: Update funding rate periodically
-        if self.funding_filter and self.funding_filter.should_update():
-            try:
-                self.funding_filter.update_sync()
-            except Exception as e:
-                logger.debug(f"Funding rate update failed: {e}")
+        results = await asyncio.gather(
+            _fetch_coinbase(),
+            _fetch_funding(),
+            return_exceptions=True,
+        )
+
+        coinbase_price = results[0] if not isinstance(results[0], Exception) else None
 
         with self._cache_lock:
             if spot is not None:
                 self._cached_spot_price = spot
-            if sentiment is not None:
-                self._cached_sentiment = sentiment
-                self._cached_sentiment_class = sentiment_class
+            elif coinbase_price is not None:
+                self._cached_spot_price = coinbase_price
 
     def _get_cached_data(self) -> dict:
         """Read cached market data (thread-safe). Called from trading decision."""
@@ -646,6 +760,11 @@ class IntegratedBTCStrategy(Strategy):
             self.rtds.start_background()
             logger.info("✓ RTDS connector started")
 
+            # V3.3: Pre-register all upcoming 15-min boundaries so the
+            # Chainlink tick handler captures the price in real-time
+            # (zero extra latency — captured inline as ticks arrive).
+            self._register_upcoming_boundaries()
+
         # V3.1: Initial funding rate fetch
         if self.funding_filter:
             try:
@@ -660,6 +779,9 @@ class IntegratedBTCStrategy(Strategy):
 
         if self.grafana_exporter:
             threading.Thread(target=self._start_grafana_sync, daemon=True).start()
+            
+        # V3.2 FIX: Dedicated background thread for News polling
+        self.news_thread = self._start_news_polling()
 
         logger.info(f"V3.1 active — {len(self.price_history)} price points cached")
 
@@ -821,8 +943,56 @@ class IntegratedBTCStrategy(Strategy):
         # V3: Reset strike for new market
         self._btc_strike_price = None
         self._strike_recorded = False
+        self._strike_defer_start = None
+        self._strike_source = ""
         self._active_entry = None
         self._late_window_traded = False
+
+        # V3.3: Set strike from pre-captured boundary snapshot (zero latency).
+        # The RTDS tick handler has been capturing Chainlink prices at pre-registered
+        # boundaries in real-time. Check for a snapshot first, then fall back.
+        if self.rtds:
+            # Try pre-captured snapshot (captured inline by tick handler)
+            snap_price = self.rtds.get_boundary_price(next_market['market_timestamp'])
+            if snap_price:
+                detail = self.rtds.get_boundary_detail(next_market['market_timestamp'])
+                delta_ms = detail[1] if detail else 0
+                self._btc_strike_price = snap_price
+                self._strike_recorded = True
+                self._strike_source = "chainlink_boundary"
+                logger.info(
+                    f"📌 Strike from boundary snapshot: "
+                    f"${snap_price:,.2f} (Δ={delta_ms}ms from boundary)"
+                )
+            else:
+                # Fall back to deque scan (e.g. boundary just happened)
+                cl_strike = self.rtds.get_chainlink_price_at(
+                    float(next_market['market_timestamp']),
+                    max_staleness_ms=10000,
+                )
+                if cl_strike:
+                    self._btc_strike_price = cl_strike
+                    self._strike_recorded = True
+                    self._strike_source = "chainlink_boundary"
+                    logger.info(
+                        f"📌 Strike from Chainlink at interval start: "
+                        f"${cl_strike:,.2f}"
+                    )
+
+            # Pre-register the NEXT boundary for real-time capture
+            next_boundary_ts = next_market['market_timestamp'] + MARKET_INTERVAL_SECONDS
+            self.rtds.register_boundary(next_boundary_ts)
+
+        if not self._strike_recorded:
+            # Chainlink boundary tick not available — try Gamma API (rare, startup edge case)
+            ptb = fetch_price_to_beat(next_market['slug'])
+            if ptb:
+                self._btc_strike_price = ptb
+                self._strike_recorded = True
+                self._strike_source = "ptb"
+                logger.info(
+                    f"📌 Strike from Gamma API priceToBeat: ${ptb:,.2f}"
+                )
 
         logger.info(f"  Trade timer reset — will trade after {QUOTE_STABILITY_REQUIRED} stable ticks")
 
@@ -976,8 +1146,44 @@ class IntegratedBTCStrategy(Strategy):
                     # V3: Reset strike
                     self._btc_strike_price = None
                     self._strike_recorded = False
+                    self._strike_defer_start = None
+                    self._strike_source = ""
                     self._active_entry = None
                     self._late_window_traded = False
+
+                    # V3.3: Set strike from boundary snapshot or Chainlink.
+                    if (self.current_instrument_index >= 0 and
+                            self.current_instrument_index < len(self.all_btc_instruments)):
+                        mkt = self.all_btc_instruments[self.current_instrument_index]
+                        if self.rtds:
+                            snap_price = self.rtds.get_boundary_price(mkt['market_timestamp'])
+                            if snap_price:
+                                detail = self.rtds.get_boundary_detail(mkt['market_timestamp'])
+                                delta_ms = detail[1] if detail else 0
+                                self._btc_strike_price = snap_price
+                                self._strike_recorded = True
+                                self._strike_source = "chainlink_boundary"
+                                logger.info(
+                                    f"📌 Strike from boundary snapshot: "
+                                    f"${snap_price:,.2f} (Δ={delta_ms}ms)"
+                                )
+                            else:
+                                cl_strike = self.rtds.get_chainlink_price_at(
+                                    float(mkt['market_timestamp']),
+                                    max_staleness_ms=10000,
+                                )
+                                if cl_strike:
+                                    self._btc_strike_price = cl_strike
+                                    self._strike_recorded = True
+                                    self._strike_source = "chainlink_boundary"
+                                    logger.info(
+                                        f"📌 Strike from Chainlink at interval start: "
+                                        f"${cl_strike:,.2f}"
+                                    )
+                            # Register next boundary
+                            next_ts = mkt['market_timestamp'] + MARKET_INTERVAL_SECONDS
+                            self.rtds.register_boundary(next_ts)
+
                     logger.info("  ✓ MARKET OPEN — waiting for stable quotes")
                 else:
                     self._switch_to_next_market()
@@ -990,11 +1196,79 @@ class IntegratedBTCStrategy(Strategy):
             try:
                 await self._refresh_cached_data()
 
-                # Record strike on first successful fetch of each market
-                if not self._strike_recorded and self._cached_spot_price:
-                    self._btc_strike_price = self._cached_spot_price
-                    self._strike_recorded = True
-                    logger.info(f"📌 BTC Strike recorded: ${self._btc_strike_price:,.2f}")
+                # V3.3: Record strike if not yet set.
+                # Priority: boundary snapshot > Chainlink deque > current Chainlink
+                # > defer 30s > Gamma API priceToBeat > Binance > Coinbase
+                if not self._strike_recorded:
+                    strike_set = False
+                    mkt = None
+                    if 0 <= self.current_instrument_index < len(self.all_btc_instruments):
+                        mkt = self.all_btc_instruments[self.current_instrument_index]
+
+                    # 1. Boundary snapshot (pre-captured in tick handler, zero latency)
+                    if not strike_set and mkt and self.rtds:
+                        snap = self.rtds.get_boundary_price(mkt['market_timestamp'])
+                        if snap:
+                            detail = self.rtds.get_boundary_detail(mkt['market_timestamp'])
+                            delta_ms = detail[1] if detail else 0
+                            self._btc_strike_price = snap
+                            self._strike_recorded = True
+                            self._strike_defer_start = None
+                            self._strike_source = "chainlink_boundary"
+                            logger.info(
+                                f"📌 Strike from boundary snapshot: "
+                                f"${snap:,.2f} (Δ={delta_ms}ms)"
+                            )
+                            strike_set = True
+
+                    # 2. Chainlink deque scan
+                    if not strike_set and mkt and self.rtds:
+                        cl_strike = self.rtds.get_chainlink_price_at(
+                            float(mkt['market_timestamp']),
+                            max_staleness_ms=10000,
+                        )
+                        if cl_strike:
+                            self._btc_strike_price = cl_strike
+                            self._strike_recorded = True
+                            self._strike_defer_start = None
+                            self._strike_source = "chainlink_boundary"
+                            logger.info(
+                                f"📌 Strike from Chainlink at interval start: "
+                                f"${cl_strike:,.2f}"
+                            )
+                            strike_set = True
+
+                    # 3. Gamma API priceToBeat (authoritative settlement reference)
+                    # CRITICAL: Try this BEFORE falling back to current Chainlink.
+                    # On cold start, current Chainlink ≠ settlement reference because
+                    # we missed the boundary tick. priceToBeat IS the real strike.
+                    if not strike_set and mkt:
+                        ptb = fetch_price_to_beat(mkt['slug'])
+                        if ptb:
+                            self._btc_strike_price = ptb
+                            self._strike_recorded = True
+                            self._strike_defer_start = None
+                            self._strike_source = "ptb"
+                            logger.info(
+                                f"📌 Strike from Gamma API priceToBeat: ${ptb:,.2f}"
+                            )
+                            strike_set = True
+
+                    # V3.4 FIX: Never fall back to unverified strike prices (chainlink_current, timeout, coinbase).
+                    # If we don't have a verified boundary tick or Gamma API priceToBeat, we must wait.
+                    # Trading on a phantom strike is catastrophic.
+                    if not strike_set:
+                        if self._strike_defer_start is None:
+                            self._strike_defer_start = time.time()
+                        defer_elapsed = time.time() - self._strike_defer_start
+                        
+                        # Throttle log to every 30s
+                        if getattr(self, "_last_defer_log", 0) < time.time() - 25:
+                            logger.debug(
+                                f"Strike deferred — waiting for verified boundary/Gamma API "
+                                f"({defer_elapsed:.0f}s elapsed)"
+                            )
+                            self._last_defer_log = time.time()
 
             except Exception as e:
                 logger.debug(f"Cache refresh error: {e}")
@@ -1038,17 +1312,13 @@ class IntegratedBTCStrategy(Strategy):
                     if self._stable_tick_count >= QUOTE_STABILITY_REQUIRED:
                         self._market_stable = True
                         logger.info(f"✓ Market STABLE after {QUOTE_STABILITY_REQUIRED} valid ticks")
-                    else:
-                        return
-                else:
-                    self._stable_tick_count = 0
-                    return
+                return
 
             if self._waiting_for_market_open:
                 return
 
-            if (self.current_instrument_index < 0 or
-                    self.current_instrument_index >= len(self.all_btc_instruments)):
+            if self.current_instrument_index < 0 or \
+                    self.current_instrument_index >= len(self.all_btc_instruments):
                 return
 
             current_market = self.all_btc_instruments[self.current_instrument_index]
@@ -1064,22 +1334,32 @@ class IntegratedBTCStrategy(Strategy):
             seconds_into_sub_interval = elapsed_secs % MARKET_INTERVAL_SECONDS
 
             # Early window trade trigger
+            # Evaluates continuously between TRADE_WINDOW_START_SEC and TRADE_WINDOW_END_SEC
+            # Locks out only AFTER a successful execution or decision has been recorded
             if (TRADE_WINDOW_START_SEC <= seconds_into_sub_interval < TRADE_WINDOW_END_SEC
-                    and trade_key != self.last_trade_time):
-                self.last_trade_time = trade_key
-                self._retry_count_this_window = 0
+                    and trade_key != self.last_trade_time 
+                    and self._btc_strike_price is not None):
 
-                logger.info("=" * 80)
-                logger.info(f"🎯 EARLY-WINDOW TRADE: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
-                logger.info(f"   Market: {current_market['slug']}")
-                logger.info(
-                    f"   Sub-interval #{sub_interval} ({seconds_into_sub_interval:.1f}s in = {seconds_into_sub_interval / 60:.1f} min)")
-                logger.info(
-                    f"   YES Price: ${float(mid_price):,.4f} | Bid: ${float(bid_decimal):,.4f} | Ask: ${float(ask_decimal):,.4f}")
-                logger.info(f"   Price history: {len(self.price_history)} points")
-                logger.info("=" * 80)
+                # We don't lock `self.last_trade_time` here yet! 
+                # We only lock it if `_make_trading_decision_sync` actually executes a trade.
+                # However we do want to ratelimit the logs + evaluations so we don't spam the CPU 
+                # 50 times a second. We'll evaluate once every 5 seconds.
+                
+                # Use a throttling key for evaluations
+                throttle_key = f"{sub_interval}_{int(seconds_into_sub_interval // 5)}"
+                if getattr(self, "_last_eval_throttle", None) != throttle_key:
+                    self._last_eval_throttle = throttle_key
 
-                self.run_in_executor(lambda: self._make_trading_decision_sync(float(mid_price)))
+                    logger.info("=" * 80)
+                    logger.info(f"🔎 CONTINUOUS EVALUATION: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                    logger.info(f"   Market: {current_market['slug']}")
+                    logger.info(
+                        f"   Sub-interval #{sub_interval} ({seconds_into_sub_interval:.1f}s in = {seconds_into_sub_interval / 60:.1f} min)")
+                    logger.info(
+                        f"   YES Price: ${float(mid_price):,.4f} | Bid: ${float(bid_decimal):,.4f} | Ask: ${float(ask_decimal):,.4f}")
+                    logger.info("=" * 80)
+
+                    self.run_in_executor(lambda: self._make_trading_decision_sync(float(mid_price), trade_key))
 
             # V3.1: Late-window Chainlink strategy
             # At T-15s through T-0s, use Chainlink settlement oracle for high-confidence trades
@@ -1116,13 +1396,13 @@ class IntegratedBTCStrategy(Strategy):
     # Trading decision (V3: Binary Option Model)
     # ------------------------------------------------------------------
 
-    def _make_trading_decision_sync(self, current_price):
+    def _make_trading_decision_sync(self, current_price, trade_key=None):
         """Sync wrapper — runs in executor thread."""
         price_decimal = Decimal(str(current_price))
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(self._make_trading_decision(price_decimal))
+            loop.run_until_complete(self._make_trading_decision(price_decimal, trade_key))
         finally:
             loop.close()
 
@@ -1184,7 +1464,7 @@ class IntegratedBTCStrategy(Strategy):
             await self._place_limit_order(mock_signal, POSITION_SIZE_USD,
                                           limit_price, direction)
 
-    async def _make_trading_decision(self, current_price: Decimal):
+    async def _make_trading_decision(self, current_price: Decimal, trade_key=None):
         """
         V3: Quantitative trading decision using binary option pricing.
 
@@ -1228,8 +1508,15 @@ class IntegratedBTCStrategy(Strategy):
 
         # Step 2: Check if we can run the quant model
         if btc_spot is None or self._btc_strike_price is None:
-            logger.warning(f"No BTC spot or strike — falling back to heuristic signals")
-            await self._make_trading_decision_heuristic(current_price, cached, is_simulation)
+            if is_simulation:
+                logger.warning(f"No BTC spot or strike — falling back to heuristic signals (SIMULATION)")
+                await self._make_trading_decision_heuristic(current_price, cached, is_simulation, trade_key)
+            else:
+                logger.warning(
+                    f"No BTC spot or strike — SKIPPING trade (live mode requires quant model). "
+                    f"spot={'$'+f'{btc_spot:,.2f}' if btc_spot else 'None'}, "
+                    f"strike={'$'+f'{self._btc_strike_price:,.2f}' if self._btc_strike_price else 'None'}"
+                )
             return
 
         # Step 3: Calculate time remaining
@@ -1239,6 +1526,19 @@ class IntegratedBTCStrategy(Strategy):
         time_remaining_min = max(0, (end_ts - now_ts) / 60.0)
 
         logger.info(f"BTC: spot=${btc_spot:,.2f}, strike=${self._btc_strike_price:,.2f}, T={time_remaining_min:.1f}min")
+
+        # V3.2: Log strike source for diagnostics
+        if self.rtds:
+            cl_at_start = self.rtds.get_chainlink_price_at(
+                float(current_market['market_timestamp']),
+                max_staleness_ms=10000,
+            )
+            if cl_at_start and abs(cl_at_start - self._btc_strike_price) > 0.01:
+                delta_bps = (self._btc_strike_price - cl_at_start) / cl_at_start * 10000
+                logger.warning(
+                    f"  ⚠ Strike drift: using ${self._btc_strike_price:,.2f}, "
+                    f"Chainlink@start was ${cl_at_start:,.2f} (Δ={delta_bps:+.1f}bps)"
+                )
 
         # Step 4: Get YES/NO market prices
         yes_price = float(current_price)
@@ -1254,11 +1554,14 @@ class IntegratedBTCStrategy(Strategy):
 
         # Step 5: Run mispricing detector (THE CORE QUANT SIGNAL)
         # V3.1: Compute vol skew + pass funding bias
-        vol_skew = BinaryOptionPricer.estimate_btc_vol_skew(
-            btc_spot, self._btc_strike_price,
-            self.vol_estimator.get_vol(VOL_METHOD).annualized_vol,
-            time_remaining_min,
-        )
+        # V3.4 FIX: Pass `vol_skew` from genuine Deribit data instead of synthetic formula
+        vol_skew = 0.0
+        if getattr(self, "deribit_pcr", None) and self.deribit_pcr._cached_result:
+            pcr = self.deribit_pcr._cached_result.get("short_pcr", 1.0)
+            # PCR > 1 (puts expensive) -> negative skew. 
+            # e.g. PCR = 1.2 -> skew = -0.02
+            vol_skew = -0.10 * (pcr - 1.0)
+            vol_skew = max(-0.10, min(0.05, vol_skew))
 
         signal = self.mispricing_detector.detect(
             yes_market_price=yes_price,
@@ -1271,6 +1574,8 @@ class IntegratedBTCStrategy(Strategy):
             # V3.1: Additional overlays
             vol_skew=vol_skew,
             funding_bias=funding_bias,
+            # V3.4: Exact market end time
+            market_end_time=getattr(self, "next_switch_time", None),
         )
 
         if not signal.is_tradeable:
@@ -1298,6 +1603,10 @@ class IntegratedBTCStrategy(Strategy):
             f"(of {len(old_signals)} signals)"
         )
 
+        # Step 7b: Orderbook hard block removed (Anomaly 9 fix)
+        # Filtering directionally correct signals based on extreme orderbook imbalance 
+        # causes too many false negatives. The model's edge should override queue-based dynamics.
+
         # Step 8: Decision — trade if model + confirmations align
         if contradicting > confirming and signal.confidence < 0.6:
             logger.info(
@@ -1315,33 +1624,17 @@ class IntegratedBTCStrategy(Strategy):
             direction = "short"
             logger.info(f"📉 MODEL SAYS: BUY NO (edge=${signal.edge:+.4f}, net_EV=${signal.net_expected_pnl:+.4f})")
 
-        logger.info(
-            f"  Vol: RV={signal.realized_vol:.0%}, IV={signal.implied_vol:.0%}, spread={signal.vol_spread:+.0%}")
-        logger.info(f"  Greeks: Δ={signal.delta:.6f}, Γ={signal.gamma:.6f}, Θ={signal.theta_per_min:.6f}/min")
-
-        # Step 10: Risk engine
-        is_valid, error = self.risk_engine.validate_new_position(
-            size=POSITION_SIZE_USD,
-            direction=direction,
-            current_price=current_price,
-        )
-        if not is_valid:
-            logger.warning(f"Risk engine blocked: {error}")
+        # Step 10: Liquidity check
+        last_bid, last_ask = self._last_bid_ask if self._last_bid_ask else (Decimal("0"), Decimal("0"))
+        MIN_LIQUIDITY = Decimal("0.02")
+        if direction == "long" and last_ask <= MIN_LIQUIDITY:
+            logger.warning(f"⚠ No liquidity for BUY YES: ask=${float(last_ask):.4f}")
+            self.last_trade_time = -1
             return
-
-        # Step 11: Liquidity guard
-        last_tick = getattr(self, '_last_bid_ask', None)
-        if last_tick:
-            last_bid, last_ask = last_tick
-            MIN_LIQUIDITY = Decimal("0.02")
-            if direction == "long" and last_ask <= MIN_LIQUIDITY:
-                logger.warning(f"⚠ No liquidity for BUY YES: ask=${float(last_ask):.4f}")
-                self.last_trade_time = -1
-                return
-            if direction == "short" and last_bid <= MIN_LIQUIDITY:
-                logger.warning(f"⚠ No liquidity for BUY NO: bid=${float(last_bid):.4f}")
-                self.last_trade_time = -1
-                return
+        if direction == "short" and last_bid <= MIN_LIQUIDITY:
+            logger.warning(f"⚠ No liquidity for BUY NO: bid=${float(last_bid):.4f}")
+            self.last_trade_time = -1
+            return
 
         # Step 12: Execute
         logger.info(f"Position size: ${POSITION_SIZE_USD} | Direction: {direction.upper()}")
@@ -1352,7 +1645,14 @@ class IntegratedBTCStrategy(Strategy):
             confidence=signal.confidence,
         )
 
-        if is_simulation:
+        # Lock out future early-window trades for this specific market sub-interval!
+        # This prevents the bot from spamming trades on every tick once an edge is found.
+        if trade_key is not None:
+            self.last_trade_time = trade_key
+
+        if is_simulation or SHADOW_MODE_ONLY:
+            if SHADOW_MODE_ONLY and not is_simulation:
+                logger.warning(f"👻 [SHADOW MODE] Paper trading {direction.upper()} | Size: ${POSITION_SIZE_USD}")
             await self._record_paper_trade(mock_signal, POSITION_SIZE_USD, current_price, direction)
         else:
             if USE_LIMIT_ORDERS:
@@ -1396,7 +1696,7 @@ class IntegratedBTCStrategy(Strategy):
 
         return metadata
 
-    async def _make_trading_decision_heuristic(self, current_price, cached, is_simulation):
+    async def _make_trading_decision_heuristic(self, current_price, cached, is_simulation, trade_key=None):
         """Fallback to V2 fusion-based logic when Coinbase data is unavailable."""
         metadata = self._build_metadata(cached, current_price)
 
@@ -1438,6 +1738,9 @@ class IntegratedBTCStrategy(Strategy):
             logger.warning(f"Risk engine blocked: {error}")
             return
 
+        if trade_key is not None:
+            self.last_trade_time = trade_key
+
         if is_simulation:
             await self._record_paper_trade(fused, POSITION_SIZE_USD, current_price, direction)
         else:
@@ -1470,14 +1773,9 @@ class IntegratedBTCStrategy(Strategy):
         if spike_signal:
             signals.append(spike_signal)
 
-        if 'sentiment_score' in processed_metadata:
-            sentiment_signal = self.sentiment_processor.process(
-                current_price=current_price,
-                historical_prices=self.price_history,
-                metadata=processed_metadata,
-            )
-            if sentiment_signal:
-                signals.append(sentiment_signal)
+        # V3.4 FIX: Removed SentimentProcessor (Fear & Greed) from intraday
+        # signal path. A daily indicator provides zero alpha for 15-minute
+        # binary options and only adds a permanent structural bias.
 
         if 'spot_price' in processed_metadata:
             divergence_signal = self.divergence_processor.process(
@@ -1650,11 +1948,14 @@ class IntegratedBTCStrategy(Strategy):
             # Clamp
             limit_price = max(Decimal("0.01"), min(Decimal("0.99"), limit_price))
 
-            # Calculate token quantity
+            # Calculate token quantity from position size
             token_qty = float(position_size / limit_price)
             precision = instrument.size_precision
             token_qty = round(token_qty, precision)
-            token_qty = max(token_qty, 5.0)
+
+            # Use exchange minimum, NOT hardcoded 5.0
+            min_qty = float(getattr(instrument, 'min_quantity', None) or Decimal("0.01"))
+            token_qty = max(token_qty, min_qty)
 
             logger.info("=" * 80)
             logger.info(f"LIMIT ORDER @ BID (MAKER, 0% FEE)")
@@ -1747,9 +2048,10 @@ class IntegratedBTCStrategy(Strategy):
             trade_price = float(current_price)
             max_usd_amount = float(position_size)
             precision = instrument.size_precision
-            min_qty_val = float(getattr(instrument, 'min_quantity', None) or 5.0)
-            token_qty = max(min_qty_val, 5.0)
+            min_qty_val = float(getattr(instrument, 'min_quantity', None) or Decimal("0.01"))
+            token_qty = max_usd_amount / trade_price if trade_price > 0 else min_qty_val
             token_qty = round(token_qty, precision)
+            token_qty = max(token_qty, min_qty_val)
 
             qty = Quantity(token_qty, precision=precision)
             timestamp_ms = int(time.time() * 1000)
@@ -1861,12 +2163,57 @@ class IntegratedBTCStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def _start_grafana_sync(self):
+        """Start Grafana exporter in a dedicated event loop that stays alive."""
         try:
+            self._grafana_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._grafana_loop)
+            self._grafana_loop.run_until_complete(self.grafana_exporter.start())
+            # Keep loop alive so the _update_loop task continues running
+            self._grafana_loop.run_forever()
+        except Exception as e:
+            logger.error(f"Grafana exporter stopped: {e}")
+        finally:
+            try:
+                self._grafana_loop.close()
+            except Exception:
+                pass
+
+    def _start_news_polling(self):
+        """Start news/sentiment polling in a dedicated background thread."""
+        def _run():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            loop.run_until_complete(self.grafana_exporter.start())
-        except Exception as e:
-            logger.error(f"Failed to start Grafana: {e}")
+            try:
+                loop.run_until_complete(self._news_poll_loop())
+            except Exception as e:
+                logger.error(f"News polling thread error: {e}")
+            finally:
+                loop.close()
+
+        t = threading.Thread(target=_run, daemon=True, name="news-poller")
+        t.start()
+        logger.info("News/sentiment poller started in background thread")
+        return t
+
+    async def _news_poll_loop(self):
+        """Poll sentiment every 60s in its own thread/loop."""
+        from data_sources.news_social.adapter import NewsSocialDataSource
+        news_src = NewsSocialDataSource()
+        await news_src.connect()
+
+        while True:
+            try:
+                fg = await asyncio.wait_for(
+                    news_src.get_fear_greed_index(), timeout=8.0
+                )
+                if fg and "value" in fg:
+                    with self._cache_lock:
+                        self._cached_sentiment = float(fg["value"])
+                        self._cached_sentiment_class = fg.get("classification", "")
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.debug(f"News poll error: {e}")
+
+            await asyncio.sleep(60)  # F&G only updates daily, 60s is plenty
 
     def on_stop(self):
         logger.info("Integrated BTC strategy V3.1 stopped")
@@ -1899,11 +2246,31 @@ class IntegratedBTCStrategy(Strategy):
 
         if self.funding_filter:
             logger.info(f"Funding filter: {self.funding_filter.get_stats()}")
+            self.funding_filter.close()
+
+        # Clean up persistent HTTP sessions
+        global _gamma_session
+        if _gamma_session is not None:
+            try:
+                _gamma_session.close()
+            except Exception:
+                pass
+            _gamma_session = None
 
         if self.grafana_exporter:
             try:
-                loop = asyncio.new_event_loop()
-                loop.run_until_complete(self.grafana_exporter.stop())
+                grafana_loop = getattr(self, '_grafana_loop', None)
+                if grafana_loop and grafana_loop.is_running():
+                    # Schedule stop() coroutine on the Grafana loop, then stop the loop
+                    async def _shutdown_grafana():
+                        await self.grafana_exporter.stop()
+                        grafana_loop.stop()
+                    asyncio.run_coroutine_threadsafe(_shutdown_grafana(), grafana_loop)
+                else:
+                    # Loop already stopped — just clean up
+                    loop = asyncio.new_event_loop()
+                    loop.run_until_complete(self.grafana_exporter.stop())
+                    loop.close()
             except Exception:
                 pass
 

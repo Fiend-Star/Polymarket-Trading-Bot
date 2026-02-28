@@ -220,6 +220,54 @@ class VolEstimator:
         for ts, price in prices:
             self.add_price(price, ts)
 
+    def preseed_historical(self, prices: List[Tuple[float, float]]):
+        """
+        Ingest historical price data (e.g. Coinbase candles) into the vol
+        estimator, even if RTDS ticks have already set _last_bar_time to
+        the current minute.
+
+        Saves the current state, clears the bar buffer, feeds all historical
+        data oldest-first, then re-appends any recent bars that were evicted.
+        This ensures historical bars are properly created.
+
+        Args:
+            prices: List of (timestamp_seconds, price) tuples, sorted
+                    oldest-first.
+        """
+        if not prices:
+            return
+
+        # Save current bars from RTDS that may have arrived before preseed
+        saved_bars = list(self._bars)
+
+        # Reset to allow historical ingestion
+        self._bars.clear()
+        self._last_bar_time = 0.0
+
+        # Feed historical data — bars will be created properly
+        for ts, price in prices:
+            self.add_price(price, ts)
+
+        historical_count = len(self._bars)
+
+        # Re-append any recent bars that came from RTDS (after the historical window)
+        # Only add bars that are newer than what we just ingested
+        newest_historical = self._last_bar_time
+        for bar in saved_bars:
+            if bar.timestamp > newest_historical:
+                bar_boundary = int(bar.timestamp / self.resample_interval_sec) * self.resample_interval_sec
+                if bar_boundary > self._last_bar_time:
+                    self._bars.append(bar)
+                    self._last_bar_time = bar_boundary
+
+        # Invalidate cache so next get_vol() computes fresh
+        self._cached_vol = None
+
+        logger.info(
+            f"Vol preseed: {len(prices)} candles → {historical_count} bars "
+            f"(+ {len(self._bars) - historical_count} recent RTDS bars restored)"
+        )
+
     def set_simulated_time(self, ts: Optional[float]):
         """Set simulated time for backtesting. Pass None to use real time."""
         self._simulated_time = ts
@@ -406,14 +454,12 @@ class VolEstimator:
 
     def _check_jump(self, timestamp: float, log_return: float):
         """Check if a return qualifies as a jump (> threshold σ)."""
-        vol_est = self._cached_vol
-        if vol_est is None or vol_est.vol_per_minute <= 0:
-            return
-
-        # Convert return to σ units using current vol estimate
+        # V3 FIX: Decouple jump detection from EWMA vol.
+        # Use a stable default reference so the jump threshold doesn't 
+        # scale up during crashes and blind the detector.
         interval_minutes = self.resample_interval_sec / 60.0
-        expected_std = vol_est.vol_per_minute * math.sqrt(interval_minutes)
-
+        expected_std = (self.default_vol / math.sqrt(MINUTES_PER_YEAR)) * math.sqrt(interval_minutes)
+        
         if expected_std > 0:
             sigma_units = abs(log_return) / expected_std
             if sigma_units > self.jump_threshold_sigma:
@@ -535,7 +581,8 @@ class VolEstimator:
 
         autocorr = self._compute_autocorr(log_returns) if len(log_returns) > 5 else 0.0
 
-        mean_reversion_active = abs(recent_sigma) > 1.5
+        # V3 FIX: Lowered MR threshold to 0.75σ (1.5σ is unreachable for 3-minute within-window returns)
+        mean_reversion_active = abs(recent_sigma) > 0.75
 
         return ReturnStats(
             recent_return=recent_return,

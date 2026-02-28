@@ -41,7 +41,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional, Callable, Deque
+from typing import Optional, Callable, Deque, Dict
 
 from loguru import logger
 
@@ -60,6 +60,11 @@ PING_INTERVAL_SEC = 30.0
 RECONNECT_DELAY_SEC = 5.0
 MAX_RECONNECT_ATTEMPTS = 50
 PRICE_HISTORY_MAXLEN = 500  # Last N price observations per feed
+
+# V3.2: Staleness detection — if a price feed's VALUE hasn't changed
+# in this many ms, treat it as frozen/stale (even if ticks keep arriving
+# with the same value).  Prevents phantom divergence signals.
+STALE_PRICE_THRESHOLD_MS = 30_000  # 30 seconds
 
 
 # =============================================================================
@@ -137,6 +142,12 @@ class RTDSConnector:
         self._binance_price: float = 0.0
         self._binance_ts: int = 0
 
+        # V3.2: Track when price VALUE last changed (not just when a tick arrived)
+        self._binance_last_changed_price: float = 0.0
+        self._binance_last_changed_ts: int = 0
+        self._chainlink_last_changed_price: float = 0.0
+        self._chainlink_last_changed_ts: int = 0
+
         # Price histories
         self._chainlink_ticks: Deque[PriceTick] = deque(maxlen=PRICE_HISTORY_MAXLEN)
         self._binance_ticks: Deque[PriceTick] = deque(maxlen=PRICE_HISTORY_MAXLEN)
@@ -148,6 +159,16 @@ class RTDSConnector:
         self._reconnect_count = 0
         self._total_messages = 0
         self._should_stop = False
+
+        # V3.3: Pre-scheduled boundary snapshots.
+        # The bot registers upcoming 15-min boundary timestamps.  As Chainlink
+        # ticks stream in, we capture the tick whose *source* timestamp is
+        # the tick whose *source* timestamp is closest to each boundary, looking strictly backwards.
+        self._boundary_snapshots: Dict[int, tuple] = {}
+        # How far back (in ms) to look for the last known price.
+        # With the strict `source_ts <= boundary` rule, we need a wide window (2 minutes)
+        # in case Chainlink didn't update right before the boundary.
+        self._boundary_capture_window_ms: int = 120_000  # 120 seconds
 
         # Stats
         self._chainlink_msg_count = 0
@@ -198,6 +219,49 @@ class RTDSConnector:
         return self._connected
 
     # ==================================================================
+    # Public: Boundary snapshot — pre-timed Chainlink capture
+    # ==================================================================
+
+    def register_boundary(self, boundary_timestamp_s: int) -> None:
+        """
+        Pre-register a 15-min boundary so we capture the Chainlink price
+        at that exact moment as ticks stream in.  Call this BEFORE the
+        boundary arrives (e.g. on startup or market switch).
+
+        The tick handler will automatically snapshot the closest Chainlink
+        tick within ±5 seconds of the boundary — zero extra latency.
+        """
+        with self._lock:
+            if boundary_timestamp_s not in self._boundary_snapshots:
+                self._boundary_snapshots[boundary_timestamp_s] = None
+                logger.debug(f"Registered boundary snapshot for ts={boundary_timestamp_s}")
+
+            # Cleanup: remove snapshots older than 30 minutes
+            now_s = int(time.time())
+            stale = [ts for ts in self._boundary_snapshots if now_s - ts > 1800]
+            for ts in stale:
+                del self._boundary_snapshots[ts]
+
+    def get_boundary_price(self, boundary_timestamp_s: int) -> Optional[float]:
+        """
+        Get the Chainlink price captured at a pre-registered boundary.
+
+        Returns the price if a tick was captured within the capture window,
+        otherwise None.  This is near-zero latency — the price was stored
+        inline during tick processing, not fetched retroactively.
+        """
+        with self._lock:
+            snap = self._boundary_snapshots.get(boundary_timestamp_s)
+            if snap is not None:
+                return snap[0]  # (price, delta_ms)
+            return None
+
+    def get_boundary_detail(self, boundary_timestamp_s: int) -> Optional[tuple]:
+        """Get (price, delta_ms) for a boundary snapshot, or None."""
+        with self._lock:
+            return self._boundary_snapshots.get(boundary_timestamp_s)
+
+    # ==================================================================
     # Public: Late-window Chainlink strategy
     # ==================================================================
 
@@ -208,7 +272,7 @@ class RTDSConnector:
     ) -> LateWindowSignal:
         """
         Late-window strategy: at T-10s, compare Chainlink price vs strike.
-        
+
         At T-10 seconds, BTC direction is ~85% deterministic.
         If Chainlink shows clear direction, signal postOnly limit order
         at 0.90-0.95 on the winning side.
@@ -288,18 +352,24 @@ class RTDSConnector:
     def get_divergence(self) -> DivergenceSignal:
         """
         Compute Binance-Chainlink price divergence.
-        
+
         When Binance leads Chainlink significantly, it suggests directional
         pressure that the settlement oracle hasn't reflected yet.
         This is a simplified proxy for order flow imbalance:
         - If Binance >> Chainlink → buying pressure → BTC likely going up
         - If Binance << Chainlink → selling pressure → BTC likely going down
+
+        V3.2: Staleness guard — if either feed's VALUE hasn't changed in
+        STALE_PRICE_THRESHOLD_MS, the divergence is phantom (frozen feed)
+        and we return NEUTRAL.
         """
         with self._lock:
             bn_px = self._binance_price
             cl_px = self._chainlink_price
             bn_ts = self._binance_ts
             cl_ts = self._chainlink_ts
+            bn_changed_ts = self._binance_last_changed_ts
+            cl_changed_ts = self._chainlink_last_changed_ts
 
         if bn_px <= 0 or cl_px <= 0:
             return DivergenceSignal(
@@ -310,6 +380,25 @@ class RTDSConnector:
 
         now_ms = int(time.time() * 1000)
         staleness = max(now_ms - bn_ts, now_ms - cl_ts) if bn_ts and cl_ts else 999999
+
+        # V3.2: Staleness guard — detect frozen price feeds
+        bn_value_age = (now_ms - bn_changed_ts) if bn_changed_ts > 0 else 999999
+        cl_value_age = (now_ms - cl_changed_ts) if cl_changed_ts > 0 else 999999
+
+        if bn_value_age > STALE_PRICE_THRESHOLD_MS or cl_value_age > STALE_PRICE_THRESHOLD_MS:
+            stale_source = "Binance" if bn_value_age > cl_value_age else "Chainlink"
+            stale_age_sec = max(bn_value_age, cl_value_age) / 1000.0
+            logger.warning(
+                f"⚠ Divergence STALE: {stale_source} price unchanged for "
+                f"{stale_age_sec:.0f}s — treating as NEUTRAL"
+            )
+            signal = DivergenceSignal(
+                binance_price=bn_px, chainlink_price=cl_px,
+                divergence_bps=0.0, direction="NEUTRAL",
+                is_significant=False, staleness_ms=max(bn_value_age, cl_value_age),
+            )
+            self._last_divergence = signal
+            return signal
 
         divergence_bps = (bn_px - cl_px) / cl_px * 10000.0
 
@@ -408,19 +497,56 @@ class RTDSConnector:
                 # Subscribe to both feeds
                 await self._subscribe(ws)
 
+                # V3.3: Track if subscriptions need retry after rate-limit / validation error
+                _resub_pending = False
+                _resub_after = 0.0
+
                 # Process messages
-                async for msg in ws:
-                    if self._should_stop:
+                while not self._should_stop:
+                    try:
+                        msg = await asyncio.wait_for(ws.receive(), timeout=1.0)
+                    except TimeoutError:
+                        # Timed out waiting for message; evaluate if we need to retry subscription
+                        if _resub_pending and time.time() >= _resub_after:
+                            logger.info("RTDS: Retrying subscriptions after error cooldown (timeout)...")
+                            await self._subscribe(ws)
+                            _resub_pending = False
+                        continue
+                    except asyncio.TimeoutError:
+                        # Depending on Python version, asyncio.TimeoutError vs TimeoutError
+                        if _resub_pending and time.time() >= _resub_after:
+                            logger.info("RTDS: Retrying subscriptions after error cooldown (timeout)...")
+                            await self._subscribe(ws)
+                            _resub_pending = False
+                        continue
+
+                    if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSING):
+                        if msg.type == aiohttp.WSMsgType.ERROR:
+                            logger.error(f"RTDS WS error: {ws.exception()}")
+                        else:
+                            logger.warning(f"RTDS WS closed by server ({msg.type})")
                         break
 
                     if msg.type == aiohttp.WSMsgType.TEXT:
+                        # V3.3: Detect 429 or 400 errors on subscriptions
+                        if not _resub_pending:
+                            data_lower = msg.data.lower()
+                            if '"message"' in data_lower and ('too many' in data_lower or 'rate limit' in data_lower):
+                                logger.warning(f"RTDS: Subscription rate-limited (429) — will retry in 10s. Server replied: {msg.data}")
+                                _resub_pending = True
+                                _resub_after = time.time() + 10.0
+                            elif 'failed validation' in data_lower or 'invalid' in data_lower:
+                                logger.warning(f"RTDS: Subscription validation error (400) — will retry in 5s. Server replied: {msg.data}")
+                                _resub_pending = True
+                                _resub_after = time.time() + 5.0
+
+                        # V3.3: Retry subscriptions after rate-limit cooldown
+                        if _resub_pending and time.time() >= _resub_after:
+                            logger.info("RTDS: Retrying subscriptions after error cooldown...")
+                            await self._subscribe(ws)
+                            _resub_pending = False
+
                         self._handle_message(msg.data)
-                    elif msg.type == aiohttp.WSMsgType.ERROR:
-                        logger.error(f"RTDS WS error: {ws.exception()}")
-                        break
-                    elif msg.type == aiohttp.WSMsgType.CLOSED:
-                        logger.warning("RTDS WS closed by server")
-                        break
         finally:
             # Always clean up the session — prevents "Unclosed client session" warnings
             self._connected = False
@@ -429,34 +555,31 @@ class RTDSConnector:
                 self._session = None
 
     async def _subscribe(self, ws):
-        """Subscribe to Binance + Chainlink BTC price feeds."""
-        # Binance feed
-        binance_sub = {
+        """Subscribe to Binance + Chainlink BTC price feeds.
+
+        Chainlink subscription is unfiltered — server-side filters silently
+        drop all ticks without error. Client-side filtering in _handle_message
+        routes btc/usd ticks to the Chainlink handler.
+        """
+        # Small delay after connect to avoid immediate rate-limit
+        await asyncio.sleep(0.5)
+
+        combined_sub = {
             "action": "subscribe",
             "subscriptions": [
                 {
                     "topic": "crypto_prices",
                     "type": "update",
-                    "filters": "btcusdt",
-                }
-            ],
-        }
-        await ws.send_json(binance_sub)
-        logger.info("RTDS: Subscribed to crypto_prices (Binance btcusdt)")
-
-        # Chainlink feed — THE SETTLEMENT ORACLE
-        chainlink_sub = {
-            "action": "subscribe",
-            "subscriptions": [
+                    "filters": json.dumps({"symbol": "btcusdt"}),
+                },
                 {
                     "topic": "crypto_prices_chainlink",
-                    "type": "*",
-                    "filters": json.dumps({"symbol": "btc/usd"}),
-                }
+                    "type": "update",
+                },
             ],
         }
-        await ws.send_json(chainlink_sub)
-        logger.info("RTDS: Subscribed to crypto_prices_chainlink (btc/usd) — SETTLEMENT ORACLE")
+        await ws.send_json(combined_sub)
+        logger.info("RTDS: Subscribed to crypto_prices (btcusdt) + crypto_prices_chainlink (unfiltered)")
 
     def _handle_message(self, raw: str):
         """Parse and route an incoming RTDS message."""
@@ -467,21 +590,76 @@ class RTDSConnector:
 
         topic = data.get("topic", "")
         payload = data.get("payload")
-        msg_ts = data.get("timestamp", 0)
         self._total_messages += 1
 
-        if not payload or "value" not in payload:
+        # V3.4: Log first 2 messages for format diagnostics
+        if self._total_messages <= 2:
+            raw_preview = raw[:500] if len(raw) > 500 else raw
+            logger.info(
+                f"RTDS msg #{self._total_messages}: topic='{topic}', "
+                f"has_payload={payload is not None}, "
+                f"raw={raw_preview}"
+            )
+
+        if not payload:
+            if self._total_messages <= 20:
+                logger.debug(f"RTDS msg dropped (no payload): topic='{topic}', keys={list(data.keys())}, raw={raw}")
             return
 
-        price = float(payload["value"])
-        source_ts = int(payload.get("timestamp", msg_ts))
-        received_ts = int(time.time() * 1000)
-        latency = received_ts - source_ts if source_ts > 0 else 0
+        # RTDS delivers two formats:
+        #   1. Array: payload = {"data": [{timestamp, value}, ...], "symbol": "btcusdt"}
+        #      Used by: crypto_prices topic (both btcusdt AND btc/usd!)
+        #   2. Flat:   payload = {"value": ..., "symbol": "btc/usd", "timestamp": ..., "full_accuracy_value": ...}
+        #      Used by: crypto_prices_chainlink topic
+        #
+        # Routing:
+        #   symbol "btcusdt"  → Binance handler
+        #   symbol "btc/usd"  → Chainlink handler (regardless of topic)
+        #   topic "crypto_prices_chainlink" → Chainlink handler
+        symbol = payload.get("symbol", "").lower()
+        is_chainlink = (topic == "crypto_prices_chainlink" or "btc/usd" in symbol)
+        is_binance = ("btcusdt" in symbol and not is_chainlink)
+        has_btc = "btc" in symbol
 
-        if topic == "crypto_prices" and "btc" in payload.get("symbol", "").lower():
-            self._handle_binance_tick(price, source_ts, received_ts, latency, payload)
-        elif topic == "crypto_prices_chainlink" and "btc" in payload.get("symbol", "").lower():
-            self._handle_chainlink_tick(price, source_ts, received_ts, latency, payload)
+        tick_data = payload.get("data")
+
+        if tick_data and isinstance(tick_data, list) and len(tick_data) > 0:
+            # Array format — use the LATEST tick (last element = most recent)
+            latest = tick_data[-1]
+            price = float(latest.get("value", 0))
+            source_ts = int(latest.get("timestamp", 0))
+            received_ts = int(time.time() * 1000)
+            latency = received_ts - source_ts if source_ts > 0 else 0
+
+            tick_payload = {"symbol": symbol, "timestamp": source_ts, "value": price}
+
+            if price > 0 and has_btc:
+                if is_chainlink:
+                    self._handle_chainlink_tick(price, source_ts, received_ts, latency, tick_payload)
+                elif is_binance:
+                    self._handle_binance_tick(price, source_ts, received_ts, latency, tick_payload)
+            return
+
+        # Flat format — payload has "value" directly
+        raw_value = payload.get("value") or payload.get("price")
+        if raw_value is not None:
+            price = float(raw_value)
+            source_ts = int(payload.get("timestamp", data.get("timestamp", 0)))
+            received_ts = int(time.time() * 1000)
+            latency = received_ts - source_ts if source_ts > 0 else 0
+
+            if has_btc:
+                if is_chainlink:
+                    self._handle_chainlink_tick(price, source_ts, received_ts, latency, payload)
+                elif is_binance:
+                    self._handle_binance_tick(price, source_ts, received_ts, latency, payload)
+            return
+
+        if self._total_messages <= 20:
+            logger.debug(
+                f"RTDS msg dropped (unknown format): "
+                f"topic='{topic}', payload_keys={list(payload.keys())}"
+            )
 
     def _handle_binance_tick(self, price, source_ts, received_ts, latency, payload):
         """Process a Binance BTC price tick."""
@@ -492,6 +670,14 @@ class RTDSConnector:
         )
 
         with self._lock:
+            # V3.2: Track when price VALUE actually changes (not just new tick)
+            if price != self._binance_price:
+                self._binance_last_changed_price = price
+                self._binance_last_changed_ts = received_ts
+            elif self._binance_last_changed_ts == 0:
+                # First tick — initialize
+                self._binance_last_changed_price = price
+                self._binance_last_changed_ts = received_ts
             self._binance_price = price
             self._binance_ts = received_ts
         self._binance_ticks.append(tick)
@@ -523,8 +709,34 @@ class RTDSConnector:
         )
 
         with self._lock:
+            # V3.2: Track when price VALUE actually changes
+            if price != self._chainlink_price:
+                self._chainlink_last_changed_price = price
+                self._chainlink_last_changed_ts = received_ts
+            elif self._chainlink_last_changed_ts == 0:
+                self._chainlink_last_changed_price = price
+                self._chainlink_last_changed_ts = received_ts
             self._chainlink_price = price
             self._chainlink_ts = received_ts
+
+            # V3.3: Boundary snapshot — capture price at pre-registered boundaries
+            # in real-time as the tick arrives (zero additional latency).
+            for boundary_ts, existing in list(self._boundary_snapshots.items()):
+                boundary_ms = boundary_ts * 1000
+                
+                # V3.4: Only capture ticks that occurred AT OR BEFORE the boundary timestamp!
+                # We define a range of [0, boundary_capture_window_ms] looking backward.
+                delta_ms = boundary_ms - source_ts
+                if 0 <= delta_ms <= self._boundary_capture_window_ms:
+                    # Keep the tick with the SMALLEST delta (closest to boundary without going over)
+                    if existing is None or delta_ms < existing[1]:
+                        self._boundary_snapshots[boundary_ts] = (price, delta_ms)
+                        if existing is None:
+                            logger.info(
+                                f"⚡ Boundary snapshot: ts={boundary_ts} → "
+                                f"${price:,.2f} (Δ={delta_ms}ms)"
+                            )
+
         self._chainlink_ticks.append(tick)
         self._chainlink_msg_count += 1
 
@@ -582,3 +794,62 @@ class RTDSConnector:
     def get_recent_binance_prices(self, n: int = 60) -> list:
         """Get last N Binance price ticks."""
         return list(self._binance_ticks)[-n:]
+
+    def get_chainlink_price_at(
+        self,
+        target_timestamp_s: float,
+        max_staleness_ms: int = 5000,
+    ) -> Optional[float]:
+        """
+        Get the Chainlink BTC/USD price closest to a specific timestamp.
+
+        V3.3: Checks pre-registered boundary snapshots first (captured in
+        real-time by the tick handler with zero extra latency), then falls
+        back to scanning the tick history deque.
+
+        Args:
+            target_timestamp_s: Unix epoch seconds of the desired moment.
+            max_staleness_ms: Maximum allowed distance (ms) from the target.
+                              Returns None if no tick is close enough.
+
+        Returns:
+            The Chainlink price at (or very near) the target time, or None.
+        """
+        target_int = int(target_timestamp_s)
+
+        # V3.3: Check boundary snapshot first — captured in real-time
+        snap = self.get_boundary_detail(target_int)
+        if snap is not None:
+            price, delta_ms = snap
+            if delta_ms <= max_staleness_ms:
+                logger.debug(
+                    f"Chainlink price at target {target_int} (snapshot): "
+                    f"${price:,.2f} (Δ={delta_ms}ms from boundary)"
+                )
+                return price
+
+        # Fallback: scan tick history
+        target_ms = int(target_timestamp_s * 1000)
+        ticks = list(self._chainlink_ticks)
+        if not ticks:
+            return None
+
+        best_tick = None
+        best_delta = float("inf")
+        for tick in ticks:
+            # V3.4: The price "at" a timestamp is the most recent update <= timestamp
+            # We look strictly backward in a defining range [0, max_staleness_ms]
+            delta = target_ms - tick.source_timestamp_ms
+            if 0 <= delta <= max_staleness_ms:
+                if delta < best_delta:
+                    best_delta = delta
+                    best_tick = tick
+
+        if best_tick is None or best_delta > max_staleness_ms:
+            return None
+
+        logger.debug(
+            f"Chainlink price at target {target_timestamp_s:.0f}: "
+            f"${best_tick.price:,.2f} (Δ={best_delta}ms from boundary)"
+        )
+        return best_tick.price
