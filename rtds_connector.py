@@ -756,6 +756,11 @@ class RTDSConnector:
             except Exception as e:
                 logger.debug(f"Chainlink tick callback error: {e}")
 
+        if self._avg_latency_ms == 0.0:
+            self._avg_latency_ms = float(latency)
+        else:
+            self._avg_latency_ms = (self._avg_latency_ms * 0.99) + (latency * 0.01)
+
         # Periodic stats
         if self._chainlink_msg_count % 100 == 0:
             logger.debug(
