@@ -607,19 +607,13 @@ class RTDSConnector:
             return
 
         # RTDS delivers two formats:
-        #   1. Array: payload = {"data": [{timestamp, value}, ...], "symbol": "btcusdt"}
+        #   1. Array: payload = {"data": [{timestamp, value}, ...], "symbol": "btcusdt"} (or inside the item)
         #      Used by: crypto_prices topic (both btcusdt AND btc/usd!)
         #   2. Flat:   payload = {"value": ..., "symbol": "btc/usd", "timestamp": ..., "full_accuracy_value": ...}
         #      Used by: crypto_prices_chainlink topic
-        #
-        # Routing:
-        #   symbol "btcusdt"  → Binance handler
-        #   symbol "btc/usd"  → Chainlink handler (regardless of topic)
-        #   topic "crypto_prices_chainlink" → Chainlink handler
-        symbol = payload.get("symbol", "").lower()
-        is_chainlink = (topic == "crypto_prices_chainlink" or "btc/usd" in symbol)
-        is_binance = ("btcusdt" in symbol and not is_chainlink)
-        has_btc = "btc" in symbol
+        
+        # Default symbols from outer envelope
+        outer_symbol = payload.get("symbol", "").lower()
 
         tick_data = payload.get("data")
 
@@ -631,7 +625,14 @@ class RTDSConnector:
             received_ts = int(time.time() * 1000)
             latency = received_ts - source_ts if source_ts > 0 else 0
 
-            tick_payload = {"symbol": symbol, "timestamp": source_ts, "value": price}
+            # Some array formats bury the symbol inside the innermost item
+            inner_symbol = latest.get("symbol", "").lower() or outer_symbol
+            
+            is_chainlink = (topic == "crypto_prices_chainlink" or "btc/usd" in inner_symbol)
+            is_binance = ("btcusdt" in inner_symbol and not is_chainlink)
+            has_btc = ("btc" in inner_symbol)
+
+            tick_payload = {"symbol": inner_symbol, "timestamp": source_ts, "value": price}
 
             if price > 0 and has_btc:
                 if is_chainlink:
@@ -641,12 +642,23 @@ class RTDSConnector:
             return
 
         # Flat format — payload has "value" directly
+        is_chainlink = (topic == "crypto_prices_chainlink" or "btc/usd" in outer_symbol)
+        is_binance = ("btcusdt" in outer_symbol and not is_chainlink)
+        has_btc = ("btc" in outer_symbol)
+        
         raw_value = payload.get("value") or payload.get("price")
         if raw_value is not None:
             price = float(raw_value)
             source_ts = int(payload.get("timestamp", data.get("timestamp", 0)))
             received_ts = int(time.time() * 1000)
             latency = received_ts - source_ts if source_ts > 0 else 0
+
+            if has_btc:
+                if is_chainlink:
+                    self._handle_chainlink_tick(price, source_ts, received_ts, latency, payload)
+                elif is_binance:
+                    self._handle_binance_tick(price, source_ts, received_ts, latency, payload)
+            return
 
             if has_btc:
                 if is_chainlink:

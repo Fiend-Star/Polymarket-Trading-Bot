@@ -886,8 +886,13 @@ class IntegratedBTCStrategy(Strategy):
         for instrument in instruments:
             try:
                 if hasattr(instrument, 'info') and instrument.info:
-                    question = instrument.info.get('question', '').lower()
-                    slug = instrument.info.get('market_slug', '').lower()
+                    q_val = instrument.info.get('question')
+                    question = (q_val if q_val else '').lower()
+
+                    s_val = instrument.info.get('market_slug')
+                    e_val = instrument.info.get('event_slug')
+                    slug_raw = s_val if s_val else (e_val if e_val else '')
+                    slug = slug_raw.lower()
 
                     if ('btc' in question or 'btc' in slug) and '15m' in slug:
                         try:
@@ -935,10 +940,10 @@ class IntegratedBTCStrategy(Strategy):
                 base_inst['yes_token_id'] = None
                 seen_slugs[slug] = base_inst
 
-            if outcome_str == 'yes':
+            if outcome_str in ('yes', 'up'):
                 seen_slugs[slug]['yes_instrument_id'] = instrument.id
                 seen_slugs[slug]['yes_token_id'] = inst.get('token_id')
-            elif outcome_str == 'no':
+            elif outcome_str in ('no', 'down'):
                 seen_slugs[slug]['no_instrument_id'] = instrument.id
 
         btc_instruments = list(seen_slugs.values())
@@ -2640,10 +2645,10 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         environment="live",
         trader_id="BTC-15MIN-V31-001",
         logging=LoggingConfig(
-            log_level="ERROR",  # Silences the "Reconciling NET position" spam
+            log_level="ERROR",
             log_directory="./logs/nautilus",
             log_component_levels={
-                "IntegratedBTCStrategy": "INFO",  # Keeps the stuff you actually care about
+                "IntegratedBTCStrategy": "INFO",
             },
         ),
         data_engine=LiveDataEngineConfig(qsize=6000),
