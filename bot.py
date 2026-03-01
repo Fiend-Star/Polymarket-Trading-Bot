@@ -175,11 +175,11 @@ class OpenPosition:
     direction: str  # "long" (bought YES) or "short" (bought NO)
     entry_price: float  # Price we PAID for the token
     size_usd: float
-    actual_qty: float = 0.0  # <--- ADD THIS FIELD
     entry_time: datetime
     market_end_time: datetime
     instrument_id: object
     order_id: str
+    actual_qty: float = 0.0  # <--- ADD THIS FIELD
     resolved: bool = False
     exit_price: Optional[float] = None
     pnl: Optional[float] = None
