@@ -177,7 +177,16 @@ class RiskEngine:
             position_size = max(Decimal("0"), self.limits.max_total_exposure - current_exposure)
 
         # Ensure at least exchange minimum
-        position_size = max(position_size, Decimal("1.0"))
+        # Determine configured minimum token qty (defaults to 5 shares) and
+        # convert to USD using current_price to enforce a sensible minimum position size.
+        try:
+            import os
+            min_token_qty = Decimal(str(os.getenv('MIN_TOKEN_QTY', '5.0')))
+            min_usd = (min_token_qty * current_price) if current_price and current_price > 0 else Decimal("1.0")
+        except Exception:
+            min_usd = Decimal("1.0")
+
+        position_size = max(position_size, min_usd)
 
         logger.info(
             f"Calculated Kelly position size: ${position_size:.2f} "
@@ -213,8 +222,17 @@ class RiskEngine:
             remaining = self.limits.max_total_exposure - current_exposure
             position_size = max(Decimal("0"), remaining)
 
-        # Ensure at least the exchange minimum of $1
-        return max(position_size, Decimal("1.0"))
+        # Ensure at least the exchange minimum in USD using MIN_TOKEN_QTY
+        try:
+            import os
+            min_token_qty = Decimal(str(os.getenv('MIN_TOKEN_QTY', '5.0')))
+            # if we have access to a representative price, try to convert; otherwise default to $1
+            # We don't have a price here, so conservatively enforce $5 USD minimum
+            min_usd = min_token_qty * Decimal("1.0") if min_token_qty > 0 else Decimal("1.0")
+        except Exception:
+            min_usd = Decimal("1.0")
+
+        return max(position_size, min_usd)
 
     def add_position(
             self,

@@ -210,7 +210,7 @@ def init_redis():
 # V3.2: Fetch authoritative strike ("price to beat") from Gamma API
 # =============================================================================
 
-def fetch_price_to_beat(slug: str, timeout: float = 5.0) -> Optional[float]:
+def fetch_price_to_beat(slug: str, timeout: float = 10.0, max_retries: int = 3) -> Optional[float]:
     """
     Fetch the authoritative 'priceToBeat' for a BTC 15-min UpDown market.
 
@@ -220,38 +220,53 @@ def fetch_price_to_beat(slug: str, timeout: float = 5.0) -> Optional[float]:
 
     Path: GET /markets?slug=<slug>  →  events[0].eventMetadata.priceToBeat
     """
-    try:
-        session = _get_gamma_session()
-        r = session.get(
-            "https://gamma-api.polymarket.com/markets",
-            params={"slug": slug},
-            timeout=timeout,
-        )
-        if r.status_code != 200:
-            logger.debug(f"Gamma API returned {r.status_code} for slug={slug}")
+    session = _get_gamma_session()
+    backoff = 1.0
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = session.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={"slug": slug},
+                timeout=timeout,
+            )
+            if r.status_code != 200:
+                logger.debug(f"Gamma API returned {r.status_code} for slug={slug} (attempt {attempt})")
+                # Retry on server errors / non-200 up to max_retries
+                if attempt < max_retries:
+                    logger.info(f"Retrying fetch_price_to_beat in {backoff}s (attempt {attempt+1}/{max_retries})")
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                return None
+
+            data = r.json()
+            if not data:
+                return None
+
+            market = data[0]
+            events = market.get("events", [])
+            if not events:
+                return None
+
+            metadata = events[0].get("eventMetadata")
+            if not metadata or not isinstance(metadata, dict):
+                return None
+
+            ptb = metadata.get("priceToBeat")
+            if ptb is not None:
+                return float(ptb)
+
             return None
-
-        data = r.json()
-        if not data:
-            return None
-
-        market = data[0]
-        events = market.get("events", [])
-        if not events:
-            return None
-
-        metadata = events[0].get("eventMetadata")
-        if not metadata or not isinstance(metadata, dict):
-            return None
-
-        ptb = metadata.get("priceToBeat")
-        if ptb is not None:
-            return float(ptb)
-
-        return None
-    except Exception as e:
-        logger.debug(f"fetch_price_to_beat({slug}) failed: {e}")
-        return None
+        except Exception as e:
+            # Handle request-level failures with exponential backoff
+            logger.debug(f"fetch_price_to_beat({slug}) attempt {attempt} failed: {e}")
+            if attempt < max_retries:
+                logger.info(f"fetch_price_to_beat retry in {backoff}s (attempt {attempt+1}/{max_retries})")
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            else:
+                return None
 
 
 # =============================================================================
@@ -1968,13 +1983,30 @@ class IntegratedBTCStrategy(Strategy):
             limit_price = max(Decimal("0.01"), min(Decimal("0.99"), limit_price))
 
             # Calculate token quantity from position size
-            token_qty = float(position_size / limit_price)
+            token_qty = 0.0
+            try:
+                token_qty = float(position_size / limit_price)
+            except Exception:
+                token_qty = 0.0
+
             precision = instrument.size_precision
+
+            # Determine exchange-declared min quantity (if present)
+            min_qty_val = float(getattr(instrument, 'min_quantity', None) or Decimal("0.01"))
+
+            # Enforce a hard minimum token quantity (Polymarket enforces min shares, often 5)
+            enforced_min_token_qty = float(os.getenv("MIN_TOKEN_QTY", "5.0"))
+            final_min_qty = max(min_qty_val, enforced_min_token_qty)
+
+            # Ensure quantity respects minimums and precision
+            token_qty = max(token_qty, final_min_qty)
             token_qty = round(token_qty, precision)
 
-            # Use exchange minimum, NOT hardcoded 5.0
-            min_qty = float(getattr(instrument, 'min_quantity', None) or Decimal("0.01"))
-            token_qty = max(token_qty, min_qty)
+            # Recompute estimated USD position size based on enforced token quantity
+            try:
+                estimated_cost = float(Decimal(str(token_qty)) * limit_price)
+            except Exception:
+                estimated_cost = float(position_size)
 
             logger.info("=" * 80)
             logger.info(f"LIMIT ORDER @ BID (MAKER, 0% FEE)")
@@ -2006,17 +2038,17 @@ class IntegratedBTCStrategy(Strategy):
             logger.info(f"  Direction: {trade_label}")
             logger.info(f"  Limit Price: ${float(limit_price):.4f} (at bid)")
             logger.info(f"  Quantity: {token_qty:.2f}")
-            logger.info(f"  Estimated Cost: ~${float(position_size):.2f}")
+            logger.info(f"  Estimated Cost: ~${float(estimated_cost):.2f}")
             logger.info(f"  Fee: 0% (maker — resting at bid)")
             logger.info("=" * 80)
 
-            # Track position
+            # Track position (use estimated cost which respects enforced min qty)
             current_market = self.all_btc_instruments[self.current_instrument_index]
             self._open_positions.append(OpenPosition(
                 market_slug=current_market['slug'],
                 direction=direction,
                 entry_price=float(limit_price),
-                size_usd=float(position_size),
+                size_usd=float(estimated_cost),
                 entry_time=datetime.now(timezone.utc),
                 market_end_time=current_market['end_time'],
                 instrument_id=trade_instrument_id,
@@ -2069,8 +2101,19 @@ class IntegratedBTCStrategy(Strategy):
             precision = instrument.size_precision
             min_qty_val = float(getattr(instrument, 'min_quantity', None) or Decimal("0.01"))
             token_qty = max_usd_amount / trade_price if trade_price > 0 else min_qty_val
+
+            # Enforce a hard minimum token quantity (Polymarket enforces min shares, often 5)
+            enforced_min_token_qty = float(os.getenv("MIN_TOKEN_QTY", "5.0"))
+            final_min_qty = max(min_qty_val, enforced_min_token_qty)
+
+            token_qty = max(token_qty, final_min_qty)
             token_qty = round(token_qty, precision)
-            token_qty = max(token_qty, min_qty_val)
+
+            # Recompute estimated USD amount based on enforced token quantity
+            try:
+                estimated_cost = float(Decimal(str(token_qty)) * Decimal(str(trade_price)))
+            except Exception:
+                estimated_cost = float(max_usd_amount)
 
             qty = Quantity(token_qty, precision=precision)
             timestamp_ms = int(time.time() * 1000)
@@ -2090,7 +2133,7 @@ class IntegratedBTCStrategy(Strategy):
             logger.info(f"MARKET ORDER SUBMITTED!")
             logger.info(f"  Order ID: {unique_id}")
             logger.info(f"  Direction: {trade_label}")
-            logger.info(f"  Estimated Cost: ~${max_usd_amount:.2f}")
+            logger.info(f"  Estimated Cost: ~${estimated_cost:.2f}")
             logger.info(f"  Fee: ~10% (taker)")
             logger.info("=" * 80)
 
@@ -2099,7 +2142,7 @@ class IntegratedBTCStrategy(Strategy):
                 market_slug=current_market['slug'],
                 direction=direction,
                 entry_price=trade_price,
-                size_usd=max_usd_amount,
+                size_usd=estimated_cost,
                 entry_time=datetime.now(timezone.utc),
                 market_end_time=current_market['end_time'],
                 instrument_id=trade_instrument_id,
@@ -2129,6 +2172,41 @@ class IntegratedBTCStrategy(Strategy):
                 logger.debug(f"PerformanceTracker has no order-counter method; ignoring '{event_type}'")
         except Exception as e:
             logger.warning(f"Failed to track order event '{event_type}': {e}")
+
+    async def _safe_submit_order(self, order) -> bool:
+        """
+        Safely submit an order: if this is a paper-derived EXIT order or we're in
+        simulation/shadow mode, do not submit to the exchange and simulate a local
+        fill instead.
+
+        Returns True if order was actually submitted, False if simulated/skipped.
+        """
+        try:
+            # client_order_id may be a ClientOrderId object or string-like
+            coid = getattr(order, 'client_order_id', None)
+            coid_str = str(coid) if coid is not None else ''
+
+            # If this is an EXIT for a paper trade, never send to exchange
+            if 'EXIT-paper_' in coid_str or coid_str.startswith('EXIT-paper_'):
+                logger.info(f"[SAFE SUBMIT] Skipping real submit for paper EXIT {coid_str}")
+                return False
+
+            is_sim = False
+            try:
+                is_sim = await self.check_simulation_mode()
+            except Exception:
+                is_sim = False
+
+            if is_sim:
+                logger.info(f"[SAFE SUBMIT] Simulation mode active — skipping real submit for {coid_str}")
+                return False
+
+            # Otherwise submit as normal
+            self.submit_order(order)
+            return True
+        except Exception as e:
+            logger.error(f"_safe_submit_order failed: {e}")
+            return False
 
     def on_order_filled(self, event):
         logger.info("=" * 80)
@@ -2274,6 +2352,20 @@ class IntegratedBTCStrategy(Strategy):
 
                 # Fetch dynamic precision from the instrument
                 precision = instrument.size_precision
+
+                # If this is a paper trade or we're running in simulation/shadow mode,
+                # do NOT submit a real exchange order. Simulate the exit locally.
+                try:
+                    is_simulation = await self.check_simulation_mode()
+                except Exception:
+                    is_simulation = False
+
+                if is_simulation or str(pos.order_id).startswith("paper_"):
+                    logger.info(f"[SIMULATION] Simulating exit for {pos.order_id} — no real order submitted")
+                    pos.resolved = True
+                    pos.exit_price = current_exit_price
+                    pos.pnl = pos.size_usd * pnl_pct
+                    continue
 
                 # Create an IOC Market order to close
                 qty = Quantity(float(pos.size_usd / pos.entry_price), precision=precision)
