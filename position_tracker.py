@@ -26,6 +26,7 @@ class OpenPosition:
     market_end_time: datetime
     instrument_id: object
     order_id: str
+    actual_qty: float = 0.0  # Actual filled quantity
     resolved: bool = False
     exit_price: Optional[float] = None
     pnl: Optional[float] = None
