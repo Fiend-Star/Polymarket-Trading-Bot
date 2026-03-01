@@ -11,6 +11,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional, Dict
 
+try:
+    from polymarket_apis import PolymarketGaslessWeb3Client
+except ImportError:
+    PolymarketGaslessWeb3Client = None
+
 # Add project to path
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
@@ -179,6 +184,7 @@ class OpenPosition:
     market_end_time: datetime
     instrument_id: object
     order_id: str
+    actual_qty: float = 0.0  # <--- ADD THIS FIELD
     resolved: bool = False
     exit_price: Optional[float] = None
     pnl: Optional[float] = None
@@ -269,6 +275,75 @@ def fetch_price_to_beat(slug: str, timeout: float = 10.0, max_retries: int = 3) 
                 return None
 
 
+def fetch_condition_id(slug: str, timeout: float = 10.0) -> Optional[str]:
+    """Fetch the specific condition ID needed to redeem a market."""
+    session = _get_gamma_session()
+    try:
+        r = session.get(
+            "https://gamma-api.polymarket.com/markets",
+            params={"slug": slug},
+            timeout=timeout,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data and len(data) > 0:
+                return data[0].get("conditionId")
+    except Exception as e:
+        logger.error(f"Failed to fetch condition ID for {slug}: {e}")
+    return None
+
+def auto_redeem_winnings(slug: str, direction: str, amount_won: float):
+    """Redeems winning shares for USDC via gasless proxy transaction."""
+    if not PolymarketGaslessWeb3Client:
+        logger.error("polymarket-apis not installed. Cannot auto-redeem.")
+        return
+
+    private_key = os.getenv("POLYMARKET_PK")
+    proxy_address = os.getenv("POLYMARKET_FUNDER")
+    
+    if not private_key or not proxy_address:
+        logger.error("Missing POLYMARKET_PK or POLYMARKET_FUNDER in .env")
+        return
+        
+    logger.info(f"🔄 Fetching condition ID to auto-redeem winnings for {slug}...")
+    condition_id = fetch_condition_id(slug)
+    
+    if not condition_id:
+        logger.error("Could not find condition_id. Redemption aborted.")
+        return
+
+    try:
+        from polymarket_apis.types.clob_types import ApiCreds
+        api_key = os.getenv("POLYMARKET_API_KEY")
+        api_secret = os.getenv("POLYMARKET_API_SECRET")
+        api_passphrase = os.getenv("POLYMARKET_PASSPHRASE")
+        
+        creds = None
+        if api_key and api_secret and api_passphrase:
+            creds = ApiCreds(
+                key=api_key,
+                secret=api_secret,
+                passphrase=api_passphrase
+            )
+            
+        client = PolymarketGaslessWeb3Client(
+            private_key=private_key,
+            signature_type=1,
+            builder_creds=creds
+        )
+        
+        # direction: "long" = Bought YES (index 0), "short" = Bought NO (index 1)
+        amounts = [float(amount_won), 0.0] if direction == "long" else [0.0, float(amount_won)]
+        
+        receipt = client.redeem_position(
+            condition_id=condition_id,
+            amounts=amounts,
+            neg_risk=False
+        )
+        logger.info(f"💰 Successfully Redeemed {slug}! Tx Hash: {receipt}")
+    except Exception as e:
+        logger.error(f"Failed to auto-redeem winnings: {e}")
+
 # =============================================================================
 # V3 Strategy
 # =============================================================================
@@ -343,6 +418,9 @@ class IntegratedBTCStrategy(Strategy):
 
         # Open positions
         self._open_positions: List[OpenPosition] = []
+        
+        # Pending token redemptions (Proxy wallets cannot auto-redeem without builder keys/Relayer)
+        self._pending_redemptions: List[str] = []
 
         # =====================================================================
         # V3 FIX: Cached market data (populated by timer loop, read by trading decision)
@@ -819,10 +897,13 @@ class IntegratedBTCStrategy(Strategy):
                             time_diff = market_timestamp - current_timestamp
 
                             if end_timestamp > current_timestamp:
-                                raw_id = str(instrument.id)
-                                without_suffix = raw_id.split('.')[0] if '.' in raw_id else raw_id
-                                yes_token_id = without_suffix.split('-')[
-                                    -1] if '-' in without_suffix else without_suffix
+                                from nautilus_trader.adapters.polymarket.common.symbol import get_polymarket_token_id
+                                try:
+                                    token_id = get_polymarket_token_id(instrument.id)
+                                except Exception:
+                                    raw_id = str(instrument.id)
+                                    without_suffix = raw_id.split('.')[0] if '.' in raw_id else raw_id
+                                    token_id = without_suffix.split('-')[-1] if '-' in without_suffix else without_suffix
 
                                 btc_instruments.append({
                                     'instrument': instrument,
@@ -832,26 +913,36 @@ class IntegratedBTCStrategy(Strategy):
                                     'market_timestamp': market_timestamp,
                                     'end_timestamp': end_timestamp,
                                     'time_diff_minutes': time_diff / 60,
-                                    'yes_token_id': yes_token_id,
+                                    'token_id': token_id,
                                 })
                         except (ValueError, IndexError):
                             continue
             except Exception:
                 continue
 
-        # Pair YES and NO tokens by slug
+        # Pair YES and NO tokens by slug securely using Nautlus outcome properties
         seen_slugs = {}
-        deduped = []
         for inst in btc_instruments:
             slug = inst['slug']
+            instrument = inst['instrument']
+            outcome = getattr(instrument, 'outcome', None)
+
             if slug not in seen_slugs:
-                inst['yes_instrument_id'] = inst['instrument'].id
-                inst['no_instrument_id'] = None
-                seen_slugs[slug] = inst
-                deduped.append(inst)
-            else:
-                seen_slugs[slug]['no_instrument_id'] = inst['instrument'].id
-        btc_instruments = deduped
+                base_inst = inst.copy()
+                base_inst['yes_instrument_id'] = None
+                base_inst['no_instrument_id'] = None
+                base_inst['yes_token_id'] = None
+                seen_slugs[slug] = base_inst
+
+            if outcome == 'Yes':
+                seen_slugs[slug]['yes_instrument_id'] = instrument.id
+                seen_slugs[slug]['yes_token_id'] = inst.get('token_id')
+            elif outcome == 'No':
+                seen_slugs[slug]['no_instrument_id'] = instrument.id
+
+        btc_instruments = list(seen_slugs.values())
+        # Filter incomplete pairs
+        btc_instruments = [m for m in btc_instruments if m['yes_instrument_id'] and m['no_instrument_id']]
         btc_instruments.sort(key=lambda x: x['market_timestamp'])
 
         if btc_instruments:
@@ -868,10 +959,10 @@ class IntegratedBTCStrategy(Strategy):
             is_active = inst['time_diff_minutes'] <= 0 and inst['end_timestamp'] > current_timestamp
             if is_active:
                 self.current_instrument_index = i
-                self.instrument_id = inst['instrument'].id
+                self.instrument_id = inst.get('yes_instrument_id')
                 self.next_switch_time = inst['end_time']
                 self._yes_token_id = inst.get('yes_token_id')
-                self._yes_instrument_id = inst.get('yes_instrument_id', inst['instrument'].id)
+                self._yes_instrument_id = inst.get('yes_instrument_id')
                 self._no_instrument_id = inst.get('no_instrument_id')
                 logger.info(f"✓ Active: {inst['slug']} → switch at {self.next_switch_time.strftime('%H:%M:%S')}")
 
@@ -891,9 +982,9 @@ class IntegratedBTCStrategy(Strategy):
 
             self.current_instrument_index = nearest_idx
             inst = nearest
-            self.instrument_id = inst['instrument'].id
+            self.instrument_id = inst.get('yes_instrument_id')
             self._yes_token_id = inst.get('yes_token_id')
-            self._yes_instrument_id = inst.get('yes_instrument_id', inst['instrument'].id)
+            self._yes_instrument_id = inst.get('yes_instrument_id')
             self._no_instrument_id = inst.get('no_instrument_id')
             self.next_switch_time = inst['start_time']
             logger.info(f"⚠ NO CURRENT MARKET — WAITING FOR: {inst['slug']}")
@@ -929,10 +1020,10 @@ class IntegratedBTCStrategy(Strategy):
         self._resolve_positions_for_market(self.current_instrument_index)
 
         self.current_instrument_index = next_index
-        self.instrument_id = next_market['instrument'].id
+        self.instrument_id = next_market.get('yes_instrument_id')
         self.next_switch_time = next_market['end_time']
         self._yes_token_id = next_market.get('yes_token_id')
-        self._yes_instrument_id = next_market.get('yes_instrument_id', next_market['instrument'].id)
+        self._yes_instrument_id = next_market.get('yes_instrument_id')
         self._no_instrument_id = next_market.get('no_instrument_id')
 
         logger.info("=" * 80)
@@ -963,14 +1054,24 @@ class IntegratedBTCStrategy(Strategy):
             snap_price = self.rtds.get_boundary_price(next_market['market_timestamp'])
             if snap_price:
                 detail = self.rtds.get_boundary_detail(next_market['market_timestamp'])
+                # detail may be (price, delta_ms) or (price, delta_ms, source_ts, received_ts, latency)
                 delta_ms = detail[1] if detail else 0
+                source_ts = detail[2] if detail and len(detail) >= 3 else None
+                received_ts = detail[3] if detail and len(detail) >= 4 else None
+                latency_ms = detail[4] if detail and len(detail) >= 5 else None
                 self._btc_strike_price = snap_price
                 self._strike_recorded = True
                 self._strike_source = "chainlink_boundary"
-                logger.info(
-                    f"📌 Strike from boundary snapshot: "
-                    f"${snap_price:,.2f} (Δ={delta_ms}ms from boundary)"
-                )
+                if source_ts is not None:
+                    logger.info(
+                        f"📌 Strike from boundary snapshot: ${snap_price:,.2f} "
+                        f"(Δ={delta_ms}ms from boundary, source_ts={source_ts}, "
+                        f"received_ts={received_ts}, latency={latency_ms}ms)"
+                    )
+                else:
+                    logger.info(
+                        f"📌 Strike from boundary snapshot: ${snap_price:,.2f} (Δ={delta_ms}ms from boundary)"
+                    )
             else:
                 # Fall back to deque scan (e.g. boundary just happened)
                 cl_strike = self.rtds.get_chainlink_price_at(
@@ -1060,6 +1161,30 @@ class IntegratedBTCStrategy(Strategy):
                     logger.info(f"📊 {tag}POSITION RESOLVED: {slug} bought {token_type}")
                     logger.info(f"   Entry: ${pos.entry_price:.4f} → Exit: ${final_price:.4f}")
                     logger.info(f"   P&L: ${pnl:+.4f} ({outcome})")
+
+                    # === PENDING REDEMPTIONS (Proxy Wallet Compatible) ===
+                    if outcome == "WIN" and not is_paper:
+                        # Proxy wallets (signature_type=1) cannot call the CTF contract directly to redeem positions
+                        # They require the Relayer client, builder credentials, or the Polymarket Wallet Recovery Tool
+                        from nautilus_trader.adapters.polymarket.common.symbol import get_polymarket_condition_id
+                        try:
+                            condition_id = getattr(pos, 'condition_id', None)
+                            if not condition_id:
+                                condition_id = get_polymarket_condition_id(pos.instrument_id)
+                                
+                            self._pending_redemptions.append(condition_id)
+                            
+                            logger.info(f"   🏆 WIN! Position marked for manual redemption.")
+                            logger.info(f"   [PROXY WALLET] condition_id {condition_id} added to pending redemptions.")
+                            logger.info(f"   Please use polymarket.com UI or polymarket-wallet-recovery tool to sweep winnings.")
+                            
+                            try:
+                                with open('pending_redemptions.txt', 'a') as f:
+                                    f.write(f"{datetime.now(timezone.utc).isoformat()} - {slug} - {condition_id}\n")
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            logger.error(f"   Failed to queue redemption: {e}")
 
                     # V3.1 FIX: Always pass direction="long" to performance tracker.
                     # In our system "short" = bought NO tokens = still a LONG position.
@@ -1167,13 +1292,22 @@ class IntegratedBTCStrategy(Strategy):
                             if snap_price:
                                 detail = self.rtds.get_boundary_detail(mkt['market_timestamp'])
                                 delta_ms = detail[1] if detail else 0
+                                source_ts = detail[2] if detail and len(detail) >= 3 else None
+                                received_ts = detail[3] if detail and len(detail) >= 4 else None
+                                latency_ms = detail[4] if detail and len(detail) >= 5 else None
                                 self._btc_strike_price = snap_price
                                 self._strike_recorded = True
                                 self._strike_source = "chainlink_boundary"
-                                logger.info(
-                                    f"📌 Strike from boundary snapshot: "
-                                    f"${snap_price:,.2f} (Δ={delta_ms}ms)"
-                                )
+                                if source_ts is not None:
+                                    logger.info(
+                                        f"📌 Strike from boundary snapshot: ${snap_price:,.2f} "
+                                        f"(Δ={delta_ms}ms from boundary, source_ts={source_ts}, "
+                                        f"received_ts={received_ts}, latency={latency_ms}ms)"
+                                    )
+                                else:
+                                    logger.info(
+                                        f"📌 Strike from boundary snapshot: ${snap_price:,.2f} (Δ={delta_ms}ms)"
+                                    )
                             else:
                                 cl_strike = self.rtds.get_chainlink_price_at(
                                     float(mkt['market_timestamp']),
@@ -1219,14 +1353,23 @@ class IntegratedBTCStrategy(Strategy):
                         if snap:
                             detail = self.rtds.get_boundary_detail(mkt['market_timestamp'])
                             delta_ms = detail[1] if detail else 0
+                            source_ts = detail[2] if detail and len(detail) >= 3 else None
+                            received_ts = detail[3] if detail and len(detail) >= 4 else None
+                            latency_ms = detail[4] if detail and len(detail) >= 5 else None
                             self._btc_strike_price = snap
                             self._strike_recorded = True
                             self._strike_defer_start = None
                             self._strike_source = "chainlink_boundary"
-                            logger.info(
-                                f"📌 Strike from boundary snapshot: "
-                                f"${snap:,.2f} (Δ={delta_ms}ms)"
-                            )
+                            if source_ts is not None:
+                                logger.info(
+                                    f"📌 Strike from boundary snapshot: ${snap:,.2f} "
+                                    f"(Δ={delta_ms}ms from boundary, source_ts={source_ts}, "
+                                    f"received_ts={received_ts}, latency={latency_ms}ms)"
+                                )
+                            else:
+                                logger.info(
+                                    f"📌 Strike from boundary snapshot: ${snap:,.2f} (Δ={delta_ms}ms)"
+                                )
                             strike_set = True
 
                     # 2. Chainlink deque scan
@@ -2217,12 +2360,13 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("=" * 80)
         self._track_order_event("filled")
 
-        # Update position entry price with actual fill
+        # Update position with actual fill data
         order_id = str(event.client_order_id)
         for pos in self._open_positions:
             if pos.order_id == order_id:
                 pos.entry_price = float(event.last_px)
-                logger.info(f"  ✓ Position entry updated to actual fill: ${pos.entry_price:.4f}")
+                pos.actual_qty = float(event.last_qty)  # <--- CAPTURE ACTUAL QUANTITY
+                logger.info(f"  ✓ Position updated: {pos.actual_qty} tokens @ ${pos.entry_price:.4f}")
                 # Also update active entry for exit monitoring
                 if self._active_entry:
                     self._active_entry["entry_price"] = pos.entry_price
@@ -2320,7 +2464,7 @@ class IntegratedBTCStrategy(Strategy):
         now_ts = datetime.now(timezone.utc).timestamp()
 
         for pos in self._open_positions:
-            if pos.resolved:
+            if pos.resolved or pos.actual_qty <= 0: # Ensure we have tokens to sell
                 continue
 
             try:
@@ -2367,8 +2511,9 @@ class IntegratedBTCStrategy(Strategy):
                     pos.pnl = pos.size_usd * pnl_pct
                     continue
 
-                # Create an IOC Market order to close
-                qty = Quantity(float(pos.size_usd / pos.entry_price), precision=precision)
+                # Submit market SELL to exit utilizing inherently mapped native Nautilus InstrumentId
+                logger.info(f"DEBUG: Setting exit order parameter mapped token: {pos.instrument_id}")
+                qty = Quantity(pos.actual_qty, precision=precision)
                 order = self.order_factory.market(
                     instrument_id=pos.instrument_id,
                     order_side=OrderSide.SELL,
