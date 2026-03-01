@@ -11,6 +11,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional, Dict
 
+try:
+    from polymarket_apis import PolymarketGaslessWeb3Client
+except ImportError:
+    PolymarketGaslessWeb3Client = None
+
 # Add project to path
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
@@ -269,6 +274,61 @@ def fetch_price_to_beat(slug: str, timeout: float = 10.0, max_retries: int = 3) 
             else:
                 return None
 
+
+def fetch_condition_id(slug: str, timeout: float = 10.0) -> Optional[str]:
+    """Fetch the specific condition ID needed to redeem a market."""
+    session = _get_gamma_session()
+    try:
+        r = session.get(
+            "https://gamma-api.polymarket.com/markets",
+            params={"slug": slug},
+            timeout=timeout,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data and len(data) > 0:
+                return data[0].get("conditionId")
+    except Exception as e:
+        logger.error(f"Failed to fetch condition ID for {slug}: {e}")
+    return None
+
+def auto_redeem_winnings(slug: str, direction: str, amount_won: float):
+    """Redeems winning shares for USDC via gasless proxy transaction."""
+    if not PolymarketGaslessWeb3Client:
+        logger.error("polymarket-apis not installed. Cannot auto-redeem.")
+        return
+
+    private_key = os.getenv("POLYMARKET_PK")
+    proxy_address = os.getenv("POLYMARKET_FUNDER")
+    
+    if not private_key or not proxy_address:
+        logger.error("Missing POLYMARKET_PK or POLYMARKET_FUNDER in .env")
+        return
+        
+    logger.info(f"🔄 Fetching condition ID to auto-redeem winnings for {slug}...")
+    condition_id = fetch_condition_id(slug)
+    
+    if not condition_id:
+        logger.error("Could not find condition_id. Redemption aborted.")
+        return
+
+    try:
+        client = PolymarketGaslessWeb3Client(
+            private_key=private_key,
+            signature_type=1
+        )
+        
+        # direction: "long" = Bought YES (index 0), "short" = Bought NO (index 1)
+        amounts = [float(amount_won), 0.0] if direction == "long" else [0.0, float(amount_won)]
+        
+        receipt = client.redeem_position(
+            condition_id=condition_id,
+            amounts=amounts,
+            neg_risk=False
+        )
+        logger.info(f"💰 Successfully Redeemed {slug}! Tx Hash: {receipt}")
+    except Exception as e:
+        logger.error(f"Failed to auto-redeem winnings: {e}")
 
 # =============================================================================
 # V3 Strategy
@@ -1071,6 +1131,18 @@ class IntegratedBTCStrategy(Strategy):
                     logger.info(f"📊 {tag}POSITION RESOLVED: {slug} bought {token_type}")
                     logger.info(f"   Entry: ${pos.entry_price:.4f} → Exit: ${final_price:.4f}")
                     logger.info(f"   P&L: ${pnl:+.4f} ({outcome})")
+
+                    # === AUTO-REDEEM WINNINGS ===
+                    if outcome == "WIN" and not is_paper:
+                        # Use actual quantity filled (requires the OpenPosition actual_qty patch applied earlier)
+                        win_qty = getattr(pos, 'actual_qty', float(pos.size_usd / pos.entry_price))
+                        if win_qty > 0:
+                            logger.info(f"   Initiating background redemption for {win_qty:.2f} tokens...")
+                            threading.Thread(
+                                target=auto_redeem_winnings, 
+                                args=(slug, pos.direction, win_qty),
+                                daemon=True
+                            ).start()
 
                     # V3.1 FIX: Always pass direction="long" to performance tracker.
                     # In our system "short" = bought NO tokens = still a LONG position.
