@@ -175,6 +175,7 @@ class OpenPosition:
     direction: str  # "long" (bought YES) or "short" (bought NO)
     entry_price: float  # Price we PAID for the token
     size_usd: float
+    actual_qty: float = 0.0  # <--- ADD THIS FIELD
     entry_time: datetime
     market_end_time: datetime
     instrument_id: object
@@ -2245,12 +2246,13 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("=" * 80)
         self._track_order_event("filled")
 
-        # Update position entry price with actual fill
+        # Update position with actual fill data
         order_id = str(event.client_order_id)
         for pos in self._open_positions:
             if pos.order_id == order_id:
                 pos.entry_price = float(event.last_px)
-                logger.info(f"  ✓ Position entry updated to actual fill: ${pos.entry_price:.4f}")
+                pos.actual_qty = float(event.last_qty)  # <--- CAPTURE ACTUAL QUANTITY
+                logger.info(f"  ✓ Position updated: {pos.actual_qty} tokens @ ${pos.entry_price:.4f}")
                 # Also update active entry for exit monitoring
                 if self._active_entry:
                     self._active_entry["entry_price"] = pos.entry_price
@@ -2348,7 +2350,7 @@ class IntegratedBTCStrategy(Strategy):
         now_ts = datetime.now(timezone.utc).timestamp()
 
         for pos in self._open_positions:
-            if pos.resolved:
+            if pos.resolved or pos.actual_qty <= 0: # Ensure we have tokens to sell
                 continue
 
             try:
@@ -2395,8 +2397,8 @@ class IntegratedBTCStrategy(Strategy):
                     pos.pnl = pos.size_usd * pnl_pct
                     continue
 
-                # Create an IOC Market order to close
-                qty = Quantity(float(pos.size_usd / pos.entry_price), precision=precision)
+                # FIX: Use pos.actual_qty instead of recalculating from pos.size_usd
+                qty = Quantity(pos.actual_qty, precision=precision)
                 order = self.order_factory.market(
                     instrument_id=pos.instrument_id,
                     order_side=OrderSide.SELL,
