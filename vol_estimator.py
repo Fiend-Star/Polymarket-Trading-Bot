@@ -28,10 +28,11 @@ Typical BTC 15-min realized vol: 40-100% annualized
 import math
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
-from loguru import logger
+import os
 
+from loguru import logger
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -52,7 +53,7 @@ class VolEstimate:
     num_returns: int
     vol_per_minute: float
     method: str
-    confidence: float           # 0-1, based on sample size
+    confidence: float  # 0-1, based on sample size
     timestamp: float
 
     def __repr__(self):
@@ -68,12 +69,12 @@ class VolEstimate:
 @dataclass
 class JumpEstimate:
     """Jump parameters for Merton jump-diffusion pricer."""
-    intensity: float        # λ: jumps per year
-    mean: float             # μ_J: mean log-jump size
-    vol: float              # σ_J: jump size std dev
-    recent_jump: bool       # Whether a jump was detected in the last N bars
-    num_jumps_detected: int # Jumps in current window
-    confidence: float       # 0-1
+    intensity: float  # λ: jumps per year
+    mean: float  # μ_J: mean log-jump size
+    vol: float  # σ_J: jump size std dev
+    recent_jump: bool  # Whether a jump was detected in the last N bars
+    num_jumps_detected: int  # Jumps in current window
+    confidence: float  # 0-1
 
     def __repr__(self):
         return (
@@ -86,10 +87,10 @@ class JumpEstimate:
 @dataclass
 class ReturnStats:
     """Return statistics for mean reversion and other overlays."""
-    recent_return: float            # Return since some reference (e.g., market open)
-    recent_return_sigma: float      # That return in σ units
-    rolling_autocorr: float         # First-order autocorrelation of recent returns
-    mean_reversion_active: bool     # Whether |return_sigma| > threshold
+    recent_return: float  # Return since some reference (e.g., market open)
+    recent_return_sigma: float  # That return in σ units
+    rolling_autocorr: float  # First-order autocorrelation of recent returns
+    mean_reversion_active: bool  # Whether |return_sigma| > threshold
     num_returns: int
 
     def __repr__(self):
@@ -126,16 +127,16 @@ class VolEstimator:
     """
 
     def __init__(
-        self,
-        window_minutes: float = 60.0,
-        resample_interval_sec: float = 60.0,
-        ewma_halflife_samples: int = 20,
-        min_samples: int = 5,
-        default_vol: float = 0.65,
-        # V2: EGARCH parameters
-        leverage_gamma: float = 0.15,       # Asymmetric response to negative returns
-        # V2: Jump detection
-        jump_threshold_sigma: float = 3.0,  # Flag returns > 3σ as jumps
+            self,
+            window_minutes: float = 60.0,
+            resample_interval_sec: float = 60.0,
+            ewma_halflife_samples: int = 20,
+            min_samples: int = 5,
+            default_vol: float = 0.65,
+            # V2: EGARCH parameters
+            leverage_gamma: float = 0.15,  # Asymmetric response to negative returns
+            # V2: Jump detection
+            jump_threshold_sigma: float = 3.0,  # Flag returns > 3σ as jumps
     ):
         self.window_minutes = window_minutes
         self.resample_interval_sec = resample_interval_sec
@@ -163,7 +164,9 @@ class VolEstimator:
         self._ewma_lambda = 1.0 - math.log(2) / max(ewma_halflife_samples, 1)
 
         # V2: Jump tracking
-        self._detected_jumps: deque = deque(maxlen=100)  # (timestamp, return_size)
+        # Bivariate jump queues (separate up/down histories for Hawkes)
+        self._up_jumps: deque = deque(maxlen=100)   # (timestamp, return_size)
+        self._down_jumps: deque = deque(maxlen=100) # (timestamp, return_size)
         self._recent_jump_window_sec: float = 300.0  # 5 minutes
 
         # V2: VRP tracking
@@ -173,6 +176,15 @@ class VolEstimator:
         # V2: Simulated time for backtesting
         # When set, get_vol() uses this instead of time.time() for pruning
         self._simulated_time: Optional[float] = None
+
+        # --- TIER 2: ADAPTIVE HAWKES PROCESS PARAMETERS ---
+        # Pull baselines from ENV, allowing external optimization without code changes.
+        self._hawkes_mu_base = float(os.getenv("HAWKES_MU_BASE", "1000.0"))
+        self._hawkes_alpha_base = float(os.getenv("HAWKES_ALPHA_BASE", "4000.0"))
+
+        # Calculate beta (decay rate) dynamically from a desired half-life in minutes
+        hawkes_half_life_min = float(os.getenv("HAWKES_HALF_LIFE_MIN", "10.0"))
+        self._hawkes_beta = math.log(2) / (hawkes_half_life_min * 60.0)
 
         logger.info(
             f"Initialized VolEstimator V2: window={window_minutes}min, "
@@ -459,69 +471,128 @@ class VolEstimator:
         # scale up during crashes and blind the detector.
         interval_minutes = self.resample_interval_sec / 60.0
         expected_std = (self.default_vol / math.sqrt(MINUTES_PER_YEAR)) * math.sqrt(interval_minutes)
-        
+
         if expected_std > 0:
             sigma_units = abs(log_return) / expected_std
             if sigma_units > self.jump_threshold_sigma:
-                self._detected_jumps.append((timestamp, log_return))
+                # Classify jump by sign and store in the appropriate bivariate queue
+                if log_return >= 0:
+                    self._up_jumps.append((timestamp, log_return))
+                    direction = "UP"
+                else:
+                    self._down_jumps.append((timestamp, log_return))
+                    direction = "DOWN"
+
                 logger.warning(
-                    f"⚡ JUMP DETECTED: {log_return:+.4%} "
+                    f"⚡ JUMP DETECTED ({direction}): {log_return:+.4%} "
                     f"({sigma_units:.1f}σ) at {timestamp:.0f}"
                 )
 
     def get_jump_params(self) -> JumpEstimate:
         """
-        Export jump parameters for Merton jump-diffusion pricer.
+        Export jump parameters for Merton jump-diffusion pricer using a Bivariate Hawkes Process.
 
-        Estimates λ (intensity), μ_J (mean), σ_J (vol) from detected jumps.
-        Falls back to conservative defaults when insufficient data.
+        Computes separate Hawkes intensities for up- and down-jumps and then
+        combines them for the existing Merton pricer by summing intensities
+        and taking a weighted average of side-specific mean jump sizes.
         """
         now = self._now()
 
-        # Prune old jumps
-        while self._detected_jumps and self._detected_jumps[0][0] < now - self.window_minutes * 60:
-            self._detected_jumps.popleft()
+        # Prune old jumps from both queues
+        cutoff_ts = now - self.window_minutes * 60
+        while self._up_jumps and self._up_jumps[0][0] < cutoff_ts:
+            self._up_jumps.popleft()
+        while self._down_jumps and self._down_jumps[0][0] < cutoff_ts:
+            self._down_jumps.popleft()
 
-        num_jumps = len(self._detected_jumps)
-        window_years = self.window_minutes / MINUTES_PER_YEAR
+        num_up = len(self._up_jumps)
+        num_down = len(self._down_jumps)
+        num_jumps = num_up + num_down
 
         # Recent jump check (last 5 minutes)
-        recent_jump = any(
-            ts > now - self._recent_jump_window_sec
-            for ts, _ in self._detected_jumps
+        recent_jump = (
+            any(ts > now - self._recent_jump_window_sec for ts, _ in self._up_jumps)
+            or any(ts > now - self._recent_jump_window_sec for ts, _ in self._down_jumps)
         )
 
+        # --- 1. HAWKES PROCESS INTENSITY (λ) ---
+        # DYNAMIC REGIME SCALING:
+        # Scale the baseline parameters by comparing current EWMA vol to our default expectation.
+        # If the market is 50% more volatile than normal, jumps are 50% more frequent/severe.
+        current_vol = self.get_vol(method="ewma").annualized_vol
+        regime_scalar = current_vol / max(self.default_vol, 0.10)
+
+        dynamic_mu = self._hawkes_mu_base * regime_scalar
+        dynamic_alpha = self._hawkes_alpha_base * regime_scalar
+
+        # For a bivariate Hawkes we split the baseline between up and down so
+        # the total baseline intensity remains comparable to the univariate version.
+        mu_up = dynamic_mu * 0.5
+        mu_down = dynamic_mu * 0.5
+        alpha_up = dynamic_alpha * 0.5
+        alpha_down = dynamic_alpha * 0.5
+
+        # λ_up(t)
+        lambda_up = mu_up
+        for ts, _ in self._up_jumps:
+            time_since_jump_sec = max(0.0, now - ts)
+            lambda_up += alpha_up * math.exp(-self._hawkes_beta * time_since_jump_sec)
+
+        # λ_down(t)
+        lambda_down = mu_down
+        for ts, _ in self._down_jumps:
+            time_since_jump_sec = max(0.0, now - ts)
+            lambda_down += alpha_down * math.exp(-self._hawkes_beta * time_since_jump_sec)
+
+        # Clamp to prevent numerical overflow in the Merton pricer
+        lambda_up = max(50.0, min(50000.0, lambda_up))
+        lambda_down = max(50.0, min(50000.0, lambda_down))
+
+        # Combined intensity
+        intensity = lambda_up + lambda_down
+
+        # --- 2. MEAN JUMP SIZE (μ_J) & VOL (σ_J) ---
+        # Compute side-specific means/vols and then combine them weighted by side intensity
         if num_jumps < 2:
-            # Conservative defaults: ~4 jumps/day, slight negative bias
-            return JumpEstimate(
-                intensity=1500.0,   # ~4/day
-                mean=-0.0008,       # Slight negative (liquidation cascades)
-                vol=0.003,          # ~0.3% typical jump size
-                recent_jump=recent_jump,
-                num_jumps_detected=num_jumps,
-                confidence=0.1,
-            )
+            # Conservative defaults
+            mean_up = 0.0
+            mean_down = -0.0008
+            vol_up = 0.003
+            vol_down = 0.003
+            confidence = 0.1
+        else:
+            up_returns = [lr for _, lr in self._up_jumps]
+            down_returns = [lr for _, lr in self._down_jumps]
 
-        # Estimate from data
-        jump_returns = [lr for _, lr in self._detected_jumps]
+            if up_returns:
+                mean_up = sum(up_returns) / len(up_returns)
+                var_up = sum((jr - mean_up) ** 2 for jr in up_returns) / (len(up_returns) - 1) if len(up_returns) > 1 else 1e-6
+                vol_up = math.sqrt(max(var_up, 1e-10))
+            else:
+                mean_up = 0.0
+                vol_up = 0.003
 
-        intensity = num_jumps / window_years if window_years > 0 else 1500.0
-        mean_jump = sum(jump_returns) / len(jump_returns)
-        var_jump = (
-            sum((jr - mean_jump) ** 2 for jr in jump_returns) / (len(jump_returns) - 1)
-            if len(jump_returns) > 1 else 0.003 ** 2
-        )
-        vol_jump = math.sqrt(max(var_jump, 1e-10))
+            if down_returns:
+                mean_down = sum(down_returns) / len(down_returns)
+                var_down = sum((jr - mean_down) ** 2 for jr in down_returns) / (len(down_returns) - 1) if len(down_returns) > 1 else 1e-6
+                vol_down = math.sqrt(max(var_down, 1e-10))
+            else:
+                mean_down = -0.0008
+                vol_down = 0.003
 
-        # Clamp to reasonable ranges
-        intensity = max(100.0, min(50000.0, intensity))
+            confidence = min(1.0, num_jumps / 10.0)
+
+        # Weighted mean jump size (skew) — weights by current side intensity
+        if intensity > 0:
+            mean_jump = (lambda_up * mean_up + lambda_down * mean_down) / intensity
+            # Combine vol as weighted RMS-like average to reflect dispersion
+            vol_jump = math.sqrt(max((lambda_up * (vol_up ** 2) + lambda_down * (vol_down ** 2)) / max(intensity, 1.0), 1e-10))
+        else:
+            mean_jump = -0.0008
+            vol_jump = 0.003
+
+        # Ensure reasonable bounds
         vol_jump = max(0.001, min(0.05, vol_jump))
-
-        confidence = min(1.0, num_jumps / 10.0)
-
-        # If we just had a jump, increase intensity (Hawkes self-excitation)
-        if recent_jump:
-            intensity *= 2.0  # Jumps cluster: double intensity after recent jump
 
         return JumpEstimate(
             intensity=intensity,
@@ -537,7 +608,7 @@ class VolEstimator:
     # ------------------------------------------------------------------
 
     def get_return_stats(
-        self, reference_price: Optional[float] = None
+            self, reference_price: Optional[float] = None
     ) -> ReturnStats:
         """
         Compute return statistics for mean reversion and other overlays.
@@ -585,12 +656,12 @@ class VolEstimator:
         mean_reversion_active = abs(recent_sigma) > 0.75
 
         return ReturnStats(
-            recent_return=recent_return,
-            recent_return_sigma=recent_sigma,
-            rolling_autocorr=autocorr,
-            mean_reversion_active=mean_reversion_active,
-            num_returns=len(log_returns),
-        )
+             recent_return=recent_return,
+             recent_return_sigma=recent_sigma,
+             rolling_autocorr=autocorr,
+             mean_reversion_active=mean_reversion_active,
+             num_returns=len(log_returns),
+         )
 
     def _compute_autocorr(self, returns: list) -> float:
         """Compute first-order autocorrelation of return series."""
@@ -647,13 +718,45 @@ class VolEstimator:
     # ------------------------------------------------------------------
 
     def get_stats(self) -> dict:
+        # Compute current per-side Hawkes intensities cheaply for monitoring
+        try:
+            current_vol = self.get_vol(method="ewma").annualized_vol
+            regime_scalar = current_vol / max(self.default_vol, 0.10)
+            dynamic_mu = self._hawkes_mu_base * regime_scalar
+            dynamic_alpha = self._hawkes_alpha_base * regime_scalar
+
+            mu_up = dynamic_mu * 0.5
+            mu_down = dynamic_mu * 0.5
+            alpha_up = dynamic_alpha * 0.5
+            alpha_down = dynamic_alpha * 0.5
+
+            now = self._now()
+            lambda_up = mu_up
+            for ts, _ in self._up_jumps:
+                time_since_jump_sec = max(0.0, now - ts)
+                lambda_up += alpha_up * math.exp(-self._hawkes_beta * time_since_jump_sec)
+
+            lambda_down = mu_down
+            for ts, _ in self._down_jumps:
+                time_since_jump_sec = max(0.0, now - ts)
+                lambda_down += alpha_down * math.exp(-self._hawkes_beta * time_since_jump_sec)
+
+            # Clamp to keep metrics sane
+            lambda_up = max(0.0, min(50000.0, lambda_up))
+            lambda_down = max(0.0, min(50000.0, lambda_down))
+        except Exception:
+            lambda_up = 0.0
+            lambda_down = 0.0
+
         return {
             "raw_ticks": len(self._raw_ticks),
             "bars": len(self._bars),
             "window_minutes": self.window_minutes,
             "last_bar_time": self._last_bar_time,
             "cached_vol": self._cached_vol.annualized_vol if self._cached_vol else None,
-            "jumps_detected": len(self._detected_jumps),
+            "jumps_detected": len(self._up_jumps) + len(self._down_jumps),
+            "lambda_up": lambda_up,
+            "lambda_down": lambda_down,
             "iv_observations": len(self._iv_observations),
             "rv_observations": len(self._rv_observations),
         }
@@ -666,7 +769,8 @@ class VolEstimator:
         self._cached_vol = None
         self._cache_time = 0.0
         # NOTE: Do NOT clear jump history or VRP — those persist across markets
-        # self._detected_jumps.clear()  # Keep!
+        # self._up_jumps.clear()  # Keep! (if you want to reset jumps, call this explicitly)
+        # self._down_jumps.clear()  # Keep!
         # self._iv_observations.clear()  # Keep!
 
 
@@ -674,6 +778,7 @@ class VolEstimator:
 # Singleton
 # ---------------------------------------------------------------------------
 _vol_instance = None
+
 
 def get_vol_estimator() -> VolEstimator:
     global _vol_instance

@@ -35,12 +35,10 @@ USAGE IN BOT:
 
 import asyncio
 import json
-import math
-import time
 import threading
+import time
 from collections import deque
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from typing import Optional, Callable, Deque, Dict
 
 from loguru import logger
@@ -50,7 +48,6 @@ try:
 except ImportError:
     aiohttp = None
     logger.warning("aiohttp not installed — RTDS connector requires it: pip install aiohttp")
-
 
 # =============================================================================
 # Constants
@@ -74,22 +71,22 @@ STALE_PRICE_THRESHOLD_MS = 30_000  # 30 seconds
 @dataclass
 class PriceTick:
     """A single price observation from RTDS."""
-    source: str             # "chainlink" or "binance"
-    symbol: str             # "btc/usd" or "btcusdt"
+    source: str  # "chainlink" or "binance"
+    symbol: str  # "btc/usd" or "btcusdt"
     price: float
     source_timestamp_ms: int  # When the price was recorded (exchange/oracle)
     received_timestamp_ms: int  # When we received it via WebSocket
-    latency_ms: int          # received - source
+    latency_ms: int  # received - source
 
 
 @dataclass
 class LateWindowSignal:
     """Signal from late-window Chainlink strategy."""
-    direction: str          # "BUY_YES", "BUY_NO", or "NO_SIGNAL"
+    direction: str  # "BUY_YES", "BUY_NO", or "NO_SIGNAL"
     chainlink_price: float
     strike: float
-    delta_bps: float        # Price distance in basis points
-    confidence: float       # 0-1, based on distance + time remaining
+    delta_bps: float  # Price distance in basis points
+    confidence: float  # 0-1, based on distance + time remaining
     time_remaining_sec: float
     reason: str
 
@@ -99,10 +96,10 @@ class DivergenceSignal:
     """Binance-Chainlink price divergence signal."""
     binance_price: float
     chainlink_price: float
-    divergence_bps: float   # (binance - chainlink) / chainlink × 10000
-    direction: str          # "BINANCE_LEADING" or "CHAINLINK_LEADING"
-    is_significant: bool    # > threshold
-    staleness_ms: int       # Max age of either price
+    divergence_bps: float  # (binance - chainlink) / chainlink × 10000
+    direction: str  # "BINANCE_LEADING" or "CHAINLINK_LEADING"
+    is_significant: bool  # > threshold
+    staleness_ms: int  # Max age of either price
 
 
 # =============================================================================
@@ -118,14 +115,14 @@ class RTDSConnector:
     """
 
     def __init__(
-        self,
-        vol_estimator=None,
-        on_chainlink_tick: Optional[Callable] = None,
-        on_binance_tick: Optional[Callable] = None,
-        divergence_threshold_bps: float = 5.0,
-        late_window_min_bps: float = 3.0,      # Min delta for late-window signal
-        late_window_max_sec: float = 15.0,      # Activate within last N seconds
-        late_window_high_conf_bps: float = 10.0,  # >10 bps = high confidence
+            self,
+            vol_estimator=None,
+            on_chainlink_tick: Optional[Callable] = None,
+            on_binance_tick: Optional[Callable] = None,
+            divergence_threshold_bps: float = 5.0,
+            late_window_min_bps: float = 3.0,  # Min delta for late-window signal
+            late_window_max_sec: float = 15.0,  # Activate within last N seconds
+            late_window_high_conf_bps: float = 10.0,  # >10 bps = high confidence
     ):
         self.vol_estimator = vol_estimator
         self._on_chainlink_tick = on_chainlink_tick
@@ -266,9 +263,9 @@ class RTDSConnector:
     # ==================================================================
 
     def get_late_window_signal(
-        self,
-        strike: float,
-        time_remaining_sec: float,
+            self,
+            strike: float,
+            time_remaining_sec: float,
     ) -> LateWindowSignal:
         """
         Late-window strategy: at T-10s, compare Chainlink price vs strike.
@@ -318,7 +315,7 @@ class RTDSConnector:
         if delta_bps > self.late_window_min_bps:
             direction = "BUY_YES"  # Chainlink above strike → Up wins
         elif delta_bps < -self.late_window_min_bps:
-            direction = "BUY_NO"   # Chainlink below strike → Down wins
+            direction = "BUY_NO"  # Chainlink below strike → Down wins
         else:
             return LateWindowSignal(
                 direction="NO_SIGNAL", chainlink_price=chainlink_px,
@@ -461,6 +458,7 @@ class RTDSConnector:
 
     def start_background(self, loop: Optional[asyncio.AbstractEventLoop] = None):
         """Start the RTDS connector in a background thread."""
+
         def _run():
             _loop = asyncio.new_event_loop()
             asyncio.set_event_loop(_loop)
@@ -485,9 +483,9 @@ class RTDSConnector:
         self._session = aiohttp.ClientSession()
         try:
             async with self._session.ws_connect(
-                RTDS_WS_URL,
-                heartbeat=PING_INTERVAL_SEC,
-                timeout=aiohttp.ClientWSTimeout(ws_close=10),
+                    RTDS_WS_URL,
+                    heartbeat=PING_INTERVAL_SEC,
+                    timeout=aiohttp.ClientWSTimeout(ws_close=10),
             ) as ws:
                 self._ws = ws
                 self._connected = True
@@ -532,11 +530,13 @@ class RTDSConnector:
                         if not _resub_pending:
                             data_lower = msg.data.lower()
                             if '"message"' in data_lower and ('too many' in data_lower or 'rate limit' in data_lower):
-                                logger.warning(f"RTDS: Subscription rate-limited (429) — will retry in 10s. Server replied: {msg.data}")
+                                logger.warning(
+                                    f"RTDS: Subscription rate-limited (429) — will retry in 10s. Server replied: {msg.data}")
                                 _resub_pending = True
                                 _resub_after = time.time() + 10.0
                             elif 'failed validation' in data_lower or 'invalid' in data_lower:
-                                logger.warning(f"RTDS: Subscription validation error (400) — will retry in 5s. Server replied: {msg.data}")
+                                logger.warning(
+                                    f"RTDS: Subscription validation error (400) — will retry in 5s. Server replied: {msg.data}")
                                 _resub_pending = True
                                 _resub_after = time.time() + 5.0
 
@@ -723,7 +723,7 @@ class RTDSConnector:
             # in real-time as the tick arrives (zero additional latency).
             for boundary_ts, existing in list(self._boundary_snapshots.items()):
                 boundary_ms = boundary_ts * 1000
-                
+
                 # V3.4: Only capture ticks that occurred AT OR BEFORE the boundary timestamp!
                 # We define a range of [0, boundary_capture_window_ms] looking backward.
                 delta_ms = boundary_ms - source_ts
@@ -796,9 +796,9 @@ class RTDSConnector:
         return list(self._binance_ticks)[-n:]
 
     def get_chainlink_price_at(
-        self,
-        target_timestamp_s: float,
-        max_staleness_ms: int = 5000,
+            self,
+            target_timestamp_s: float,
+            max_staleness_ms: int = 5000,
     ) -> Optional[float]:
         """
         Get the Chainlink BTC/USD price closest to a specific timestamp.

@@ -138,3 +138,4 @@ $RECYCLE.BIN/
 *.swo
 node_modules/
 .cache/!/test_rtds_feeds.py
+cache/

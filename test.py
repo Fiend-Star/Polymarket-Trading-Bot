@@ -3,23 +3,24 @@ Test script to directly query Gamma API for BTC markets.
 Run this separately to debug the API response.
 """
 
-import httpx
 import asyncio
 from datetime import datetime, timezone, timedelta
-import json
+
+import httpx
+
 
 async def test_gamma_api():
     """Test different filtering approaches with Gamma API."""
-    
+
     base_url = "https://gamma-api.polymarket.com"
     now = datetime.now(timezone.utc)
-    
+
     print("=" * 80)
     print("TESTING GAMMA API FILTERING")
     print("=" * 80)
-    
+
     async with httpx.AsyncClient() as client:
-        
+
         # Test 1: Get all active BTC markets (no time filter)
         print("\n1. Testing: All active BTC markets (no time filter)")
         params1 = {
@@ -29,7 +30,7 @@ async def test_gamma_api():
             "limit": 50,
             "slug": "btc-updown-15m-1771140600"  # Use the specific slug we know exists
         }
-        
+
         response1 = await client.get(f"{base_url}/markets", params=params1)
         if response1.status_code == 200:
             data1 = response1.json()
@@ -38,7 +39,7 @@ async def test_gamma_api():
                 print(f"   - {market.get('slug')}: {market.get('question')}")
         else:
             print(f"   Error: {response1.status_code}")
-        
+
         # Test 2: Get markets with crypto tag
         print("\n2. Testing: Markets with crypto tag (744)")
         params2 = {
@@ -48,7 +49,7 @@ async def test_gamma_api():
             "tag_id": 744,
             "limit": 20
         }
-        
+
         response2 = await client.get(f"{base_url}/markets", params=params2)
         if response2.status_code == 200:
             data2 = response2.json()
@@ -57,7 +58,7 @@ async def test_gamma_api():
                 print(f"   - {market.get('slug')}: {market.get('question')}")
         else:
             print(f"   Error: {response2.status_code}")
-        
+
         # Test 3: Get markets with time filter (next 30 minutes)
         print("\n3. Testing: Time filter (next 30 minutes)")
         params3 = {
@@ -68,7 +69,7 @@ async def test_gamma_api():
             "end_date_max": (now + timedelta(minutes=30)).isoformat(),
             "limit": 50
         }
-        
+
         response3 = await client.get(f"{base_url}/markets", params=params3)
         if response3.status_code == 200:
             data3 = response3.json()
@@ -79,7 +80,7 @@ async def test_gamma_api():
                 print(f"   - {market.get('slug')}: expires {market.get('endDate')}")
         else:
             print(f"   Error: {response3.status_code}")
-        
+
         # Test 4: Get markets with time filter + crypto tag
         print("\n4. Testing: Time filter + crypto tag")
         params4 = {
@@ -91,7 +92,7 @@ async def test_gamma_api():
             "end_date_max": (now + timedelta(minutes=30)).isoformat(),
             "limit": 50
         }
-        
+
         response4 = await client.get(f"{base_url}/markets", params=params4)
         if response4.status_code == 200:
             data4 = response4.json()
@@ -102,6 +103,7 @@ async def test_gamma_api():
                 print(f"   - {market.get('slug')}")
         else:
             print(f"   Error: {response4.status_code}")
+
 
 if __name__ == "__main__":
     asyncio.run(test_gamma_api())

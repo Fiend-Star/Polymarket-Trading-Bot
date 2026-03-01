@@ -27,8 +27,8 @@ USAGE:
     # regime.mean_reversion_bias = -0.02  # Subtract from YES probability
 """
 
-import time
 import threading
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -36,15 +36,16 @@ from loguru import logger
 
 try:
     import httpx
+
     HTTPX_AVAILABLE = True
 except ImportError:
     try:
         import requests as httpx
+
         HTTPX_AVAILABLE = True
     except ImportError:
         HTTPX_AVAILABLE = False
         logger.warning("Neither httpx nor requests available — FundingRateFilter disabled")
-
 
 # =============================================================================
 # Constants
@@ -62,16 +63,16 @@ CACHE_TTL_SEC = 300
 @dataclass
 class FundingRegime:
     """Current funding rate regime classification."""
-    funding_rate: float             # Raw funding rate (e.g., 0.0001 = 0.01%)
-    funding_rate_pct: float         # As percentage (e.g., 0.01)
+    funding_rate: float  # Raw funding rate (e.g., 0.0001 = 0.01%)
+    funding_rate_pct: float  # As percentage (e.g., 0.01)
     predicted_rate: Optional[float]  # Predicted next funding rate
-    classification: str             # EXTREME_POSITIVE, HIGH_POSITIVE, NEUTRAL, etc.
-    mean_reversion_bias: float      # Additive probability adjustment
-    index_price: float              # Binance index price
-    mark_price: float               # Binance mark price
-    basis_bps: float                # (mark - index) / index × 10000
-    next_funding_time: int          # Unix ms
-    last_update: float              # When we fetched this
+    classification: str  # EXTREME_POSITIVE, HIGH_POSITIVE, NEUTRAL, etc.
+    mean_reversion_bias: float  # Additive probability adjustment
+    index_price: float  # Binance index price
+    mark_price: float  # Binance mark price
+    basis_bps: float  # (mark - index) / index × 10000
+    next_funding_time: int  # Unix ms
+    last_update: float  # When we fetched this
 
 
 # =============================================================================
@@ -85,11 +86,11 @@ class FundingRateFilter:
     """
 
     def __init__(
-        self,
-        symbol: str = "BTCUSDT",
-        extreme_threshold: float = 0.0005,   # 0.05% per 8h
-        high_threshold: float = 0.0002,      # 0.02% per 8h
-        max_bias: float = 0.02,              # Max probability adjustment ±2%
+            self,
+            symbol: str = "BTCUSDT",
+            extreme_threshold: float = 0.0005,  # 0.05% per 8h
+            high_threshold: float = 0.0002,  # 0.02% per 8h
+            max_bias: float = 0.02,  # Max probability adjustment ±2%
     ):
         self.symbol = symbol
         self.extreme_threshold = extreme_threshold
@@ -262,6 +263,7 @@ class FundingRateFilter:
 # Singleton
 # =============================================================================
 _funder_instance = None
+
 
 def get_funding_rate_filter() -> FundingRateFilter:
     global _funder_instance

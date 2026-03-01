@@ -32,14 +32,15 @@ API USED (completely free, no auth required):
     - instrument_name (e.g. BTC-20FEB26-95000-P = Put, -C = Call)
     - days to expiry (parsed from instrument name)
 """
-import httpx
-from decimal import Decimal
-from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List, Tuple
-from loguru import logger
-
 import os
 import sys
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Optional, Dict, Any
+
+import httpx
+from loguru import logger
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from core.strategy_brain.signal_processors.base_processor import (
@@ -62,13 +63,13 @@ class DeribitPCRProcessor(BaseSignalProcessor):
     """
 
     def __init__(
-        self,
-        bullish_pcr_threshold: float = 1.20,   # PCR above this = contrarian bullish
-        bearish_pcr_threshold: float = 0.70,   # PCR below this = contrarian bearish
-        max_days_to_expiry: int = 2,            # only short-dated options
-        min_open_interest: float = 100.0,       # ignore tiny strikes (BTC notional)
-        cache_seconds: int = 300,               # refresh every 5 minutes
-        min_confidence: float = 0.55,
+            self,
+            bullish_pcr_threshold: float = 1.20,  # PCR above this = contrarian bullish
+            bearish_pcr_threshold: float = 0.70,  # PCR below this = contrarian bearish
+            max_days_to_expiry: int = 2,  # only short-dated options
+            min_open_interest: float = 100.0,  # ignore tiny strikes (BTC notional)
+            cache_seconds: int = 300,  # refresh every 5 minutes
+            min_confidence: float = 0.55,
     ):
         super().__init__("DeribitPCR")
 
@@ -103,7 +104,7 @@ class DeribitPCRProcessor(BaseSignalProcessor):
             parts = instrument_name.split("-")
             if len(parts) < 3:
                 return None
-            expiry_str = parts[1]   # e.g. "20FEB26"
+            expiry_str = parts[1]  # e.g. "20FEB26"
             expiry_dt = datetime.strptime(expiry_str, "%d%b%y").replace(tzinfo=timezone.utc)
             now = datetime.now(timezone.utc)
             dte = (expiry_dt - now).days
@@ -189,10 +190,10 @@ class DeribitPCRProcessor(BaseSignalProcessor):
             return None
 
     def process(
-        self,
-        current_price: Decimal,
-        historical_prices: list,
-        metadata: Dict[str, Any] = None,
+            self,
+            current_price: Decimal,
+            historical_prices: list,
+            metadata: Dict[str, Any] = None,
     ) -> Optional[TradingSignal]:
         """Synchronous wrapper — runs async fetch if cache is stale."""
         if not self.is_enabled:
@@ -201,9 +202,9 @@ class DeribitPCRProcessor(BaseSignalProcessor):
         # Check cache
         now = datetime.now(timezone.utc)
         cache_valid = (
-            self._cached_result is not None and
-            self._cache_time is not None and
-            (now - self._cache_time).total_seconds() < self.cache_seconds
+                self._cached_result is not None and
+                self._cache_time is not None and
+                (now - self._cache_time).total_seconds() < self.cache_seconds
         )
 
         if cache_valid:
@@ -228,9 +229,9 @@ class DeribitPCRProcessor(BaseSignalProcessor):
         return self._generate_signal(current_price, pcr_data)
 
     def _generate_signal(
-        self,
-        current_price: Decimal,
-        pcr_data: Dict,
+            self,
+            current_price: Decimal,
+            pcr_data: Dict,
     ) -> Optional[TradingSignal]:
         """Generate signal from PCR data."""
         # Prefer short-dated PCR; fall back to overall

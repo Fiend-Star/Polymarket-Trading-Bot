@@ -13,14 +13,15 @@ FIX: Original threshold was 15% deviation, designed for dollar prices.
        - Also detect VELOCITY (fast moves in the last 3 ticks)
        - Mean reversion logic is still correct: spike up → BEARISH, spike down → BULLISH
 """
-from decimal import Decimal
-from datetime import datetime
-from typing import Optional, Dict, Any
-from loguru import logger
 import os
 import sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from datetime import datetime
+from decimal import Decimal
+from typing import Optional, Dict, Any
 
+from loguru import logger
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from core.strategy_brain.signal_processors.base_processor import (
     BaseSignalProcessor,
@@ -48,11 +49,11 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
     """
 
     def __init__(
-        self,
-        spike_threshold: float = 0.05,    # FIXED: was 0.15, now 0.05 for probability prices
-        lookback_periods: int = 20,
-        min_confidence: float = 0.55,     # FIXED: was 0.60, slightly lower for more signals
-        velocity_threshold: float = 0.03, # 3% move in 3 ticks = velocity spike
+            self,
+            spike_threshold: float = 0.05,  # FIXED: was 0.15, now 0.05 for probability prices
+            lookback_periods: int = 20,
+            min_confidence: float = 0.55,  # FIXED: was 0.60, slightly lower for more signals
+            velocity_threshold: float = 0.03,  # 3% move in 3 ticks = velocity spike
     ):
         super().__init__("SpikeDetection")
 
@@ -69,10 +70,10 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
         )
 
     def process(
-        self,
-        current_price: Decimal,
-        historical_prices: list,
-        metadata: Dict[str, Any] = None,
+            self,
+            current_price: Decimal,
+            historical_prices: list,
+            metadata: Dict[str, Any] = None,
     ) -> Optional[TradingSignal]:
         """
         Detect probability spikes and generate mean-reversion or momentum signals.

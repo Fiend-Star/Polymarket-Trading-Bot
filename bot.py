@@ -1,15 +1,15 @@
 import asyncio
+import math
 import os
 import sys
-from pathlib import Path
-from datetime import datetime, timezone
-import math
-from decimal import Decimal
-import time
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict
-from types import SimpleNamespace
 import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+from types import SimpleNamespace
+from typing import List, Optional, Dict
 
 # Add project to path
 project_root = Path(__file__).parent
@@ -49,7 +49,7 @@ from nautilus_trader.adapters.polymarket.factories import (
     PolymarketLiveExecClientFactory,
 )
 from nautilus_trader.trading.strategy import Strategy
-from nautilus_trader.model.identifiers import InstrumentId, ClientOrderId
+from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.objects import Quantity, Price
 from nautilus_trader.model.data import QuoteTick
@@ -62,6 +62,7 @@ import requests
 # Persistent HTTP session for Gamma API calls (reuses TCP/TLS connections)
 _gamma_session: Optional[requests.Session] = None
 
+
 def _get_gamma_session() -> requests.Session:
     """Return a module-level persistent requests.Session for Gamma API."""
     global _gamma_session
@@ -70,13 +71,12 @@ def _get_gamma_session() -> requests.Session:
         _gamma_session.headers.update({"Accept": "application/json"})
     return _gamma_session
 
+
 # Signal processors (kept as confirmation signals in V3)
 from core.strategy_brain.signal_processors.spike_detector import SpikeDetectionProcessor
-from core.strategy_brain.signal_processors.sentiment_processor import SentimentProcessor
 from core.strategy_brain.signal_processors.divergence_processor import PriceDivergenceProcessor
 from core.strategy_brain.signal_processors.orderbook_processor import OrderBookImbalanceProcessor
 from core.strategy_brain.signal_processors.tick_velocity_processor import TickVelocityProcessor
-from core.strategy_brain.signal_processors.deribit_pcr_processor import DeribitPCRProcessor
 from core.strategy_brain.fusion_engine.signal_fusion import get_fusion_engine
 from execution.risk_engine import get_risk_engine
 from monitoring.performance_tracker import get_performance_tracker
@@ -84,7 +84,7 @@ from monitoring.grafana_exporter import get_grafana_exporter
 from feedback.learning_engine import get_learning_engine
 
 # V3: Quantitative pricing model
-from binary_pricer import get_binary_pricer, BinaryOptionPricer
+from binary_pricer import get_binary_pricer
 from vol_estimator import get_vol_estimator
 from mispricing_detector import get_mispricing_detector
 
@@ -136,6 +136,10 @@ RTDS_DIVERGENCE_THRESHOLD_BPS = float(os.getenv("RTDS_DIVERGENCE_THRESHOLD_BPS",
 USE_FUNDING_FILTER = os.getenv("USE_FUNDING_FILTER", "true").lower() == "true"
 LATE_WINDOW_ENABLED = os.getenv("LATE_WINDOW_ENABLED", "true").lower() == "true"
 SHADOW_MODE_ONLY = os.getenv("SHADOW_MODE_ONLY", "false").lower() == "true"
+
+# V3: Gamma Scalping Config
+GAMMA_EXIT_PROFIT_PCT = float(os.getenv("GAMMA_EXIT_PROFIT_PCT", "0.04"))  # 4% profit threshold for late exit
+GAMMA_EXIT_TIME_MINS = float(os.getenv("GAMMA_EXIT_TIME_MINS", "3.0"))  # Active threshold in final 3 minutes
 
 
 # =============================================================================
@@ -206,7 +210,7 @@ def init_redis():
 # V3.2: Fetch authoritative strike ("price to beat") from Gamma API
 # =============================================================================
 
-def fetch_price_to_beat(slug: str, timeout: float = 5.0) -> Optional[float]:
+def fetch_price_to_beat(slug: str, timeout: float = 10.0, max_retries: int = 3) -> Optional[float]:
     """
     Fetch the authoritative 'priceToBeat' for a BTC 15-min UpDown market.
 
@@ -216,38 +220,53 @@ def fetch_price_to_beat(slug: str, timeout: float = 5.0) -> Optional[float]:
 
     Path: GET /markets?slug=<slug>  →  events[0].eventMetadata.priceToBeat
     """
-    try:
-        session = _get_gamma_session()
-        r = session.get(
-            "https://gamma-api.polymarket.com/markets",
-            params={"slug": slug},
-            timeout=timeout,
-        )
-        if r.status_code != 200:
-            logger.debug(f"Gamma API returned {r.status_code} for slug={slug}")
+    session = _get_gamma_session()
+    backoff = 1.0
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = session.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={"slug": slug},
+                timeout=timeout,
+            )
+            if r.status_code != 200:
+                logger.debug(f"Gamma API returned {r.status_code} for slug={slug} (attempt {attempt})")
+                # Retry on server errors / non-200 up to max_retries
+                if attempt < max_retries:
+                    logger.info(f"Retrying fetch_price_to_beat in {backoff}s (attempt {attempt+1}/{max_retries})")
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                return None
+
+            data = r.json()
+            if not data:
+                return None
+
+            market = data[0]
+            events = market.get("events", [])
+            if not events:
+                return None
+
+            metadata = events[0].get("eventMetadata")
+            if not metadata or not isinstance(metadata, dict):
+                return None
+
+            ptb = metadata.get("priceToBeat")
+            if ptb is not None:
+                return float(ptb)
+
             return None
-
-        data = r.json()
-        if not data:
-            return None
-
-        market = data[0]
-        events = market.get("events", [])
-        if not events:
-            return None
-
-        metadata = events[0].get("eventMetadata")
-        if not metadata or not isinstance(metadata, dict):
-            return None
-
-        ptb = metadata.get("priceToBeat")
-        if ptb is not None:
-            return float(ptb)
-
-        return None
-    except Exception as e:
-        logger.debug(f"fetch_price_to_beat({slug}) failed: {e}")
-        return None
+        except Exception as e:
+            # Handle request-level failures with exponential backoff
+            logger.debug(f"fetch_price_to_beat({slug}) attempt {attempt} failed: {e}")
+            if attempt < max_retries:
+                logger.info(f"fetch_price_to_beat retry in {backoff}s (attempt {attempt+1}/{max_retries})")
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            else:
+                return None
 
 
 # =============================================================================
@@ -348,7 +367,7 @@ class IntegratedBTCStrategy(Strategy):
         self.vol_estimator = get_vol_estimator()
         self.mispricing_detector = get_mispricing_detector(
             maker_fee=0.00,
-            taker_fee=0.02,         # V2: ~2% default, overridden by nonlinear formula (was 10%!)
+            taker_fee=0.02,  # V2: ~2% default, overridden by nonlinear formula (was 10%!)
             min_edge_cents=MIN_EDGE_CENTS,
             min_edge_after_fees=0.005,
             take_profit_pct=TAKE_PROFIT_PCT,
@@ -394,10 +413,6 @@ class IntegratedBTCStrategy(Strategy):
             spike_threshold=float(os.getenv("SPIKE_THRESHOLD", "0.05")),
             lookback_periods=20,
         )
-        self.sentiment_processor = SentimentProcessor(
-            extreme_fear_threshold=25,
-            extreme_greed_threshold=75,
-        )
         self.divergence_processor = PriceDivergenceProcessor(
             divergence_threshold=float(os.getenv("DIVERGENCE_THRESHOLD", "0.05")),
         )
@@ -409,21 +424,13 @@ class IntegratedBTCStrategy(Strategy):
             velocity_threshold_60s=0.015,
             velocity_threshold_30s=0.010,
         )
-        self.deribit_pcr_processor = DeribitPCRProcessor(
-            bullish_pcr_threshold=1.20,
-            bearish_pcr_threshold=0.70,
-            max_days_to_expiry=2,
-            cache_seconds=300,
-        )
 
         # Fusion engine (kept for confirmation and heuristic fallback)
         self.fusion_engine = get_fusion_engine()
-        self.fusion_engine.set_weight("OrderBookImbalance", 0.30)
-        self.fusion_engine.set_weight("TickVelocity", 0.25)
-        self.fusion_engine.set_weight("PriceDivergence", 0.18)
-        self.fusion_engine.set_weight("SpikeDetection", 0.12)
-        self.fusion_engine.set_weight("DeribitPCR", 0.10)
-        self.fusion_engine.set_weight("SentimentAnalysis", 0.05)
+        self.fusion_engine.set_weight("OrderBookImbalance", 0.40)
+        self.fusion_engine.set_weight("TickVelocity", 0.30)
+        self.fusion_engine.set_weight("PriceDivergence", 0.20)
+        self.fusion_engine.set_weight("SpikeDetection", 0.10)
 
         # Risk / Performance / Learning
         self.risk_engine = get_risk_engine()
@@ -653,7 +660,7 @@ class IntegratedBTCStrategy(Strategy):
         elif self.rtds and self.rtds.binance_btc_price > 0 and self.rtds.binance_age_ms < 60000:
             # V3.2: RTDS Binance as intermediate fallback (Chainlink feed may be silent)
             spot = self.rtds.binance_btc_price
-            
+
         # Concurrent I/O fetches
         async def _fetch_coinbase():
             if spot is not None or not self._coinbase_source:
@@ -779,7 +786,7 @@ class IntegratedBTCStrategy(Strategy):
 
         if self.grafana_exporter:
             threading.Thread(target=self._start_grafana_sync, daemon=True).start()
-            
+
         # V3.2 FIX: Dedicated background thread for News polling
         self.news_thread = self._start_news_polling()
 
@@ -1195,6 +1202,7 @@ class IntegratedBTCStrategy(Strategy):
             # =========================================================
             try:
                 await self._refresh_cached_data()
+                await self._manage_open_positions()
 
                 # V3.3: Record strike if not yet set.
                 # Priority: boundary snapshot > Chainlink deque > current Chainlink
@@ -1261,7 +1269,7 @@ class IntegratedBTCStrategy(Strategy):
                         if self._strike_defer_start is None:
                             self._strike_defer_start = time.time()
                         defer_elapsed = time.time() - self._strike_defer_start
-                        
+
                         # Throttle log to every 30s
                         if getattr(self, "_last_defer_log", 0) < time.time() - 25:
                             logger.debug(
@@ -1303,7 +1311,10 @@ class IntegratedBTCStrategy(Strategy):
                 self.price_history.pop(0)
 
             self._last_bid_ask = (bid_decimal, ask_decimal)
-            self._tick_buffer.append({'ts': now, 'price': mid_price})
+
+            # Append both a normalized 'price' (spot if available, else mid) and explicit 'spot_price'
+            spot_for_tick = float(self._cached_spot_price) if self._cached_spot_price is not None else float(mid_price)
+            self._tick_buffer.append({'ts': now, 'price': spot_for_tick, 'spot_price': self._cached_spot_price})
 
             # Stability gate
             if not self._market_stable:
@@ -1337,14 +1348,14 @@ class IntegratedBTCStrategy(Strategy):
             # Evaluates continuously between TRADE_WINDOW_START_SEC and TRADE_WINDOW_END_SEC
             # Locks out only AFTER a successful execution or decision has been recorded
             if (TRADE_WINDOW_START_SEC <= seconds_into_sub_interval < TRADE_WINDOW_END_SEC
-                    and trade_key != self.last_trade_time 
+                    and trade_key != self.last_trade_time
                     and self._btc_strike_price is not None):
 
                 # We don't lock `self.last_trade_time` here yet! 
                 # We only lock it if `_make_trading_decision_sync` actually executes a trade.
                 # However we do want to ratelimit the logs + evaluations so we don't spam the CPU 
                 # 50 times a second. We'll evaluate once every 5 seconds.
-                
+
                 # Use a throttling key for evaluations
                 throttle_key = f"{sub_interval}_{int(seconds_into_sub_interval // 5)}"
                 if getattr(self, "_last_eval_throttle", None) != throttle_key:
@@ -1514,8 +1525,8 @@ class IntegratedBTCStrategy(Strategy):
             else:
                 logger.warning(
                     f"No BTC spot or strike — SKIPPING trade (live mode requires quant model). "
-                    f"spot={'$'+f'{btc_spot:,.2f}' if btc_spot else 'None'}, "
-                    f"strike={'$'+f'{self._btc_strike_price:,.2f}' if self._btc_strike_price else 'None'}"
+                    f"spot={'$' + f'{btc_spot:,.2f}' if btc_spot else 'None'}, "
+                    f"strike={'$' + f'{self._btc_strike_price:,.2f}' if self._btc_strike_price else 'None'}"
                 )
             return
 
@@ -1556,12 +1567,6 @@ class IntegratedBTCStrategy(Strategy):
         # V3.1: Compute vol skew + pass funding bias
         # V3.4 FIX: Pass `vol_skew` from genuine Deribit data instead of synthetic formula
         vol_skew = 0.0
-        if getattr(self, "deribit_pcr", None) and self.deribit_pcr._cached_result:
-            pcr = self.deribit_pcr._cached_result.get("short_pcr", 1.0)
-            # PCR > 1 (puts expensive) -> negative skew. 
-            # e.g. PCR = 1.2 -> skew = -0.02
-            vol_skew = -0.10 * (pcr - 1.0)
-            vol_skew = max(-0.10, min(0.05, vol_skew))
 
         signal = self.mispricing_detector.detect(
             yes_market_price=yes_price,
@@ -1637,7 +1642,23 @@ class IntegratedBTCStrategy(Strategy):
             return
 
         # Step 12: Execute
-        logger.info(f"Position size: ${POSITION_SIZE_USD} | Direction: {direction.upper()}")
+        # Determine position size via Risk Engine (use detector's kelly fraction)
+        try:
+            # signal.score may not exist; use confidence*100 as fallback score
+            signal_score = getattr(signal, 'score', signal.confidence * 100)
+            position_size_decimal = self.risk_engine.calculate_position_size(
+                signal_confidence=signal.confidence,
+                signal_score=signal_score,
+                current_price=Decimal(str(current_price)),
+                time_remaining_mins=time_remaining_min,
+                kelly_fraction=getattr(signal, 'kelly_fraction', 0.0),
+            )
+            position_size_usd = float(position_size_decimal)
+        except Exception:
+            # Fallback to configured static size
+            position_size_usd = float(POSITION_SIZE_USD)
+
+        logger.info(f"Position size: ${position_size_usd:.2f} | Direction: {direction.upper()}")
 
         mock_signal = SimpleNamespace(
             direction="BULLISH" if direction == "long" else "BEARISH",
@@ -1652,13 +1673,13 @@ class IntegratedBTCStrategy(Strategy):
 
         if is_simulation or SHADOW_MODE_ONLY:
             if SHADOW_MODE_ONLY and not is_simulation:
-                logger.warning(f"👻 [SHADOW MODE] Paper trading {direction.upper()} | Size: ${POSITION_SIZE_USD}")
-            await self._record_paper_trade(mock_signal, POSITION_SIZE_USD, current_price, direction)
+                logger.warning(f"👻 [SHADOW MODE] Paper trading {direction.upper()} | Size: ${position_size_usd}")
+            await self._record_paper_trade(mock_signal, position_size_usd, current_price, direction)
         else:
             if USE_LIMIT_ORDERS:
-                await self._place_limit_order(mock_signal, POSITION_SIZE_USD, current_price, direction)
+                await self._place_limit_order(mock_signal, position_size_usd, current_price, direction)
             else:
-                await self._place_real_order(mock_signal, POSITION_SIZE_USD, current_price, direction)
+                await self._place_real_order(mock_signal, position_size_usd, current_price, direction)
 
         # Track entry for exit monitoring
         self._active_entry = {
@@ -1804,14 +1825,6 @@ class IntegratedBTCStrategy(Strategy):
             if tv_signal:
                 signals.append(tv_signal)
 
-        pcr_signal = self.deribit_pcr_processor.process(
-            current_price=current_price,
-            historical_prices=self.price_history,
-            metadata=processed_metadata,
-        )
-        if pcr_signal:
-            signals.append(pcr_signal)
-
         return signals
 
     # ------------------------------------------------------------------
@@ -1943,19 +1956,57 @@ class IntegratedBTCStrategy(Strategy):
             # V3 FIX: Place at best bid to GUARANTEE maker.
             # At the bid, our order rests in the book = maker (0% fee).
             # V2 placed at mid-spread, which crossed to the ask = taker (10%).
-            limit_price = token_bid
+            # --- DYNAMIC EXECUTION ROUTING (Choice A) ---
+            edge = getattr(signal, 'edge', 0.0)
+            if edge == 0.0 and hasattr(signal, 'confidence'):
+                # Principled heuristic calculation:
+                # Maps confidence (0.50 to 1.0) linearly to an assumed edge (0% to 25%)
+                # Rationale: A purely heuristic signal lacks a priced edge. We assume a
+                # 100% confidence signal implies a maximum expected VRP/edge of ~25% in 15m markets.
+                edge = max(0.0, float(signal.confidence - 0.50) * 0.50)
 
-            # Clamp
+            if edge > 0.10:
+                # CRITICAL EDGE: Cross the spread. Eat the taker fee to guarantee fill.
+                limit_price = token_ask
+                logger.info(f"⚡ CRITICAL EDGE ({edge:.1%}): Crossing spread to guarantee fill.")
+            elif edge > 0.04 or signal.confidence > 0.70:
+                # STRONG EDGE: Penny the bid to jump the queue (Maker status likely)
+                limit_price = token_bid + Decimal("0.001")
+                limit_price = min(limit_price, token_ask - Decimal("0.001"))  # Don't cross ask
+                logger.info(f"🎯 STRONG EDGE ({edge:.1%}): Pennying the bid (+0.001) to jump queue.")
+            else:
+                # STANDARD EDGE: Rest passively at the bid (Pure Maker)
+                limit_price = token_bid
+                logger.info(f"🛡️ STANDARD EDGE ({edge:.1%}): Resting passively at best bid.")
+
+            # Clamp bounds
             limit_price = max(Decimal("0.01"), min(Decimal("0.99"), limit_price))
 
             # Calculate token quantity from position size
-            token_qty = float(position_size / limit_price)
+            token_qty = 0.0
+            try:
+                token_qty = float(position_size / limit_price)
+            except Exception:
+                token_qty = 0.0
+
             precision = instrument.size_precision
+
+            # Determine exchange-declared min quantity (if present)
+            min_qty_val = float(getattr(instrument, 'min_quantity', None) or Decimal("0.01"))
+
+            # Enforce a hard minimum token quantity (Polymarket enforces min shares, often 5)
+            enforced_min_token_qty = float(os.getenv("MIN_TOKEN_QTY", "5.0"))
+            final_min_qty = max(min_qty_val, enforced_min_token_qty)
+
+            # Ensure quantity respects minimums and precision
+            token_qty = max(token_qty, final_min_qty)
             token_qty = round(token_qty, precision)
 
-            # Use exchange minimum, NOT hardcoded 5.0
-            min_qty = float(getattr(instrument, 'min_quantity', None) or Decimal("0.01"))
-            token_qty = max(token_qty, min_qty)
+            # Recompute estimated USD position size based on enforced token quantity
+            try:
+                estimated_cost = float(Decimal(str(token_qty)) * limit_price)
+            except Exception:
+                estimated_cost = float(position_size)
 
             logger.info("=" * 80)
             logger.info(f"LIMIT ORDER @ BID (MAKER, 0% FEE)")
@@ -1987,17 +2038,17 @@ class IntegratedBTCStrategy(Strategy):
             logger.info(f"  Direction: {trade_label}")
             logger.info(f"  Limit Price: ${float(limit_price):.4f} (at bid)")
             logger.info(f"  Quantity: {token_qty:.2f}")
-            logger.info(f"  Estimated Cost: ~${float(position_size):.2f}")
+            logger.info(f"  Estimated Cost: ~${float(estimated_cost):.2f}")
             logger.info(f"  Fee: 0% (maker — resting at bid)")
             logger.info("=" * 80)
 
-            # Track position
+            # Track position (use estimated cost which respects enforced min qty)
             current_market = self.all_btc_instruments[self.current_instrument_index]
             self._open_positions.append(OpenPosition(
                 market_slug=current_market['slug'],
                 direction=direction,
                 entry_price=float(limit_price),
-                size_usd=float(position_size),
+                size_usd=float(estimated_cost),
                 entry_time=datetime.now(timezone.utc),
                 market_end_time=current_market['end_time'],
                 instrument_id=trade_instrument_id,
@@ -2050,8 +2101,19 @@ class IntegratedBTCStrategy(Strategy):
             precision = instrument.size_precision
             min_qty_val = float(getattr(instrument, 'min_quantity', None) or Decimal("0.01"))
             token_qty = max_usd_amount / trade_price if trade_price > 0 else min_qty_val
+
+            # Enforce a hard minimum token quantity (Polymarket enforces min shares, often 5)
+            enforced_min_token_qty = float(os.getenv("MIN_TOKEN_QTY", "5.0"))
+            final_min_qty = max(min_qty_val, enforced_min_token_qty)
+
+            token_qty = max(token_qty, final_min_qty)
             token_qty = round(token_qty, precision)
-            token_qty = max(token_qty, min_qty_val)
+
+            # Recompute estimated USD amount based on enforced token quantity
+            try:
+                estimated_cost = float(Decimal(str(token_qty)) * Decimal(str(trade_price)))
+            except Exception:
+                estimated_cost = float(max_usd_amount)
 
             qty = Quantity(token_qty, precision=precision)
             timestamp_ms = int(time.time() * 1000)
@@ -2071,7 +2133,7 @@ class IntegratedBTCStrategy(Strategy):
             logger.info(f"MARKET ORDER SUBMITTED!")
             logger.info(f"  Order ID: {unique_id}")
             logger.info(f"  Direction: {trade_label}")
-            logger.info(f"  Estimated Cost: ~${max_usd_amount:.2f}")
+            logger.info(f"  Estimated Cost: ~${estimated_cost:.2f}")
             logger.info(f"  Fee: ~10% (taker)")
             logger.info("=" * 80)
 
@@ -2080,7 +2142,7 @@ class IntegratedBTCStrategy(Strategy):
                 market_slug=current_market['slug'],
                 direction=direction,
                 entry_price=trade_price,
-                size_usd=max_usd_amount,
+                size_usd=estimated_cost,
                 entry_time=datetime.now(timezone.utc),
                 market_end_time=current_market['end_time'],
                 instrument_id=trade_instrument_id,
@@ -2110,6 +2172,41 @@ class IntegratedBTCStrategy(Strategy):
                 logger.debug(f"PerformanceTracker has no order-counter method; ignoring '{event_type}'")
         except Exception as e:
             logger.warning(f"Failed to track order event '{event_type}': {e}")
+
+    async def _safe_submit_order(self, order) -> bool:
+        """
+        Safely submit an order: if this is a paper-derived EXIT order or we're in
+        simulation/shadow mode, do not submit to the exchange and simulate a local
+        fill instead.
+
+        Returns True if order was actually submitted, False if simulated/skipped.
+        """
+        try:
+            # client_order_id may be a ClientOrderId object or string-like
+            coid = getattr(order, 'client_order_id', None)
+            coid_str = str(coid) if coid is not None else ''
+
+            # If this is an EXIT for a paper trade, never send to exchange
+            if 'EXIT-paper_' in coid_str or coid_str.startswith('EXIT-paper_'):
+                logger.info(f"[SAFE SUBMIT] Skipping real submit for paper EXIT {coid_str}")
+                return False
+
+            is_sim = False
+            try:
+                is_sim = await self.check_simulation_mode()
+            except Exception:
+                is_sim = False
+
+            if is_sim:
+                logger.info(f"[SAFE SUBMIT] Simulation mode active — skipping real submit for {coid_str}")
+                return False
+
+            # Otherwise submit as normal
+            self.submit_order(order)
+            return True
+        except Exception as e:
+            logger.error(f"_safe_submit_order failed: {e}")
+            return False
 
     def on_order_filled(self, event):
         logger.info("=" * 80)
@@ -2180,6 +2277,7 @@ class IntegratedBTCStrategy(Strategy):
 
     def _start_news_polling(self):
         """Start news/sentiment polling in a dedicated background thread."""
+
         def _run():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -2214,6 +2312,74 @@ class IntegratedBTCStrategy(Strategy):
                 logger.debug(f"News poll error: {e}")
 
             await asyncio.sleep(60)  # F&G only updates daily, 60s is plenty
+
+    async def _manage_open_positions(self):
+        """
+        Continuously monitor positions and execute Gamma Scalp exits.
+        """
+        now_ts = datetime.now(timezone.utc).timestamp()
+
+        for pos in self._open_positions:
+            if pos.resolved:
+                continue
+
+            try:
+                instrument = self.cache.instrument(pos.instrument_id)
+                if not instrument:
+                    continue
+
+                quote = self.cache.quote_tick(pos.instrument_id)
+                if not quote:
+                    continue
+                # If long, sell at the BID to exit immediately
+                current_exit_price = float(quote.bid_price.as_decimal())
+            except Exception:
+                continue
+
+            # Calculate Unrealized PnL
+            pnl_pct = (current_exit_price - pos.entry_price) / pos.entry_price
+
+            end_ts = pos.market_end_time.timestamp()
+            mins_remaining = max(0.0, (end_ts - now_ts) / 60.0)
+
+            # GAMMA SCALP LOGIC using defined constants
+            if pnl_pct >= TAKE_PROFIT_PCT or (
+                    mins_remaining < GAMMA_EXIT_TIME_MINS and pnl_pct > GAMMA_EXIT_PROFIT_PCT):
+                logger.info(
+                    f"💰 GAMMA SCALP EXIT: {pos.market_slug} | "
+                    f"PnL: +{pnl_pct:.1%} | T-Minus: {mins_remaining:.1f}m"
+                )
+
+                # Fetch dynamic precision from the instrument
+                precision = instrument.size_precision
+
+                # If this is a paper trade or we're running in simulation/shadow mode,
+                # do NOT submit a real exchange order. Simulate the exit locally.
+                try:
+                    is_simulation = await self.check_simulation_mode()
+                except Exception:
+                    is_simulation = False
+
+                if is_simulation or str(pos.order_id).startswith("paper_"):
+                    logger.info(f"[SIMULATION] Simulating exit for {pos.order_id} — no real order submitted")
+                    pos.resolved = True
+                    pos.exit_price = current_exit_price
+                    pos.pnl = pos.size_usd * pnl_pct
+                    continue
+
+                # Create an IOC Market order to close
+                qty = Quantity(float(pos.size_usd / pos.entry_price), precision=precision)
+                order = self.order_factory.market(
+                    instrument_id=pos.instrument_id,
+                    order_side=OrderSide.SELL,
+                    quantity=qty,
+                    client_order_id=ClientOrderId(f"EXIT-{pos.order_id}"),
+                    time_in_force=TimeInForce.IOC,
+                )
+                self.submit_order(order)
+                pos.resolved = True
+                pos.exit_price = current_exit_price
+                pos.pnl = pos.size_usd * pnl_pct
 
     def on_stop(self):
         logger.info("Integrated BTC strategy V3.1 stopped")
@@ -2265,6 +2431,7 @@ class IntegratedBTCStrategy(Strategy):
                     async def _shutdown_grafana():
                         await self.grafana_exporter.stop()
                         grafana_loop.stop()
+
                     asyncio.run_coroutine_threadsafe(_shutdown_grafana(), grafana_loop)
                 else:
                     # Loop already stopped — just clean up
@@ -2296,7 +2463,8 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         except Exception as e:
             logger.warning(f"Could not set Redis simulation mode: {e}")
 
-    print(f"\nMode: {'SIMULATION' if simulation else 'LIVE TRADING'} | Trade Size: ${POSITION_SIZE_USD} | Min Edge: ${MIN_EDGE_CENTS:.2f}")
+    print(
+        f"\nMode: {'SIMULATION' if simulation else 'LIVE TRADING'} | Trade Size: ${POSITION_SIZE_USD} | Min Edge: ${MIN_EDGE_CENTS:.2f}")
 
     logger.info("Loading BTC 15-min markets via event slug builder...")
 

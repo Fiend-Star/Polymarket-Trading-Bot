@@ -28,10 +28,10 @@ Maps Polymarket YES/NO tokens to cash-or-nothing binary options:
 """
 
 import math
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
+
 from loguru import logger
 
 
@@ -57,28 +57,28 @@ def _norm_pdf(x: float) -> float:
 class BinaryOptionPrice:
     """Complete pricing output for a binary option."""
     # Fair values
-    yes_fair_value: float       # Binary call price (0 to 1)
-    no_fair_value: float        # Binary put price (0 to 1)
+    yes_fair_value: float  # Binary call price (0 to 1)
+    no_fair_value: float  # Binary put price (0 to 1)
 
     # Greeks (for the YES/call side)
-    delta: float                # dP/dS — sensitivity to spot
-    gamma: float                # d²P/dS² — convexity
-    theta: float                # dP/dT — time decay (per minute)
-    vega: float                 # dP/dσ — vol sensitivity
+    delta: float  # dP/dS — sensitivity to spot
+    gamma: float  # d²P/dS² — convexity
+    theta: float  # dP/dT — time decay (per minute)
+    vega: float  # dP/dσ — vol sensitivity
 
     # Inputs (for logging/debugging)
     spot: float
     strike: float
-    vol: float                  # Annualized
+    vol: float  # Annualized
     time_remaining_min: float
     d2: float
 
     # Derived
-    moneyness: float            # S/K ratio
-    implied_prob: float         # Model-implied probability of YES outcome
+    moneyness: float  # S/K ratio
+    implied_prob: float  # Model-implied probability of YES outcome
 
     # V2 fields: pricing method + adjustment components
-    method: str = "bsm"        # "bsm", "merton_jd", "adjusted"
+    method: str = "bsm"  # "bsm", "merton_jd", "adjusted"
     bsm_base: float = 0.0
     jump_adjustment: float = 0.0
     mean_reversion_adj: float = 0.0
@@ -132,9 +132,9 @@ class BinaryOptionPricer:
     # --- Intraday seasonality (QuantPedia / SSRN 4581124) ---
     # Hour-of-day bullish/bearish bias in BTC returns (UTC)
     HOURLY_BIAS = {
-        0: 0.10,  1: 0.05,  2: 0.02,  3: -0.15,
-        4: -0.12, 5: -0.05, 6: 0.00,  7: 0.02,
-        8: 0.03,  9: 0.05, 10: 0.04, 11: 0.02,
+        0: 0.10, 1: 0.05, 2: 0.02, 3: -0.15,
+        4: -0.12, 5: -0.05, 6: 0.00, 7: 0.02,
+        8: 0.03, 9: 0.05, 10: 0.04, 11: 0.02,
         12: 0.00, 13: -0.02, 14: 0.03, 15: 0.05,
         16: 0.04, 17: 0.02, 18: -0.03, 19: -0.05,
         20: 0.00, 21: 0.08, 22: 0.15, 23: 0.12,
@@ -143,8 +143,8 @@ class BinaryOptionPricer:
 
     # --- Mean reversion ---
     MEAN_REVERSION_THRESHOLD_SIGMA = 1.5
-    MEAN_REVERSION_STRENGTH = 0.06       # Max ~6% probability shift
-    NEGATIVE_REVERSION_MULT = 1.25       # Negative returns revert 25% faster
+    MEAN_REVERSION_STRENGTH = 0.06  # Max ~6% probability shift
+    NEGATIVE_REVERSION_MULT = 1.25  # Negative returns revert 25% faster
 
     def __init__(self, risk_free_rate: float = 0.0):
         self.r = risk_free_rate
@@ -155,26 +155,26 @@ class BinaryOptionPricer:
     # ==================================================================
 
     def price(
-        self,
-        spot: float,
-        strike: float,
-        vol: float,
-        time_remaining_min: float,
-        # V2: Jump-diffusion parameters (from VolEstimator)
-        jump_intensity: float = 1500.0,
-        jump_mean: float = -0.0008,
-        jump_vol: float = 0.003,
-        # V2: Mean reversion inputs
-        recent_return: Optional[float] = None,
-        recent_return_sigma: Optional[float] = None,
-        # V2: Overlay toggle
-        apply_overlays: bool = True,
-        # V3: Skew-adjusted binary correction (dσ/dK)
-        vol_skew: Optional[float] = None,
-        # V3: Funding rate regime bias
-        funding_bias: float = 0.0,
-        # V3.4: Exact market end time
-        market_end_time: Optional[datetime] = None,
+            self,
+            spot: float,
+            strike: float,
+            vol: float,
+            time_remaining_min: float,
+            # V2: Jump-diffusion parameters (from VolEstimator)
+            jump_intensity: float = 1500.0,
+            jump_mean: float = -0.0008,
+            jump_vol: float = 0.003,
+            # V2: Mean reversion inputs
+            recent_return: Optional[float] = None,
+            recent_return_sigma: Optional[float] = None,
+            # V2: Overlay toggle
+            apply_overlays: bool = True,
+            # V3: Skew-adjusted binary correction (dσ/dK)
+            vol_skew: Optional[float] = None,
+            # V3: Funding rate regime bias
+            funding_bias: float = 0.0,
+            # V3.4: Exact market end time
+            market_end_time: Optional[datetime] = None,
     ) -> BinaryOptionPrice:
         """
         Price a binary call (YES) and put (NO) using jump-diffusion + overlays.
@@ -230,8 +230,8 @@ class BinaryOptionPricer:
 
         # --- Combine ---
         yes_fv = max(0.01, min(0.99,
-            yes_base + mr_adj + candle_adj + season_adj + skew_adj_val + funding_adj
-        ))
+                               yes_base + mr_adj + candle_adj + season_adj + skew_adj_val + funding_adj
+                               ))
         no_fv = max(0.01, min(0.99, 1.0 - yes_fv))
 
         return BinaryOptionPrice(
@@ -262,15 +262,15 @@ class BinaryOptionPricer:
     # ==================================================================
 
     def _merton_jump_diffusion(
-        self,
-        spot: float,
-        strike: float,
-        vol: float,
-        T: float,
-        jump_intensity: float,
-        jump_mean: float,
-        jump_vol: float,
-        num_terms: int = 25,
+            self,
+            spot: float,
+            strike: float,
+            vol: float,
+            T: float,
+            jump_intensity: float,
+            jump_mean: float,
+            jump_vol: float,
+            num_terms: int = 25,
     ) -> tuple:
         """
         Merton jump-diffusion binary option pricing.
@@ -334,7 +334,7 @@ class BinaryOptionPricer:
     # ==================================================================
 
     def _bsm_with_greeks(
-        self, spot: float, strike: float, vol: float, T: float
+            self, spot: float, strike: float, vol: float, T: float
     ) -> tuple:
         """Standard BSM binary pricing + Greeks. Returns (yes_prob, d2, greeks)."""
         sqrt_T = math.sqrt(T)
@@ -366,7 +366,7 @@ class BinaryOptionPricer:
     # ==================================================================
 
     def _mean_reversion_adj(
-        self, recent_return: float, recent_sigma: float, t_min: float
+            self, recent_return: float, recent_sigma: float, t_min: float
     ) -> float:
         """
         Mean reversion overlay. BTC has negative autocorrelation at 15-min.
@@ -402,9 +402,9 @@ class BinaryOptionPricer:
             resolve_minute = (now.minute + round(time_remaining_min)) % 60
 
         if resolve_minute in self.CANDLE_MINUTES:
-            return 0.002   # +0.2% bullish bias at candle boundaries
+            return 0.002  # +0.2% bullish bias at candle boundaries
         elif resolve_minute % 15 <= 1 or resolve_minute % 15 >= 14:
-            return 0.001   # Partial effect near boundaries
+            return 0.001  # Partial effect near boundaries
         else:
             return -0.0005  # Slight negative at non-boundary minutes
 
@@ -428,10 +428,10 @@ class BinaryOptionPricer:
 
     @staticmethod
     def estimate_btc_vol_skew(
-        spot: float,
-        strike: float,
-        vol: float,
-        time_remaining_min: float,
+            spot: float,
+            strike: float,
+            vol: float,
+            time_remaining_min: float,
     ) -> float:
         """
         Estimate dσ/dK (vol skew slope) for BTC at short horizons.
@@ -495,14 +495,14 @@ class BinaryOptionPricer:
     # ==================================================================
 
     def implied_vol(
-        self,
-        market_price: float,
-        spot: float,
-        strike: float,
-        time_remaining_min: float,
-        is_call: bool = True,
-        max_iterations: int = 50,
-        tolerance: float = 1e-6,
+            self,
+            market_price: float,
+            spot: float,
+            strike: float,
+            time_remaining_min: float,
+            is_call: bool = True,
+            max_iterations: int = 50,
+            tolerance: float = 1e-6,
     ) -> Optional[float]:
         """
         Back out implied volatility from market price using bisection.
@@ -516,10 +516,9 @@ class BinaryOptionPricer:
             return 0.0
 
         T = max(time_remaining_min / self.MINUTES_PER_YEAR, 1e-12)
-        # V3.2: Cap at 200% (was 500%). IV hitting the upper bound is a
-        # numerical failure, not a real vol estimate. 200% is still extremely
-        # generous for 15-min BTC options.
-        vol_low, vol_high = 0.01, 2.0
+        # INCREASE BOUNDS: 15-minute intraday vol can easily exceed 1000% annualized
+        # during liquidation wicks. Capping at 2.0 (200%) causes false failures.
+        vol_low, vol_high = 0.01, 15.0  # Raised from 2.0 to 15.0 (1500% vol)
         sqrt_T = math.sqrt(T)
 
         def _bsm_price(vol: float) -> float:
@@ -614,7 +613,7 @@ class BinaryOptionPricer:
     # ==================================================================
 
     def price_bsm(
-        self, spot: float, strike: float, vol: float, time_remaining_min: float,
+            self, spot: float, strike: float, vol: float, time_remaining_min: float,
     ) -> BinaryOptionPrice:
         """Pure BSM pricing for comparison/debugging."""
         if spot <= 0 or strike <= 0:
@@ -644,6 +643,7 @@ class BinaryOptionPricer:
 # Singleton
 # ---------------------------------------------------------------------------
 _pricer_instance = None
+
 
 def get_binary_pricer() -> BinaryOptionPricer:
     global _pricer_instance

@@ -1,31 +1,32 @@
-import subprocess
-import time
-import sys
 import os
-from pathlib import Path
+import subprocess
+import sys
+import time
 from datetime import datetime
+from pathlib import Path
 
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
+
 def run_bot():
     """Run the bot with auto-restart using the SAME Python environment."""
-    
+
     BOT_SCRIPT = "bot.py"
-    
+
     # CRITICAL: Use the SAME Python executable
     python_cmd = sys.executable
-    
+
     # Get command line arguments (excluding the script name)
     # If you run "python 15m_bot_runner.py --live", this captures ['--live']
     bot_args = sys.argv[1:] if len(sys.argv) > 1 else []
-    
+
     print("=" * 80)
     print("BTC 15-MIN TRADING BOT - AUTO-RESTART WRAPPER")
     print(f"Bot: {BOT_SCRIPT} {' '.join(bot_args)}")
     print("=" * 80)
     print()
-    
+
     # Check if bot script exists
     if not os.path.exists(BOT_SCRIPT):
         print(f"ERROR: Bot script '{BOT_SCRIPT}' not found!")
@@ -39,12 +40,12 @@ def run_bot():
         print()
         print("Please set BOT_SCRIPT to your bot filename")
         sys.exit(1)
-    
+
     restart_count = 0
-    
+
     while True:
         restart_count += 1
-        
+
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting bot (restart #{restart_count})...")
 
         try:
@@ -54,15 +55,15 @@ def run_bot():
                 cmd,
                 check=False
             )
-            
+
             exit_code = result.returncode
-            
+
             print()
             print("=" * 80)
             print(f"Bot stopped at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             print(f"Exit code: {exit_code}")
             print("=" * 80)
-            
+
             # Normal termination (auto-restart from bot)
             if exit_code in [0, 143, 15, -15]:
                 print("✅ Normal auto-restart - loading fresh filters...")
@@ -70,18 +71,18 @@ def run_bot():
             else:
                 print(f"⚠️ Error detected (code {exit_code}) - waiting before retry...")
                 wait_time = 10
-            
+
             print(f"Restarting in {wait_time} seconds...")
             print()
             time.sleep(wait_time)
-            
+
         except KeyboardInterrupt:
             print()
             print("=" * 80)
             print("Keyboard interrupt received - stopping wrapper")
             print("=" * 80)
             break
-            
+
         except Exception as e:
             print()
             print("=" * 80)
@@ -90,6 +91,7 @@ def run_bot():
             print("Waiting 10 seconds before retry...")
             print()
             time.sleep(10)
+
 
 if __name__ == "__main__":
     try:
