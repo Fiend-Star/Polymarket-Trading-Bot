@@ -963,14 +963,24 @@ class IntegratedBTCStrategy(Strategy):
             snap_price = self.rtds.get_boundary_price(next_market['market_timestamp'])
             if snap_price:
                 detail = self.rtds.get_boundary_detail(next_market['market_timestamp'])
+                # detail may be (price, delta_ms) or (price, delta_ms, source_ts, received_ts, latency)
                 delta_ms = detail[1] if detail else 0
+                source_ts = detail[2] if detail and len(detail) >= 3 else None
+                received_ts = detail[3] if detail and len(detail) >= 4 else None
+                latency_ms = detail[4] if detail and len(detail) >= 5 else None
                 self._btc_strike_price = snap_price
                 self._strike_recorded = True
                 self._strike_source = "chainlink_boundary"
-                logger.info(
-                    f"📌 Strike from boundary snapshot: "
-                    f"${snap_price:,.2f} (Δ={delta_ms}ms from boundary)"
-                )
+                if source_ts is not None:
+                    logger.info(
+                        f"📌 Strike from boundary snapshot: ${snap_price:,.2f} "
+                        f"(Δ={delta_ms}ms from boundary, source_ts={source_ts}, "
+                        f"received_ts={received_ts}, latency={latency_ms}ms)"
+                    )
+                else:
+                    logger.info(
+                        f"📌 Strike from boundary snapshot: ${snap_price:,.2f} (Δ={delta_ms}ms from boundary)"
+                    )
             else:
                 # Fall back to deque scan (e.g. boundary just happened)
                 cl_strike = self.rtds.get_chainlink_price_at(
@@ -1167,13 +1177,22 @@ class IntegratedBTCStrategy(Strategy):
                             if snap_price:
                                 detail = self.rtds.get_boundary_detail(mkt['market_timestamp'])
                                 delta_ms = detail[1] if detail else 0
+                                source_ts = detail[2] if detail and len(detail) >= 3 else None
+                                received_ts = detail[3] if detail and len(detail) >= 4 else None
+                                latency_ms = detail[4] if detail and len(detail) >= 5 else None
                                 self._btc_strike_price = snap_price
                                 self._strike_recorded = True
                                 self._strike_source = "chainlink_boundary"
-                                logger.info(
-                                    f"📌 Strike from boundary snapshot: "
-                                    f"${snap_price:,.2f} (Δ={delta_ms}ms)"
-                                )
+                                if source_ts is not None:
+                                    logger.info(
+                                        f"📌 Strike from boundary snapshot: ${snap_price:,.2f} "
+                                        f"(Δ={delta_ms}ms from boundary, source_ts={source_ts}, "
+                                        f"received_ts={received_ts}, latency={latency_ms}ms)"
+                                    )
+                                else:
+                                    logger.info(
+                                        f"📌 Strike from boundary snapshot: ${snap_price:,.2f} (Δ={delta_ms}ms)"
+                                    )
                             else:
                                 cl_strike = self.rtds.get_chainlink_price_at(
                                     float(mkt['market_timestamp']),
@@ -1219,14 +1238,23 @@ class IntegratedBTCStrategy(Strategy):
                         if snap:
                             detail = self.rtds.get_boundary_detail(mkt['market_timestamp'])
                             delta_ms = detail[1] if detail else 0
+                            source_ts = detail[2] if detail and len(detail) >= 3 else None
+                            received_ts = detail[3] if detail and len(detail) >= 4 else None
+                            latency_ms = detail[4] if detail and len(detail) >= 5 else None
                             self._btc_strike_price = snap
                             self._strike_recorded = True
                             self._strike_defer_start = None
                             self._strike_source = "chainlink_boundary"
-                            logger.info(
-                                f"📌 Strike from boundary snapshot: "
-                                f"${snap:,.2f} (Δ={delta_ms}ms)"
-                            )
+                            if source_ts is not None:
+                                logger.info(
+                                    f"📌 Strike from boundary snapshot: ${snap:,.2f} "
+                                    f"(Δ={delta_ms}ms from boundary, source_ts={source_ts}, "
+                                    f"received_ts={received_ts}, latency={latency_ms}ms)"
+                                )
+                            else:
+                                logger.info(
+                                    f"📌 Strike from boundary snapshot: ${snap:,.2f} (Δ={delta_ms}ms)"
+                                )
                             strike_set = True
 
                     # 2. Chainlink deque scan
