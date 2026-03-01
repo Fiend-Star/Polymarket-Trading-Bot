@@ -313,9 +313,23 @@ def auto_redeem_winnings(slug: str, direction: str, amount_won: float):
         return
 
     try:
+        from polymarket_apis.types.clob_types import ApiCreds
+        api_key = os.getenv("POLYMARKET_API_KEY")
+        api_secret = os.getenv("POLYMARKET_API_SECRET")
+        api_passphrase = os.getenv("POLYMARKET_PASSPHRASE")
+        
+        creds = None
+        if api_key and api_secret and api_passphrase:
+            creds = ApiCreds(
+                key=api_key,
+                secret=api_secret,
+                passphrase=api_passphrase
+            )
+            
         client = PolymarketGaslessWeb3Client(
             private_key=private_key,
-            signature_type=1
+            signature_type=1,
+            builder_creds=creds
         )
         
         # direction: "long" = Bought YES (index 0), "short" = Bought NO (index 1)
