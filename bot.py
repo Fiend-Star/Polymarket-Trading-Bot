@@ -2483,8 +2483,9 @@ class IntegratedBTCStrategy(Strategy):
                     pos.pnl = pos.size_usd * pnl_pct
                     continue
 
-                # FIX: Use calculated specific trade_instrument_id instead of parent instrument_id
-                trade_instrument_id = InstrumentId(f"{pos.market_slug}-{pos.direction}")
+                # Submit market SELL to exit with exact Nautilus outcome instrument ID
+                trade_instrument_id = getattr(self, '_yes_instrument_id', pos.instrument_id) if pos.direction == "long" else getattr(self, '_no_instrument_id', pos.instrument_id)
+                logger.info(f"DEBUG: Attempting to exit position. Original Direction: {pos.direction}, Expected string: {pos.instrument_id}, Mapped Token ID to sell: {trade_instrument_id}")
                 
                 qty = Quantity(pos.actual_qty, precision=precision)
                 order = self.order_factory.market(
