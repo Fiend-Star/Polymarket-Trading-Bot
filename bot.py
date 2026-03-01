@@ -2483,10 +2483,12 @@ class IntegratedBTCStrategy(Strategy):
                     pos.pnl = pos.size_usd * pnl_pct
                     continue
 
-                # FIX: Use pos.actual_qty instead of recalculating from pos.size_usd
+                # FIX: Use calculated specific trade_instrument_id instead of parent instrument_id
+                trade_instrument_id = InstrumentId(f"{pos.market_slug}-{pos.direction}")
+                
                 qty = Quantity(pos.actual_qty, precision=precision)
                 order = self.order_factory.market(
-                    instrument_id=pos.instrument_id,
+                    instrument_id=trade_instrument_id,
                     order_side=OrderSide.SELL,
                     quantity=qty,
                     client_order_id=ClientOrderId(f"EXIT-{pos.order_id}"),
