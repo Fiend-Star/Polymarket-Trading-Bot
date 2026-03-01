@@ -109,7 +109,7 @@ class PositionTracker:
 
     def _record(self, pos, final_price, is_paper, outcome):
         self._performance.record_trade(
-            trade_id=pos.order_id, direction="long",
+            trade_id=pos.order_id, direction=pos.direction,
             entry_price=Decimal(str(pos.entry_price)),
             exit_price=Decimal(str(final_price)),
             size=Decimal(str(pos.size_usd)),

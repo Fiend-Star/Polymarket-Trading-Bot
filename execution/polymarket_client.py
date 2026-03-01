@@ -8,11 +8,20 @@ from decimal import Decimal
 from typing import Optional, Dict, Any, List
 
 from loguru import logger
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs
-from py_clob_client.order_builder.constants import BUY, SELL
 
-POLYMARKET_AVAILABLE = True
+# Import guard for py_clob_client
+try:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import OrderArgs
+    from py_clob_client.order_builder.constants import BUY, SELL
+    POLYMARKET_AVAILABLE = True
+except ImportError:
+    logger.warning("py_clob_client not installed. Install with: pip install py-clob-client")
+    POLYMARKET_AVAILABLE = False
+    ClobClient = None
+    OrderArgs = None
+    BUY = "BUY"
+    SELL = "SELL"
 
 
 class PolymarketClient:

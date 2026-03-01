@@ -56,7 +56,7 @@ class BTCStrategy15Min:
 
         # Signal processors
         self.spike_detector = SpikeDetectionProcessor(
-            spike_threshold=0.15,
+            spike_threshold=0.05,  # 5% for probability prices (0-1 range)
             lookback_periods=20,
         )
 
