@@ -37,14 +37,14 @@ INTEGRATION:
   In _fetch_market_context(), add:
     metadata['tick_buffer'] = list(self._tick_buffer)
 """
-from decimal import Decimal
-from datetime import datetime, timezone, timedelta
-from collections import deque
-from typing import Optional, Dict, Any, List
-from loguru import logger
-
 import os
 import sys
+from datetime import datetime, timezone, timedelta
+from decimal import Decimal
+from typing import Optional, Dict, Any, List
+
+from loguru import logger
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from core.strategy_brain.signal_processors.base_processor import (
@@ -64,11 +64,11 @@ class TickVelocityProcessor(BaseSignalProcessor):
     """
 
     def __init__(
-        self,
-        velocity_threshold_60s: float = 0.015,   # 1.5% move in 60s
-        velocity_threshold_30s: float = 0.010,   # 1.0% move in 30s
-        min_ticks: int = 5,                       # need at least 5 ticks in window
-        min_confidence: float = 0.55,
+            self,
+            velocity_threshold_60s: float = 0.015,  # 1.5% move in 60s
+            velocity_threshold_30s: float = 0.010,  # 1.0% move in 30s
+            min_ticks: int = 5,  # need at least 5 ticks in window
+            min_confidence: float = 0.55,
     ):
         super().__init__("TickVelocity")
 
@@ -84,10 +84,10 @@ class TickVelocityProcessor(BaseSignalProcessor):
         )
 
     def _get_price_at(
-        self,
-        tick_buffer: List[Dict],
-        seconds_ago: float,
-        now: datetime,
+            self,
+            tick_buffer: List[Dict],
+            seconds_ago: float,
+            now: datetime,
     ) -> Optional[float]:
         """Find the tick price closest to `seconds_ago` seconds before now."""
         target = now - timedelta(seconds=seconds_ago)
@@ -109,64 +109,128 @@ class TickVelocityProcessor(BaseSignalProcessor):
             return best
         return None
 
-    def _compute_velocities(self, tick_buffer, current_price):
-        """Compute 30s and 60s velocities plus acceleration. Returns dict or None."""
-        now = datetime.now(timezone.utc)
-        curr = float(current_price)
-        p60 = self._get_price_at(tick_buffer, 60, now)
-        p30 = self._get_price_at(tick_buffer, 30, now)
-        if p60 is None and p30 is None:
-            return None
-        v60 = ((curr - p60) / p60) if p60 else None
-        v30 = ((curr - p30) / p30) if p30 else None
-        accel = 0.0
-        if v60 is not None and v30 is not None:
-            accel = v30 - (v60 - v30)
-        return {"v60": v60, "v30": v30, "accel": accel, "p60": p60, "p30": p30, "ticks": len(tick_buffer)}
-
-    def _classify_velocity(self, abs_vel):
-        """Classify velocity magnitude into signal strength."""
-        if abs_vel >= 0.04: return SignalStrength.VERY_STRONG
-        if abs_vel >= 0.025: return SignalStrength.STRONG
-        if abs_vel >= 0.015: return SignalStrength.MODERATE
-        return SignalStrength.WEAK
-
-    def _compute_confidence(self, pv, threshold, accel, v60, v30):
-        """Compute confidence with acceleration/reversal adjustments."""
-        conf = min(0.82, 0.55 + (abs(pv) / threshold - 1) * 0.12)
-        same_dir = (accel > 0 and pv > 0) or (accel < 0 and pv < 0)
-        if same_dir and abs(accel) > 0.005:
-            conf = min(0.88, conf + 0.06)
-        if v60 is not None and v30 is not None and (v60 > 0) != (v30 > 0):
-            conf *= 0.80
-        return conf
-
-    def process(self, current_price: Decimal, historical_prices: list,
-                metadata: Dict[str, Any] = None) -> Optional[TradingSignal]:
-        """Generate momentum signal from tick velocity analysis."""
+    def process(
+            self,
+            current_price: Decimal,
+            historical_prices: list,
+            metadata: Dict[str, Any] = None,
+    ) -> Optional[TradingSignal]:
         if not self.is_enabled or not metadata:
             return None
+
         tick_buffer = metadata.get("tick_buffer")
         if not tick_buffer or len(tick_buffer) < self.min_ticks:
+            logger.debug(
+                f"TickVelocity: insufficient ticks "
+                f"({len(tick_buffer) if tick_buffer else 0} < {self.min_ticks})"
+            )
             return None
-        v = self._compute_velocities(tick_buffer, current_price)
-        if v is None:
+
+        now = datetime.now(timezone.utc)
+        # 1. EXTRACT BTC SPOT (Not the option price)
+        btc_spot_now = metadata.get("spot_price")
+        if not btc_spot_now:
+            logger.debug("TickVelocity: No spot price in metadata.")
             return None
-        pv = v["v30"] if v["v30"] is not None else v["v60"]
-        thresh = self.velocity_threshold_30s if v["v30"] is not None else self.velocity_threshold_60s
-        if abs(pv) < thresh:
+
+        # 2. Get historical spot prices from the buffer 
+        # (Ensure bot.py is appending spot_price to the tick_buffer dicts!)
+        price_60s = self._get_price_at(tick_buffer, 60, now)
+        price_30s = self._get_price_at(tick_buffer, 30, now)
+
+        if price_60s is None and price_30s is None:
+            logger.debug("TickVelocity: no historical ticks in 60s window")
             return None
-        direction = SignalDirection.BULLISH if pv > 0 else SignalDirection.BEARISH
-        strength = self._classify_velocity(abs(pv))
-        conf = self._compute_confidence(pv, thresh, v["accel"], v["v60"], v["v30"])
-        if conf < self.min_confidence:
+
+        # 3. Compute velocities based on the UNDERLYING ASSET, not the lagging option
+        vel_60s = ((btc_spot_now - price_60s) / price_60s) if price_60s else None
+        vel_30s = ((btc_spot_now - price_30s) / price_30s) if price_30s else None
+
+        # Compute acceleration (is the move speeding up?)
+        acceleration = 0.0
+        if vel_60s is not None and vel_30s is not None:
+            vel_first_30s = vel_60s - vel_30s
+            acceleration = vel_30s - vel_first_30s  # positive = accelerating
+
+        # Logging for velocity and acceleration
+        vel_60s_str = f"{vel_60s * 100:+.3f}%" if vel_60s is not None else "N/A"
+        vel_30s_str = f"{vel_30s * 100:+.3f}%" if vel_30s is not None else "N/A"
+        logger.info(
+            f"TickVelocity: vel_60s={vel_60s_str} vel_30s={vel_30s_str} accel={acceleration * 100:+.4f}%"
+        )
+
+        # Use best available velocity for signal decision
+        primary_vel = vel_30s if vel_30s is not None else vel_60s
+        threshold = (
+            self.velocity_threshold_30s if vel_30s is not None
+            else self.velocity_threshold_60s
+        )
+
+        if abs(primary_vel) < threshold:
+            logger.debug(
+                f"TickVelocity: {primary_vel * 100:+.3f}% below threshold "
+                f"{threshold * 100:.1f}% — no signal"
+            )
             return None
-        meta = {"velocity_60s": round(v["v60"], 6) if v["v60"] else None,
-                "velocity_30s": round(v["v30"], 6) if v["v30"] else None,
-                "acceleration": round(v["accel"], 6),
-                "price_60s_ago": round(v["p60"], 6) if v["p60"] else None,
-                "price_30s_ago": round(v["p30"], 6) if v["p30"] else None,
-                "ticks_in_buffer": v["ticks"]}
-        sig = self._build_and_record(SignalType.MOMENTUM, direction, strength, conf, current_price, meta)
-        logger.info(f"{direction.value.upper()} TickVelocity: vel={pv*100:+.3f}%, conf={conf:.2%}")
-        return sig
+
+        direction = SignalDirection.BULLISH if primary_vel > 0 else SignalDirection.BEARISH
+        abs_vel = abs(primary_vel)
+
+        # Strength by velocity magnitude
+        if abs_vel >= 0.04:  # >4%
+            strength = SignalStrength.VERY_STRONG
+        elif abs_vel >= 0.025:  # >2.5%
+            strength = SignalStrength.STRONG
+        elif abs_vel >= 0.015:  # >1.5%
+            strength = SignalStrength.MODERATE
+        else:
+            strength = SignalStrength.WEAK
+
+        # Base confidence
+        confidence = min(0.82, 0.55 + (abs_vel / threshold - 1) * 0.12)
+
+        # Acceleration bonus: if move is accelerating, higher confidence
+        accel_same_direction = (
+                (acceleration > 0 and primary_vel > 0) or
+                (acceleration < 0 and primary_vel < 0)
+        )
+        if accel_same_direction and abs(acceleration) > 0.005:
+            confidence = min(0.88, confidence + 0.06)
+            logger.info(f"TickVelocity: acceleration bonus applied ({acceleration * 100:+.4f}%)")
+
+        # If 60s velocity conflicts with 30s velocity — reduce confidence
+        if vel_60s is not None and vel_30s is not None:
+            if (vel_60s > 0) != (vel_30s > 0):
+                confidence *= 0.80
+                logger.info("TickVelocity: velocity reversal — confidence reduced")
+
+        if confidence < self.min_confidence:
+            return None
+
+        signal = TradingSignal(
+            timestamp=datetime.now(),
+            source=self.name,
+            signal_type=SignalType.MOMENTUM,
+            direction=direction,
+            strength=strength,
+            confidence=confidence,
+            current_price=current_price,
+            metadata={
+                "velocity_60s": round(vel_60s, 6) if vel_60s else None,
+                "velocity_30s": round(vel_30s, 6) if vel_30s else None,
+                "acceleration": round(acceleration, 6),
+                "price_60s_ago": round(price_60s, 6) if price_60s else None,
+                "price_30s_ago": round(price_30s, 6) if price_30s else None,
+                "ticks_in_buffer": len(tick_buffer),
+            }
+        )
+
+        self._record_signal(signal)
+
+        logger.info(
+            f"Generated {direction.value.upper()} signal (TickVelocity): "
+            f"vel={primary_vel * 100:+.3f}%, accel={acceleration * 100:+.4f}%, "
+            f"confidence={confidence:.2%}, score={signal.score:.1f}"
+        )
+
+        return signal

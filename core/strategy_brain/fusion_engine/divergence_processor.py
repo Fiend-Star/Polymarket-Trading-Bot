@@ -2,15 +2,15 @@
 Price Divergence Signal Processor
 Detects when Polymarket price diverges from spot exchanges
 """
-from decimal import Decimal
+import os
+import sys
 from datetime import datetime
+from decimal import Decimal
 from typing import Optional, Dict, Any
+
 from loguru import logger
 
-import os 
-import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-
 
 from core.strategy_brain.signal_processors.base_processor import (
     BaseSignalProcessor,
@@ -30,11 +30,11 @@ class PriceDivergenceProcessor(BaseSignalProcessor):
     - If divergence > threshold, signal arbitrage opportunity
     - Direction: Trade toward convergence
     """
-    
+
     def __init__(
-        self,
-        divergence_threshold: float = 0.05,  # 5% divergence
-        min_confidence: float = 0.65,
+            self,
+            divergence_threshold: float = 0.05,  # 5% divergence
+            min_confidence: float = 0.65,
     ):
         """
         Initialize divergence processor.
@@ -44,45 +44,102 @@ class PriceDivergenceProcessor(BaseSignalProcessor):
             min_confidence: Minimum confidence threshold
         """
         super().__init__("PriceDivergence")
-        
+
         self.divergence_threshold = divergence_threshold
         self.min_confidence = min_confidence
-        
+
         logger.info(
             f"Initialized Price Divergence Processor: "
             f"threshold={divergence_threshold:.1%}"
         )
-    
-    @staticmethod
-    def _classify_divergence_strength(div_pct):
-        """Classify divergence magnitude into signal strength."""
-        if div_pct >= 0.15: return SignalStrength.VERY_STRONG
-        if div_pct >= 0.10: return SignalStrength.STRONG
-        if div_pct >= 0.07: return SignalStrength.MODERATE
-        return SignalStrength.WEAK
 
-    def process(self, current_price: Decimal, historical_prices: list,
-                metadata: Dict[str, Any] = None) -> Optional[TradingSignal]:
-        """Detect price divergence between Polymarket and spot."""
-        if not self.is_enabled or not metadata or 'spot_price' not in metadata:
+    def process(
+            self,
+            current_price: Decimal,
+            historical_prices: list[Decimal],
+            metadata: Dict[str, Any] = None,
+    ) -> Optional[TradingSignal]:
+        """
+        Detect price divergence between markets.
+        
+        Args:
+            current_price: Polymarket price
+            historical_prices: Not used
+            metadata: Must contain 'spot_price' (Coinbase/Binance consensus)
+            
+        Returns:
+            TradingSignal if divergence detected, None otherwise
+        """
+        if not self.is_enabled:
             return None
-        spot = Decimal(str(metadata['spot_price']))
-        div = (current_price - spot) / spot
-        div_pct = float(abs(div))
-        if div_pct < self.divergence_threshold:
+
+        if not metadata or 'spot_price' not in metadata:
             return None
-        direction = SignalDirection.BEARISH if div > 0 else SignalDirection.BULLISH
-        strength = self._classify_divergence_strength(div_pct)
-        confidence = min(0.90, 0.60 + div_pct)
+
+        spot_price = Decimal(str(metadata['spot_price']))
+
+        # Calculate divergence
+        divergence = (current_price - spot_price) / spot_price
+        divergence_pct = float(abs(divergence))
+
+        # Check if divergence is significant
+        if divergence_pct < self.divergence_threshold:
+            return None  # Not enough divergence
+
+        logger.info(
+            f"Price divergence detected: {divergence_pct:.2%} "
+            f"(Polymarket ${float(current_price):,.2f} vs "
+            f"Spot ${float(spot_price):,.2f})"
+        )
+
+        # Determine direction (trade toward convergence)
+        if divergence > 0:
+            # Polymarket price too high → expect it to fall → BEARISH
+            direction = SignalDirection.BEARISH
+            target_price = spot_price
+        else:
+            # Polymarket price too low → expect it to rise → BULLISH
+            direction = SignalDirection.BULLISH
+            target_price = spot_price
+
+        # Calculate strength based on divergence magnitude
+        if divergence_pct >= 0.15:  # >15%
+            strength = SignalStrength.VERY_STRONG
+        elif divergence_pct >= 0.10:  # >10%
+            strength = SignalStrength.STRONG
+        elif divergence_pct >= 0.07:  # >7%
+            strength = SignalStrength.MODERATE
+        else:
+            strength = SignalStrength.WEAK
+
+        # Calculate confidence (higher divergence = higher confidence)
+        confidence = min(0.90, 0.60 + divergence_pct)
+
         if confidence < self.min_confidence:
             return None
+
+        # Create signal
         signal = TradingSignal(
-            timestamp=datetime.now(), source=self.name,
-            signal_type=SignalType.PRICE_DIVERGENCE, direction=direction,
-            strength=strength, confidence=confidence,
-            current_price=current_price, target_price=spot,
-            metadata={"divergence_pct": div_pct, "spot_price": float(spot),
-                      "polymarket_price": float(current_price)})
+            timestamp=datetime.now(),
+            source=self.name,
+            signal_type=SignalType.PRICE_DIVERGENCE,
+            direction=direction,
+            strength=strength,
+            confidence=confidence,
+            current_price=current_price,
+            target_price=target_price,
+            metadata={
+                "divergence_pct": divergence_pct,
+                "spot_price": float(spot_price),
+                "polymarket_price": float(current_price),
+            }
+        )
+
         self._record_signal(signal)
-        logger.info(f"Divergence {direction.value}: {div_pct:.2%}, conf={confidence:.2%}")
+
+        logger.info(
+            f"Generated divergence signal: {direction.value}, "
+            f"confidence={confidence:.2%}"
+        )
+
         return signal

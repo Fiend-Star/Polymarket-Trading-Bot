@@ -6,8 +6,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional, Dict, Any
 from enum import Enum
+from typing import Optional, Dict, Any
 
 
 class SignalType(Enum):
@@ -49,19 +49,19 @@ class TradingSignal:
     direction: SignalDirection
     strength: SignalStrength
     confidence: float  # 0.0 - 1.0
-    
+
     # Price context
     current_price: Decimal
     target_price: Optional[Decimal] = None
     stop_loss: Optional[Decimal] = None
-    
+
     # Additional data
     metadata: Dict[str, Any] = None
-    
+
     def __post_init__(self):
         if self.metadata is None:
             self.metadata = {}
-    
+
     @property
     def score(self) -> float:
         """
@@ -79,7 +79,7 @@ class BaseSignalProcessor(ABC):
     
     Signal processors analyze market data and generate trading signals.
     """
-    
+
     def __init__(self, name: str):
         """
         Initialize signal processor.
@@ -89,17 +89,17 @@ class BaseSignalProcessor(ABC):
         """
         self.name = name
         self._enabled = True
-        
+
         # Statistics
         self._signals_generated = 0
         self._last_signal: Optional[TradingSignal] = None
-    
+
     @abstractmethod
     def process(
-        self,
-        current_price: Decimal,
-        historical_prices: list[Decimal],
-        metadata: Dict[str, Any] = None,
+            self,
+            current_price: Decimal,
+            historical_prices: list[Decimal],
+            metadata: Dict[str, Any] = None,
     ) -> Optional[TradingSignal]:
         """
         Process market data and generate signal if conditions met.
@@ -113,40 +113,29 @@ class BaseSignalProcessor(ABC):
             TradingSignal if opportunity detected, None otherwise
         """
         pass
-    
+
     def enable(self) -> None:
         """Enable this processor."""
         self._enabled = True
-    
+
     def disable(self) -> None:
         """Disable this processor."""
         self._enabled = False
-    
+
     @property
     def is_enabled(self) -> bool:
         """Check if processor is enabled."""
         return self._enabled
-    
+
     @property
     def signals_generated(self) -> int:
         """Get total signals generated."""
         return self._signals_generated
-    
+
     def _record_signal(self, signal: TradingSignal) -> None:
         """Record that a signal was generated."""
         self._signals_generated += 1
         self._last_signal = signal
-
-    def _build_and_record(self, signal_type, direction, strength, confidence,
-                          current_price, metadata=None):
-        """Build a TradingSignal, record it, and return it."""
-        signal = TradingSignal(
-            timestamp=datetime.now(), source=self.name,
-            signal_type=signal_type, direction=direction,
-            strength=strength, confidence=confidence,
-            current_price=current_price, metadata=metadata or {})
-        self._record_signal(signal)
-        return signal
 
     def get_stats(self) -> Dict[str, Any]:
         """Get processor statistics."""

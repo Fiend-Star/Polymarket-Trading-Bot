@@ -3,8 +3,9 @@ News and Social Media Data Source
 Aggregates sentiment and news related to BTC
 """
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, List, Dict, Any
+
 import httpx
 from loguru import logger
 
@@ -19,22 +20,22 @@ class NewsSocialDataSource:
     - Fear & Greed Index
     - Trending topics
     """
-    
+
     def __init__(self):
         """Initialize news/social data source."""
         self.session: Optional[httpx.AsyncClient] = None
-        
+
         # API endpoints (free tier alternatives)
         self.news_api_url = "https://cryptopanic.com/api/v1/posts/"
         self.sentiment_api_url = "https://api.alternative.me/fng/"  # Fear & Greed
-        
+
         # Cache
         self._last_sentiment: Optional[Dict[str, Any]] = None
         self._last_news: List[Dict[str, Any]] = []
         self._last_logged_fg_value: Optional[int] = None
 
         logger.info("Initialized News/Social data source")
-    
+
     async def connect(self) -> bool:
         """
         Connect to APIs.
@@ -44,81 +45,159 @@ class NewsSocialDataSource:
         """
         try:
             self.session = httpx.AsyncClient(
-                timeout=30.0,
+                timeout=8.0,
                 headers={"User-Agent": "PolymarketBot/1.0"}
             )
-            
+
             # Test connection with Fear & Greed Index (no API key needed)
             response = await self.session.get(self.sentiment_api_url)
             response.raise_for_status()
-            
+
             logger.info("✓ Connected to News/Social APIs")
             return True
-            
+
         except Exception as e:
             logger.error(f"Failed to connect to News APIs: {e}")
             return False
-    
+
     async def disconnect(self) -> None:
         """Close connections."""
         if self.session:
             await self.session.aclose()
             logger.info("Disconnected from News/Social APIs")
-    
+
     async def get_fear_greed_index(self) -> Optional[Dict[str, Any]]:
-        """Get Fear & Greed Index (0-100)."""
-        try:
-            resp = await self.session.get(self.sentiment_api_url)
-            resp.raise_for_status()
-            cur = resp.json()["data"][0]
-            s = {"timestamp": datetime.fromtimestamp(int(cur["timestamp"])),
-                 "value": int(cur["value"]), "classification": cur["value_classification"],
-                 "time_until_update": cur.get("time_until_update")}
-            self._last_sentiment = s
-            if s['value'] != self._last_logged_fg_value:
-                logger.debug(f"F&G: {s['value']} ({s['classification']})")
-                self._last_logged_fg_value = s['value']
-            return s
-        except Exception as e:
-            logger.error(f"Fear & Greed error: {e}"); return None
+        """
+        Get Fear & Greed Index (0-100).
+        
+        Returns:
+            Dict with value, classification, and timestamp
+        """
+        for attempt in range(3):
+            try:
+                response = await self.session.get(self.sentiment_api_url)
+                response.raise_for_status()
 
-    def _parse_article(self, article):
-        """Parse a single news article into dict."""
-        votes = article.get("votes", {})
-        pos, neg = votes.get("positive", 0), votes.get("negative", 0)
-        return {"timestamp": datetime.fromisoformat(article["published_at"].replace("Z", "+00:00")),
-                "title": article["title"], "url": article["url"],
-                "source": article["source"]["title"], "votes": pos - neg,
-                "sentiment": "positive" if pos > neg else "negative"}
+                data = response.json()
+                current = data["data"][0]
 
-    async def get_crypto_news(self, filter_: str = "hot", currencies: str = "BTC",
-                               limit: int = 20) -> List[Dict[str, Any]]:
-        """Get crypto news from CryptoPanic."""
+                sentiment = {
+                    "timestamp": datetime.fromtimestamp(int(current["timestamp"])),
+                    "value": int(current["value"]),  # 0-100
+                    "classification": current["value_classification"],  # "Extreme Fear", "Fear", etc.
+                    "time_until_update": current.get("time_until_update"),
+                }
+
+                self._last_sentiment = sentiment
+
+                if sentiment['value'] != self._last_logged_fg_value:
+                    logger.debug(f"Fear & Greed Index: {sentiment['value']} ({sentiment['classification']})")
+                    self._last_logged_fg_value = sentiment['value']
+                return sentiment
+
+            except Exception as e:
+                logger.warning(f"Error fetching Fear & Greed Index (attempt {attempt + 1}/3): {e}")
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+
+        logger.error("Failed to fetch Fear & Greed Index after 3 attempts.")
+        return self._last_sentiment
+
+    async def get_crypto_news(
+            self,
+            filter_: str = "hot",  # "rising", "hot", "bullish", "bearish"
+            currencies: str = "BTC",
+            limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """
+        Get crypto news from CryptoPanic.
+        
+        Note: Free tier has rate limits. Consider caching.
+        
+        Args:
+            filter_: News filter type
+            currencies: Comma-separated currency codes
+            limit: Max number of articles
+            
+        Returns:
+            List of news articles
+        """
         try:
-            params = {"auth_token": "YOUR_CRYPTOPANIC_API_KEY", "filter": filter_,
-                      "currencies": currencies, "public": "true"}
-            resp = await self.session.get(self.news_api_url, params=params)
-            if resp.status_code == 401:
-                logger.warning("CryptoPanic API key not configured"); return self._last_news
-            resp.raise_for_status()
-            news = [self._parse_article(a) for a in resp.json().get("results", [])[:limit]]
+            # Note: CryptoPanic free tier requires API key
+            # This is a placeholder - you'll need to sign up at cryptopanic.com
+            params = {
+                "auth_token": "YOUR_CRYPTOPANIC_API_KEY",  # Get from cryptopanic.com
+                "filter": filter_,
+                "currencies": currencies,
+                "public": "true",
+            }
+
+            response = await self.session.get(self.news_api_url, params=params)
+
+            # If no API key, return cached or empty
+            if response.status_code == 401:
+                logger.warning("CryptoPanic API key not configured - using cached news")
+                return self._last_news
+
+            response.raise_for_status()
+            data = response.json()
+
+            news = []
+            for article in data.get("results", [])[:limit]:
+                news.append({
+                    "timestamp": datetime.fromisoformat(article["published_at"].replace("Z", "+00:00")),
+                    "title": article["title"],
+                    "url": article["url"],
+                    "source": article["source"]["title"],
+                    "votes": article.get("votes", {}).get("positive", 0) - article.get("votes", {}).get("negative", 0),
+                    "sentiment": "positive" if article.get("votes", {}).get("positive", 0) > article.get("votes",
+                                                                                                         {}).get(
+                        "negative", 0) else "negative",
+                })
+
             self._last_news = news
             return news
+
         except Exception as e:
-            logger.error(f"Crypto news error: {e}"); return self._last_news
+            logger.error(f"Error fetching crypto news: {e}")
+            return self._last_news
 
     async def get_sentiment_score(self) -> Optional[float]:
-        """Calculate aggregate sentiment (0-100). Combines F&G + news."""
+        """
+        Calculate aggregate sentiment score (0-100).
+        
+        Combines Fear & Greed Index with news sentiment.
+        
+        Returns:
+            Sentiment score (0=extreme fear, 100=extreme greed)
+        """
         try:
-            fg = await self.get_fear_greed_index()
-            if not fg: return None
+            # Get Fear & Greed Index
+            fg_data = await self.get_fear_greed_index()
+            if not fg_data:
+                return None
+
+            fg_score = fg_data["value"]
+
+            # Try to get news sentiment
             news = await self.get_crypto_news(limit=10)
+
             if news:
-                pos = sum(1 for n in news if n.get("sentiment") == "positive")
-                return fg["value"] * 0.7 + (pos / len(news) * 100) * 0.3
-            return float(fg["value"])
+                # Calculate news sentiment
+                positive_count = sum(1 for n in news if n.get("sentiment") == "positive")
+                news_score = (positive_count / len(news)) * 100
+
+                # Weighted average (70% Fear & Greed, 30% News)
+                total_score = (fg_score * 0.7) + (news_score * 0.3)
+            else:
+                total_score = fg_score
+
+            logger.info(f"Aggregate sentiment score: {total_score:.1f}")
+            return total_score
+
         except Exception as e:
-            logger.error(f"Sentiment score error: {e}"); return None
+            logger.error(f"Error calculating sentiment score: {e}")
+            return None
 
     async def get_trending_topics(self) -> List[str]:
         """
@@ -130,17 +209,17 @@ class NewsSocialDataSource:
         # This would require Twitter API or similar
         # Placeholder implementation
         return ["BTC", "Bitcoin", "Cryptocurrency", "Trading"]
-    
+
     @property
     def last_sentiment(self) -> Optional[Dict[str, Any]]:
         """Get cached sentiment data."""
         return self._last_sentiment
-    
+
     @property
     def last_news(self) -> List[Dict[str, Any]]:
         """Get cached news articles."""
         return self._last_news
-    
+
     async def health_check(self) -> bool:
         """
         Check if data source is healthy.
@@ -157,6 +236,7 @@ class NewsSocialDataSource:
 
 # Singleton instance
 _news_instance: Optional[NewsSocialDataSource] = None
+
 
 def get_news_social_source() -> NewsSocialDataSource:
     """Get singleton instance of News/Social data source."""
