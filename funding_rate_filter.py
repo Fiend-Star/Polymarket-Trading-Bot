@@ -27,8 +27,8 @@ USAGE:
     # regime.mean_reversion_bias = -0.02  # Subtract from YES probability
 """
 
-import time
 import threading
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -36,55 +36,24 @@ from loguru import logger
 
 try:
     import httpx
+
     HTTPX_AVAILABLE = True
 except ImportError:
     try:
         import requests as httpx
+
         HTTPX_AVAILABLE = True
     except ImportError:
         HTTPX_AVAILABLE = False
         logger.warning("Neither httpx nor requests available — FundingRateFilter disabled")
 
-
 # =============================================================================
-# Constants (shared with backtest_v3.py)
+# Constants
 # =============================================================================
 BINANCE_MARK_PRICE_URL = "https://fapi.binance.com/fapi/v1/premiumIndex"
 BINANCE_FUNDING_RATE_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
 UPDATE_INTERVAL_SEC = 300  # Poll every 5 minutes
 CACHE_TTL_SEC = 300
-
-FUNDING_EXTREME_THRESHOLD = 0.0005   # 0.05% per 8h
-FUNDING_HIGH_THRESHOLD    = 0.0002   # 0.02% per 8h
-FUNDING_MAX_BIAS          = 0.02     # Max probability adjustment ±2%
-
-
-# =============================================================================
-# Standalone classifier (SRP: shared by live filter AND backtest)
-# =============================================================================
-
-def classify_funding(rate: float, extreme: float = FUNDING_EXTREME_THRESHOLD,
-                     high: float = FUNDING_HIGH_THRESHOLD,
-                     max_bias: float = FUNDING_MAX_BIAS) -> tuple:
-    """
-    Classify a funding rate into regime + compute mean-reversion bias.
-
-    Returns:
-        (classification: str, mean_reversion_bias: float)
-
-    Used by both FundingRateFilter (live) and backtest_v3 (historical).
-    """
-    if rate > extreme:
-        return "EXTREME_POSITIVE", -max_bias
-    elif rate > high:
-        scale = (rate - high) / (extreme - high)
-        return "HIGH_POSITIVE", -(0.005 + scale * 0.015)
-    elif rate < -extreme:
-        return "EXTREME_NEGATIVE", +max_bias
-    elif rate < -high:
-        scale = (-rate - high) / (extreme - high)
-        return "HIGH_NEGATIVE", (0.005 + scale * 0.015)
-    return "NEUTRAL", 0.0
 
 
 # =============================================================================
@@ -94,16 +63,16 @@ def classify_funding(rate: float, extreme: float = FUNDING_EXTREME_THRESHOLD,
 @dataclass
 class FundingRegime:
     """Current funding rate regime classification."""
-    funding_rate: float             # Raw funding rate (e.g., 0.0001 = 0.01%)
-    funding_rate_pct: float         # As percentage (e.g., 0.01)
+    funding_rate: float  # Raw funding rate (e.g., 0.0001 = 0.01%)
+    funding_rate_pct: float  # As percentage (e.g., 0.01)
     predicted_rate: Optional[float]  # Predicted next funding rate
-    classification: str             # EXTREME_POSITIVE, HIGH_POSITIVE, NEUTRAL, etc.
-    mean_reversion_bias: float      # Additive probability adjustment
-    index_price: float              # Binance index price
-    mark_price: float               # Binance mark price
-    basis_bps: float                # (mark - index) / index × 10000
-    next_funding_time: int          # Unix ms
-    last_update: float              # When we fetched this
+    classification: str  # EXTREME_POSITIVE, HIGH_POSITIVE, NEUTRAL, etc.
+    mean_reversion_bias: float  # Additive probability adjustment
+    index_price: float  # Binance index price
+    mark_price: float  # Binance mark price
+    basis_bps: float  # (mark - index) / index × 10000
+    next_funding_time: int  # Unix ms
+    last_update: float  # When we fetched this
 
 
 # =============================================================================
@@ -117,11 +86,11 @@ class FundingRateFilter:
     """
 
     def __init__(
-        self,
-        symbol: str = "BTCUSDT",
-        extreme_threshold: float = 0.0005,   # 0.05% per 8h
-        high_threshold: float = 0.0002,      # 0.02% per 8h
-        max_bias: float = 0.02,              # Max probability adjustment ±2%
+            self,
+            symbol: str = "BTCUSDT",
+            extreme_threshold: float = 0.0005,  # 0.05% per 8h
+            high_threshold: float = 0.0002,  # 0.02% per 8h
+            max_bias: float = 0.02,  # Max probability adjustment ±2%
     ):
         self.symbol = symbol
         self.extreme_threshold = extreme_threshold
@@ -132,6 +101,9 @@ class FundingRateFilter:
         self._regime: Optional[FundingRegime] = None
         self._last_fetch: float = 0.0
         self._fetch_count: int = 0
+
+        # Persistent HTTP session for connection reuse
+        self._http_session = None
 
         logger.info(
             f"Initialized FundingRateFilter: {symbol}, "
@@ -161,30 +133,30 @@ class FundingRateFilter:
             basis_bps=0.0, next_funding_time=0, last_update=0,
         )
 
+    def _get_http_session(self):
+        """Return a persistent HTTP session (httpx.Client or requests.Session)."""
+        if self._http_session is None:
+            if hasattr(httpx, 'Client'):
+                self._http_session = httpx.Client(timeout=10.0)
+            else:
+                # requests fallback — create a Session
+                self._http_session = httpx.Session()
+        return self._http_session
+
     def update_sync(self) -> Optional[FundingRegime]:
         """Synchronous funding rate fetch (for non-async contexts)."""
         if not HTTPX_AVAILABLE:
             return None
 
         try:
-            if hasattr(httpx, 'Client'):
-                # httpx
-                with httpx.Client(timeout=10.0) as client:
-                    resp = client.get(
-                        BINANCE_MARK_PRICE_URL,
-                        params={"symbol": self.symbol},
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-            else:
-                # requests fallback
-                resp = httpx.get(
-                    BINANCE_MARK_PRICE_URL,
-                    params={"symbol": self.symbol},
-                    timeout=10.0,
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            client = self._get_http_session()
+            resp = client.get(
+                BINANCE_MARK_PRICE_URL,
+                params={"symbol": self.symbol},
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
             return self._process_response(data)
 
@@ -193,27 +165,14 @@ class FundingRateFilter:
             return None
 
     async def update(self) -> Optional[FundingRegime]:
-        """Async funding rate fetch."""
+        """Async funding rate fetch — delegates to sync with persistent session."""
         if not HTTPX_AVAILABLE:
             return None
 
         try:
-            if hasattr(httpx, 'AsyncClient'):
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.get(
-                        BINANCE_MARK_PRICE_URL,
-                        params={"symbol": self.symbol},
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-            else:
-                # Fallback to sync in thread
-                import asyncio
-                loop = asyncio.get_event_loop()
-                return await loop.run_in_executor(None, self.update_sync)
-
-            return self._process_response(data)
-
+            import asyncio
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self.update_sync)
         except Exception as e:
             logger.warning(f"Async funding rate fetch failed: {e}")
             return None
@@ -225,35 +184,20 @@ class FundingRateFilter:
         index_price = float(data.get("indexPrice", 0))
         next_funding_time = int(data.get("nextFundingTime", 0))
 
-        classification, bias = self._classify(funding_rate)
-        regime = self._build_regime(
-            funding_rate, mark_price, index_price,
-            next_funding_time, classification, bias,
-        )
+        funding_pct = funding_rate * 100  # e.g., 0.0001 → 0.01%
 
-        with self._lock:
-            self._regime = regime
-            self._last_fetch = time.time()
-            self._fetch_count += 1
-
-        logger.info(
-            f"Funding rate: {funding_rate:+.6f} ({regime.funding_rate_pct:+.4f}%) → "
-            f"{classification}, bias={bias:+.3f}, basis={regime.basis_bps:+.1f}bps"
-        )
-        return regime
-
-    def _build_regime(self, funding_rate, mark_price, index_price,
-                      next_funding_time, classification, bias):
-        """Build a FundingRegime from parsed data."""
-        funding_pct = funding_rate * 100
+        # Basis = (mark - index) / index
         basis_bps = 0.0
         if index_price > 0:
             basis_bps = (mark_price - index_price) / index_price * 10000
 
-        return FundingRegime(
+        # Classify regime
+        classification, bias = self._classify(funding_rate)
+
+        regime = FundingRegime(
             funding_rate=funding_rate,
             funding_rate_pct=funding_pct,
-            predicted_rate=None,
+            predicted_rate=None,  # Could fetch from predicted endpoint
             classification=classification,
             mean_reversion_bias=bias,
             index_price=index_price,
@@ -263,11 +207,34 @@ class FundingRateFilter:
             last_update=time.time(),
         )
 
+        with self._lock:
+            self._regime = regime
+            self._last_fetch = time.time()
+            self._fetch_count += 1
+
+        logger.info(
+            f"Funding rate: {funding_rate:+.6f} ({funding_pct:+.4f}%) → "
+            f"{classification}, bias={bias:+.3f}, basis={basis_bps:+.1f}bps"
+        )
+
+        return regime
 
     def _classify(self, rate: float) -> tuple:
-        """Delegate to shared classify_funding() with instance thresholds."""
-        return classify_funding(rate, self.extreme_threshold,
-                                self.high_threshold, self.max_bias)
+        """Classify funding rate into regime + compute mean-reversion bias."""
+        if rate > self.extreme_threshold:
+            # Crowded long → expect reversal DOWN
+            return "EXTREME_POSITIVE", -self.max_bias
+        elif rate > self.high_threshold:
+            scale = (rate - self.high_threshold) / (self.extreme_threshold - self.high_threshold)
+            return "HIGH_POSITIVE", -self.max_bias * 0.5 * scale
+        elif rate < -self.extreme_threshold:
+            # Crowded short → expect reversal UP
+            return "EXTREME_NEGATIVE", +self.max_bias
+        elif rate < -self.high_threshold:
+            scale = (abs(rate) - self.high_threshold) / (self.extreme_threshold - self.high_threshold)
+            return "HIGH_NEGATIVE", +self.max_bias * 0.5 * scale
+        else:
+            return "NEUTRAL", 0.0
 
     def should_update(self) -> bool:
         """Check if it's time to re-fetch."""
@@ -282,11 +249,21 @@ class FundingRateFilter:
             "basis_bps": self._regime.basis_bps if self._regime else None,
         }
 
+    def close(self):
+        """Close the persistent HTTP session."""
+        if self._http_session is not None:
+            try:
+                self._http_session.close()
+            except Exception:
+                pass
+            self._http_session = None
+
 
 # =============================================================================
 # Singleton
 # =============================================================================
 _funder_instance = None
+
 
 def get_funding_rate_filter() -> FundingRateFilter:
     global _funder_instance

@@ -66,16 +66,32 @@ class MarketLifecycleMixin:
             return None
 
     def _dedup_and_pair_instruments(self, btc_instruments):
-        seen, deduped = {}, []
+        """
+        Deduplicate and pair YES/NO tokens by slug using case-insensitive outcome parsing.
+        V3.4 FIX: Use outcome.lower() for case-insensitive comparison.
+        """
+        seen_slugs = {}
         for inst in btc_instruments:
             slug = inst['slug']
-            if slug not in seen:
-                inst['yes_instrument_id'] = inst['instrument'].id
-                inst['no_instrument_id'] = None
-                seen[slug] = inst
-                deduped.append(inst)
-            else:
-                seen[slug]['no_instrument_id'] = inst['instrument'].id
+            instrument = inst['instrument']
+            outcome = getattr(instrument, 'outcome', None)
+            outcome_str = outcome.lower() if outcome else ""
+
+            if slug not in seen_slugs:
+                base_inst = inst.copy()
+                base_inst['yes_instrument_id'] = None
+                base_inst['no_instrument_id'] = None
+                base_inst['yes_token_id'] = inst.get('yes_token_id')
+                seen_slugs[slug] = base_inst
+
+            if outcome_str in ('yes', 'up'):
+                seen_slugs[slug]['yes_instrument_id'] = instrument.id
+                if 'yes_token_id' not in seen_slugs[slug] or seen_slugs[slug]['yes_token_id'] is None:
+                    seen_slugs[slug]['yes_token_id'] = inst.get('yes_token_id')
+            elif outcome_str in ('no', 'down'):
+                seen_slugs[slug]['no_instrument_id'] = instrument.id
+
+        deduped = list(seen_slugs.values())
         deduped.sort(key=lambda x: x['market_timestamp'])
         return deduped
 

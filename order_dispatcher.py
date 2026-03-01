@@ -124,7 +124,7 @@ class OrderDispatcher:
             return
         iid, label, inst = resolved
         prec = inst.size_precision
-        qty = round(max(float(getattr(inst, "min_quantity", None) or 5.0), 5.0), prec)
+        qty = self._qty(size, Decimal(str(price)), inst)
         uid = f"BTC-15MIN-MKT-{int(time.time()*1000)}"
         order = self._strategy.order_factory.market(
             instrument_id=iid, order_side=OrderSide.BUY,
@@ -184,5 +184,4 @@ class OrderDispatcher:
                 pt.outcome = outcome
                 break
         self._save()
-
 

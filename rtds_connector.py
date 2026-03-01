@@ -9,7 +9,7 @@ import time
 import threading
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional, Callable, Deque
+from typing import Optional, Callable, Deque, Dict
 
 from loguru import logger
 from rtds_websocket import RTDSWebSocketMixin
@@ -20,6 +20,11 @@ except ImportError:
     aiohttp = None
 
 PRICE_HISTORY_MAXLEN = 500
+
+# V3.2: Staleness detection — if a price feed's VALUE hasn't changed
+# in this many ms, treat it as frozen/stale (even if ticks keep arriving
+# with the same value).  Prevents phantom divergence signals.
+STALE_PRICE_THRESHOLD_MS = 30_000  # 30 seconds
 
 
 @dataclass
@@ -78,8 +83,23 @@ class RTDSConnector(RTDSWebSocketMixin):
         self._chainlink_ts: int = 0
         self._binance_price: float = 0.0
         self._binance_ts: int = 0
+
+        # V3.2: Track when price VALUE last changed (not just when a tick arrived)
+        self._binance_last_changed_price: float = 0.0
+        self._binance_last_changed_ts: int = 0
+        self._chainlink_last_changed_price: float = 0.0
+        self._chainlink_last_changed_ts: int = 0
+
         self._chainlink_ticks: Deque[PriceTick] = deque(maxlen=PRICE_HISTORY_MAXLEN)
         self._binance_ticks: Deque[PriceTick] = deque(maxlen=PRICE_HISTORY_MAXLEN)
+
+        # V3.3: Pre-scheduled boundary snapshots.
+        # The bot registers upcoming 15-min boundary timestamps.  As Chainlink
+        # ticks stream in, we capture the tick whose *source* timestamp is
+        # closest to each boundary, looking strictly backwards.
+        self._boundary_snapshots: Dict[int, Optional[tuple]] = {}
+        # How far back (in ms) to look for the last known price.
+        self._boundary_capture_window_ms: int = 120_000  # 120 seconds
 
     def _init_connection_state(self):
         self._ws = None
@@ -116,6 +136,45 @@ class RTDSConnector(RTDSWebSocketMixin):
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+    # ── Boundary Snapshots ────────────────────────────────────────────
+
+    def register_boundary(self, boundary_timestamp_s: int):
+        """
+        Register an upcoming 15-min boundary for Chainlink price capture.
+
+        The connector will automatically capture the closest Chainlink tick
+        (source timestamp <= boundary) within the capture window.
+        """
+        with self._lock:
+            if boundary_timestamp_s not in self._boundary_snapshots:
+                self._boundary_snapshots[boundary_timestamp_s] = None
+                logger.debug(f"Registered boundary snapshot for ts={boundary_timestamp_s}")
+
+            # Cleanup: remove snapshots older than 30 minutes
+            now_s = int(time.time())
+            stale = [ts for ts in self._boundary_snapshots if now_s - ts > 1800]
+            for ts in stale:
+                del self._boundary_snapshots[ts]
+
+    def get_boundary_price(self, boundary_timestamp_s: int) -> Optional[float]:
+        """
+        Get the Chainlink price captured at a pre-registered boundary.
+
+        Returns the price if a tick was captured within the capture window,
+        otherwise None.  This is near-zero latency — the price was stored
+        inline during tick processing, not fetched retroactively.
+        """
+        with self._lock:
+            snap = self._boundary_snapshots.get(boundary_timestamp_s)
+            if snap is not None:
+                return snap[0]  # (price, delta_ms, ...)
+            return None
+
+    def get_boundary_detail(self, boundary_timestamp_s: int) -> Optional[tuple]:
+        """Get (price, delta_ms, source_ts, received_ts, latency) for a boundary snapshot, or None."""
+        with self._lock:
+            return self._boundary_snapshots.get(boundary_timestamp_s)
 
     # ── Late-window Chainlink strategy ───────────────────────────────
 

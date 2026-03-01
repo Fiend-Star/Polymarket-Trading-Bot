@@ -26,6 +26,7 @@ class OpenPosition:
     market_end_time: datetime
     instrument_id: object
     order_id: str
+    actual_qty: float = 0.0  # Actual filled quantity
     resolved: bool = False
     exit_price: Optional[float] = None
     pnl: Optional[float] = None
@@ -108,7 +109,7 @@ class PositionTracker:
 
     def _record(self, pos, final_price, is_paper, outcome):
         self._performance.record_trade(
-            trade_id=pos.order_id, direction="long",
+            trade_id=pos.order_id, direction=pos.direction,
             entry_price=Decimal(str(pos.entry_price)),
             exit_price=Decimal(str(final_price)),
             size=Decimal(str(pos.size_usd)),

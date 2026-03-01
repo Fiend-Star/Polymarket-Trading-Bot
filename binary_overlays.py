@@ -32,16 +32,24 @@ class BinaryOverlaysMixin:
 
     # ── Candle effect ────────────────────────────────────────────────
 
-    def _candle_effect_adj(self, time_remaining_min: float) -> float:
-        """Turn-of-candle effect (Shanaev & Vasenin 2023)."""
-        now = datetime.now(timezone.utc)
-        resolve_minute = (now.minute + int(time_remaining_min)) % 60
-        if resolve_minute in self.CANDLE_MINUTES:
-            return 0.002
-        elif resolve_minute % 15 <= 1 or resolve_minute % 15 >= 14:
-            return 0.001
+    def _candle_effect_adj(self, time_remaining_min: float, market_end_time: Optional[datetime] = None) -> float:
+        """
+        Turn-of-candle effect (Shanaev & Vasenin 2023).
+        +0.58 bps/min concentrated at minutes 0, 15, 30, 45 of each hour.
+        """
+        # V3.4 FIX: Use exact market_end_time instead of volatile float math
+        if market_end_time is not None:
+            resolve_minute = market_end_time.minute
         else:
-            return -0.0005
+            now = datetime.now(timezone.utc)
+            resolve_minute = (now.minute + round(time_remaining_min)) % 60
+
+        if resolve_minute in self.CANDLE_MINUTES:
+            return 0.002  # +0.2% bullish bias at candle boundaries
+        elif resolve_minute % 15 <= 1 or resolve_minute % 15 >= 14:
+            return 0.001  # Partial effect near boundaries
+        else:
+            return -0.0005  # Slight negative at non-boundary minutes
 
     # ── Seasonality ──────────────────────────────────────────────────
 
