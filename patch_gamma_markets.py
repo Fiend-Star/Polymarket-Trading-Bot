@@ -21,8 +21,26 @@ def apply_gamma_markets_patch():
         from nautilus_trader.core.nautilus_pyo3 import HttpClient
 
         logger.info("=" * 80)
-        logger.info("Applying enhanced patches for Polymarket filtering")
+        logger.info("Applying enhanced patches for Polymarket filtering & Timeouts")
         logger.info("=" * 80)
+        
+        # ===== PATCH 0: Fix py_clob_client Timeout Constraints =====
+        try:
+            import httpx
+            from py_clob_client.http_helpers import helpers as clob_helpers
+            
+            # The default py_clob_client is artificially restricted to 5.0s timeouts
+            # This causes catastrophic bot failure during mass position reconciliation
+            # because Gamma APIs often take >10s to reply under heavy load.
+            timeout_limit = 30.0
+            
+            # Sub in our own httpx client with higher thresholds natively
+            clob_helpers._http_client = httpx.Client(
+                timeout=httpx.Timeout(timeout_limit)
+            )
+            logger.info(f"✓ Patched py_clob_client.http_helpers (_http_client.timeout = {timeout_limit}s)")
+        except ImportError as e:
+            logger.warning(f"Could not patch py_clob_client timeouts: {e}")
 
         # ===== PATCH 1: Fix gamma_markets.py array parameter handling =====
 

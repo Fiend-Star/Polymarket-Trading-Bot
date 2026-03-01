@@ -418,6 +418,9 @@ class IntegratedBTCStrategy(Strategy):
 
         # Open positions
         self._open_positions: List[OpenPosition] = []
+        
+        # Pending token redemptions (Proxy wallets cannot auto-redeem without builder keys/Relayer)
+        self._pending_redemptions: List[str] = []
 
         # =====================================================================
         # V3 FIX: Cached market data (populated by timer loop, read by trading decision)
@@ -894,10 +897,13 @@ class IntegratedBTCStrategy(Strategy):
                             time_diff = market_timestamp - current_timestamp
 
                             if end_timestamp > current_timestamp:
-                                raw_id = str(instrument.id)
-                                without_suffix = raw_id.split('.')[0] if '.' in raw_id else raw_id
-                                yes_token_id = without_suffix.split('-')[
-                                    -1] if '-' in without_suffix else without_suffix
+                                from nautilus_trader.adapters.polymarket.common.symbol import get_polymarket_token_id
+                                try:
+                                    token_id = get_polymarket_token_id(instrument.id)
+                                except Exception:
+                                    raw_id = str(instrument.id)
+                                    without_suffix = raw_id.split('.')[0] if '.' in raw_id else raw_id
+                                    token_id = without_suffix.split('-')[-1] if '-' in without_suffix else without_suffix
 
                                 btc_instruments.append({
                                     'instrument': instrument,
@@ -907,26 +913,36 @@ class IntegratedBTCStrategy(Strategy):
                                     'market_timestamp': market_timestamp,
                                     'end_timestamp': end_timestamp,
                                     'time_diff_minutes': time_diff / 60,
-                                    'yes_token_id': yes_token_id,
+                                    'token_id': token_id,
                                 })
                         except (ValueError, IndexError):
                             continue
             except Exception:
                 continue
 
-        # Pair YES and NO tokens by slug
+        # Pair YES and NO tokens by slug securely using Nautlus outcome properties
         seen_slugs = {}
-        deduped = []
         for inst in btc_instruments:
             slug = inst['slug']
+            instrument = inst['instrument']
+            outcome = getattr(instrument, 'outcome', None)
+
             if slug not in seen_slugs:
-                inst['yes_instrument_id'] = inst['instrument'].id
-                inst['no_instrument_id'] = None
-                seen_slugs[slug] = inst
-                deduped.append(inst)
-            else:
-                seen_slugs[slug]['no_instrument_id'] = inst['instrument'].id
-        btc_instruments = deduped
+                base_inst = inst.copy()
+                base_inst['yes_instrument_id'] = None
+                base_inst['no_instrument_id'] = None
+                base_inst['yes_token_id'] = None
+                seen_slugs[slug] = base_inst
+
+            if outcome == 'Yes':
+                seen_slugs[slug]['yes_instrument_id'] = instrument.id
+                seen_slugs[slug]['yes_token_id'] = inst.get('token_id')
+            elif outcome == 'No':
+                seen_slugs[slug]['no_instrument_id'] = instrument.id
+
+        btc_instruments = list(seen_slugs.values())
+        # Filter incomplete pairs
+        btc_instruments = [m for m in btc_instruments if m['yes_instrument_id'] and m['no_instrument_id']]
         btc_instruments.sort(key=lambda x: x['market_timestamp'])
 
         if btc_instruments:
@@ -943,10 +959,10 @@ class IntegratedBTCStrategy(Strategy):
             is_active = inst['time_diff_minutes'] <= 0 and inst['end_timestamp'] > current_timestamp
             if is_active:
                 self.current_instrument_index = i
-                self.instrument_id = inst['instrument'].id
+                self.instrument_id = inst.get('yes_instrument_id')
                 self.next_switch_time = inst['end_time']
                 self._yes_token_id = inst.get('yes_token_id')
-                self._yes_instrument_id = inst.get('yes_instrument_id', inst['instrument'].id)
+                self._yes_instrument_id = inst.get('yes_instrument_id')
                 self._no_instrument_id = inst.get('no_instrument_id')
                 logger.info(f"✓ Active: {inst['slug']} → switch at {self.next_switch_time.strftime('%H:%M:%S')}")
 
@@ -966,9 +982,9 @@ class IntegratedBTCStrategy(Strategy):
 
             self.current_instrument_index = nearest_idx
             inst = nearest
-            self.instrument_id = inst['instrument'].id
+            self.instrument_id = inst.get('yes_instrument_id')
             self._yes_token_id = inst.get('yes_token_id')
-            self._yes_instrument_id = inst.get('yes_instrument_id', inst['instrument'].id)
+            self._yes_instrument_id = inst.get('yes_instrument_id')
             self._no_instrument_id = inst.get('no_instrument_id')
             self.next_switch_time = inst['start_time']
             logger.info(f"⚠ NO CURRENT MARKET — WAITING FOR: {inst['slug']}")
@@ -1004,10 +1020,10 @@ class IntegratedBTCStrategy(Strategy):
         self._resolve_positions_for_market(self.current_instrument_index)
 
         self.current_instrument_index = next_index
-        self.instrument_id = next_market['instrument'].id
+        self.instrument_id = next_market.get('yes_instrument_id')
         self.next_switch_time = next_market['end_time']
         self._yes_token_id = next_market.get('yes_token_id')
-        self._yes_instrument_id = next_market.get('yes_instrument_id', next_market['instrument'].id)
+        self._yes_instrument_id = next_market.get('yes_instrument_id')
         self._no_instrument_id = next_market.get('no_instrument_id')
 
         logger.info("=" * 80)
@@ -1146,17 +1162,29 @@ class IntegratedBTCStrategy(Strategy):
                     logger.info(f"   Entry: ${pos.entry_price:.4f} → Exit: ${final_price:.4f}")
                     logger.info(f"   P&L: ${pnl:+.4f} ({outcome})")
 
-                    # === AUTO-REDEEM WINNINGS ===
+                    # === PENDING REDEMPTIONS (Proxy Wallet Compatible) ===
                     if outcome == "WIN" and not is_paper:
-                        # Use actual quantity filled (requires the OpenPosition actual_qty patch applied earlier)
-                        win_qty = getattr(pos, 'actual_qty', float(pos.size_usd / pos.entry_price))
-                        if win_qty > 0:
-                            logger.info(f"   Initiating background redemption for {win_qty:.2f} tokens...")
-                            threading.Thread(
-                                target=auto_redeem_winnings, 
-                                args=(slug, pos.direction, win_qty),
-                                daemon=True
-                            ).start()
+                        # Proxy wallets (signature_type=1) cannot call the CTF contract directly to redeem positions
+                        # They require the Relayer client, builder credentials, or the Polymarket Wallet Recovery Tool
+                        from nautilus_trader.adapters.polymarket.common.symbol import get_polymarket_condition_id
+                        try:
+                            condition_id = getattr(pos, 'condition_id', None)
+                            if not condition_id:
+                                condition_id = get_polymarket_condition_id(pos.instrument_id)
+                                
+                            self._pending_redemptions.append(condition_id)
+                            
+                            logger.info(f"   🏆 WIN! Position marked for manual redemption.")
+                            logger.info(f"   [PROXY WALLET] condition_id {condition_id} added to pending redemptions.")
+                            logger.info(f"   Please use polymarket.com UI or polymarket-wallet-recovery tool to sweep winnings.")
+                            
+                            try:
+                                with open('pending_redemptions.txt', 'a') as f:
+                                    f.write(f"{datetime.now(timezone.utc).isoformat()} - {slug} - {condition_id}\n")
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            logger.error(f"   Failed to queue redemption: {e}")
 
                     # V3.1 FIX: Always pass direction="long" to performance tracker.
                     # In our system "short" = bought NO tokens = still a LONG position.
@@ -2483,13 +2511,11 @@ class IntegratedBTCStrategy(Strategy):
                     pos.pnl = pos.size_usd * pnl_pct
                     continue
 
-                # Submit market SELL to exit with exact Nautilus outcome instrument ID
-                trade_instrument_id = getattr(self, '_yes_instrument_id', pos.instrument_id) if pos.direction == "long" else getattr(self, '_no_instrument_id', pos.instrument_id)
-                logger.info(f"DEBUG: Attempting to exit position. Original Direction: {pos.direction}, Expected string: {pos.instrument_id}, Mapped Token ID to sell: {trade_instrument_id}")
-                
+                # Submit market SELL to exit utilizing inherently mapped native Nautilus InstrumentId
+                logger.info(f"DEBUG: Setting exit order parameter mapped token: {pos.instrument_id}")
                 qty = Quantity(pos.actual_qty, precision=precision)
                 order = self.order_factory.market(
-                    instrument_id=trade_instrument_id,
+                    instrument_id=pos.instrument_id,
                     order_side=OrderSide.SELL,
                     quantity=qty,
                     client_order_id=ClientOrderId(f"EXIT-{pos.order_id}"),
