@@ -1,6 +1,6 @@
 """
-Backtest Engine V4 — REAL Polymarket Data
-==========================================
+Backtest Engine V4.1 — REAL Polymarket Data (Synced with Live Bot March 2026)
+==============================================================================
 
 The critical upgrade over V3: replaces the synthetic btc_to_probability()
 function with ACTUAL historical Polymarket market prices.
@@ -63,9 +63,9 @@ from vol_estimator import VolEstimator
 from mispricing_detector import MispricingDetector, polymarket_taker_fee
 
 # ── Optional: Fusion processors for confirmation ────────────────────────────
+# [PATCH-6] Removed SentimentProcessor import — dropped from live bot March 2026
 try:
     from core.strategy_brain.signal_processors.spike_detector import SpikeDetectionProcessor
-    from core.strategy_brain.signal_processors.sentiment_processor import SentimentProcessor
     from core.strategy_brain.signal_processors.divergence_processor import PriceDivergenceProcessor
     from core.strategy_brain.signal_processors.tick_velocity_processor import TickVelocityProcessor
     FUSION_AVAILABLE = True
@@ -86,9 +86,14 @@ TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.30"))
 CUT_LOSS_PCT = float(os.getenv("CUT_LOSS_PCT", "-0.50"))
 VOL_METHOD = os.getenv("VOL_METHOD", "ewma")
 DEFAULT_VOL = float(os.getenv("DEFAULT_VOL", "0.65"))
-BANKROLL_USD = float(os.getenv("BANKROLL_USD", "20.0"))
+BANKROLL_USD = float(os.getenv("BANKROLL_USD", "25.0"))  # [PATCH-1] synced with live .env.example
 MARKET_BUY_USD = float(os.getenv("MARKET_BUY_USD", "1.00"))
 WINDOW_MINUTES = 15
+
+# [PATCH-2] Trade window enforcement (synced with live bot)
+TRADE_WINDOW_START_SEC = int(os.getenv("TRADE_WINDOW_START", "180"))   # 3 minutes into window
+TRADE_WINDOW_END_SEC = int(os.getenv("TRADE_WINDOW_END", "600"))       # 10 minutes into window
+QUOTE_STABILITY_REQUIRED = int(os.getenv("QUOTE_STABILITY_REQUIRED", "5"))  # ticks before trading
 
 GAMMA_EXIT_PROFIT_PCT = float(os.getenv("GAMMA_EXIT_PROFIT_PCT", "0.04"))
 GAMMA_EXIT_TIME_MINS = float(os.getenv("GAMMA_EXIT_TIME_MINS", "3.0"))
@@ -704,15 +709,18 @@ def compute_rsi(prices: List[float], period: int = 14) -> float:
 # Fusion confirmation (same as V3)
 # =============================================================================
 def create_fusion_processors() -> Optional[Dict]:
+    # [PATCH-4] Synced with live bot (March 2026):
+    #   - Removed SentimentProcessor (dropped from live)
+    #   - Removed DeribitPCR (dropped from live)
+    #   - Live weights: OrderBook=0.40, TickVelocity=0.30, Divergence=0.20, Spike=0.10
+    #   - OrderBook cannot run in backtest (no historical orderbook data)
+    #   - So backtest confirmation uses: spike, divergence, tick_velocity only
     if not FUSION_AVAILABLE:
         return None
     return {
         "spike": SpikeDetectionProcessor(
             spike_threshold=float(os.getenv("SPIKE_THRESHOLD", "0.05")),
             lookback_periods=20,
-        ),
-        "sentiment": SentimentProcessor(
-            extreme_fear_threshold=25, extreme_greed_threshold=75,
         ),
         "divergence": PriceDivergenceProcessor(
             divergence_threshold=float(os.getenv("DIVERGENCE_THRESHOLD", "0.05")),
@@ -732,7 +740,7 @@ def run_confirmation(
     pm = {}
     for k, v in metadata.items():
         pm[k] = Decimal(str(v)) if isinstance(v, float) else v
-    for name in ["spike", "sentiment", "divergence", "tick_velocity"]:
+    for name in ["spike", "divergence", "tick_velocity"]:  # [PATCH-5] sentiment removed (live bot dropped it)
         proc = processors.get(name)
         if not proc:
             continue
@@ -1399,8 +1407,8 @@ Examples:
     parser.add_argument("--start", type=str, help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end", type=str, help="End date (YYYY-MM-DD)")
     parser.add_argument("--days", type=int, default=1, help="Days to backtest (default: 1)")
-    parser.add_argument("--decision-minute", type=int, default=2,
-                        help="Minute within window to decide (default: 2)")
+    parser.add_argument("--decision-minute", type=int, default=3,
+                        help="Minute within window to decide (default: 3, matches live TRADE_WINDOW_START=180s)")  # [PATCH-3]
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--output", "-o", type=str, help="Export results to JSON")
     parser.add_argument("--cache-dir", type=str, default=None,
@@ -1435,6 +1443,8 @@ Examples:
     print(f"  Fees:              {'Maker (0%)' if use_maker else 'Taker (nonlinear, max 1.56%)'}")
     print(f"  Min edge:          ${MIN_EDGE_CENTS:.2f}")
     print(f"  Decision minute:   {args.decision_minute}")
+    print(f"  Trade window:      {TRADE_WINDOW_START_SEC}s–{TRADE_WINDOW_END_SEC}s (synced with live)")  # [PATCH-8]
+    print(f"  Quote stability:   {QUOTE_STABILITY_REQUIRED} ticks required")
     print(f"  Confirmation:      {'ON' if not args.no_confirmation else 'OFF'}")
     print(f"  Funding filter:    {'ON' if use_funding else 'OFF'}")
     print(f"  Cache:             {args.cache_dir or 'disabled'}")
