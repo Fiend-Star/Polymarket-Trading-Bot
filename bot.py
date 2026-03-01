@@ -926,6 +926,7 @@ class IntegratedBTCStrategy(Strategy):
             slug = inst['slug']
             instrument = inst['instrument']
             outcome = getattr(instrument, 'outcome', None)
+            outcome_str = outcome.lower() if outcome else ""
 
             if slug not in seen_slugs:
                 base_inst = inst.copy()
@@ -934,10 +935,10 @@ class IntegratedBTCStrategy(Strategy):
                 base_inst['yes_token_id'] = None
                 seen_slugs[slug] = base_inst
 
-            if outcome == 'Yes':
+            if outcome_str == 'yes':
                 seen_slugs[slug]['yes_instrument_id'] = instrument.id
                 seen_slugs[slug]['yes_token_id'] = inst.get('token_id')
-            elif outcome == 'No':
+            elif outcome_str == 'no':
                 seen_slugs[slug]['no_instrument_id'] = instrument.id
 
         btc_instruments = list(seen_slugs.values())
